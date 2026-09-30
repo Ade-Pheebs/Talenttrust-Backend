@@ -484,6 +484,21 @@ describe('SqliteAuditRepository — verifyIntegrity()', () => {
     expect(report.firstCorruptedId).toBe(created.id);
   });
 
+  it('reports malformed persisted metadata as the first corrupted entry', () => {
+    const created = repository.append(makeInput());
+    db.prepare('UPDATE audit_log_entries SET metadata_json = ? WHERE id = ?').run(
+      '{malformed',
+      created.id,
+    );
+
+    expect(repository.verifyIntegrity()).toMatchObject({
+      valid: false,
+      totalEntries: 1,
+      firstCorruptedIndex: 0,
+      firstCorruptedId: created.id,
+    });
+  });
+
   it('detects tampering by deletion (chain break)', () => {
     repository.append(makeInput());
     const second = repository.append(makeInput({ action: 'CONTRACT_UPDATED' }));

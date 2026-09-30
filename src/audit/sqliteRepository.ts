@@ -21,6 +21,16 @@ interface AuditRow {
 }
 
 function toAuditEntry(row: AuditRow): AuditEntry {
+  let metadata: unknown;
+  try {
+    metadata = JSON.parse(row.metadata_json) as unknown;
+  } catch {
+    throw new Error('Invalid audit metadata JSON');
+  }
+  if (typeof metadata !== 'object' || metadata === null || Array.isArray(metadata)) {
+    throw new Error('Invalid audit metadata JSON');
+  }
+
   return Object.freeze({
     id: row.id,
     timestamp: row.timestamp,
@@ -29,7 +39,7 @@ function toAuditEntry(row: AuditRow): AuditEntry {
     actor: row.actor,
     resource: row.resource,
     resourceId: row.resource_id,
-    metadata: Object.freeze(JSON.parse(row.metadata_json) as Record<string, unknown>),
+    metadata: Object.freeze(metadata as Record<string, unknown>),
     ipAddress: row.ip_address ?? undefined,
     correlationId: row.correlation_id ?? undefined,
     hash: row.hash,
@@ -226,7 +236,18 @@ export class SqliteAuditRepository implements AuditLogRepository {
 
     let previousHash = GENESIS_HASH;
     for (let index = 0; index < rows.length; index += 1) {
-      const entry = toAuditEntry(rows[index]);
+      let entry: AuditEntry;
+      try {
+        entry = toAuditEntry(rows[index]);
+      } catch {
+        return {
+          valid: false,
+          totalEntries: rows.length,
+          firstCorruptedIndex: index,
+          firstCorruptedId: rows[index].id,
+          checkedAt,
+        };
+      }
 
       if (entry.previousHash !== previousHash) {
         return {

@@ -1,3 +1,4 @@
+
 /**
  * @file service.test.ts
  * @description Focused unit tests for the `AuditService`-level contract.

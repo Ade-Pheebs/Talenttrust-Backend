@@ -24,7 +24,7 @@ export const AUDIT_ACTIONS = [
   'CONTRACT_COMPLETED',
   'PAYMENT_INITIATED',
   'PAYMENT_RELEASED',
-  'PAYMENT_DISPUTED',
+  'PAYMENT_DISPUED',
   'REPUTATION_UPDATED',
   'REPUTATION_CORRECTED',
   'USER_CREATED',
@@ -64,8 +64,7 @@ export type AuditAction =
   | 'AUTH_LOCKOUT_RELEASED'
   | 'ADMIN_ACTION'
   | 'ENDPOINT_ACCESS'
-  | 'ENDPOINT_MUTATION'
-  | 'DEPLOYMENT_PROMOTED'
+  | 'ENDPOINT_MUTATION' | 'DEPLOYMENT_PROMOTED'
   | 'DEPLOYMENT_ROLLED_BACK'
   | 'MILESTONES_CREATED'
   | 'MILESTONES_UPDATED'
@@ -99,7 +98,7 @@ export interface AuditEntry {
    * Structured metadata about the change.
    * Must NOT contain raw PII — callers are responsible for sanitisation.
    */
-  readonly metadata: Readonly<Record<string, unknown>>;
+  readonly metadata: Readonly<Record<string, unknown>;
   /** IP address of the request origin, if available. */
   readonly ipAddress?: string;
   /** Correlation ID for tracing across services. */

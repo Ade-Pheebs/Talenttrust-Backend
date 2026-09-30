@@ -48,6 +48,15 @@
 
 import { parseIntEnv } from './env';
 
+/**
+ * Upper bound for TTL to avoid overflowing setTimeout/Date arithmetic and to
+ * keep cache behavior deterministic across platforms.
+ */
+const MAX_TTL_MS = 24 * 60 * 60 * 1000; // 24 hours
+
+/** Upper bound for entries to prevent unbounded memory growth from misconfig. */
+const MAX_ENTRIES_LIMIT = 1_000_000;
+
 export interface CacheConfig {
   /** TTL in milliseconds for cached contract reads */
   contractsTtlMs: number;
@@ -58,12 +67,25 @@ export interface CacheConfig {
 /**
  * Loads cache configuration from environment variables.
  *
+ * ## Invariants
+ * - Returned values are always finite, non-negative integers within safe bounds.
+ * - `contractsTtlMs` is clamped to `[0, MAX_TTL_MS]`.
+ * - `contractsMaxEntries` is clamped to `[1, MAX_ENTRIES_LIMIT]`.
+ * - Repeated calls with the same `env` produce identical results (idempotent).
+ * - Invalid/missing values fall back to defaults rather than throwing, so
+ *   concurrent startup paths cannot observe partial/inconsistent state.
+ *
  * @param env - Environment object (defaults to process.env for production, can be overridden in tests)
  * @returns Parsed cache configuration
  */
 export function loadCacheConfig(env: NodeJS.ProcessEnv = process.env): CacheConfig {
-  const contractsTtlMs = parseIntEnv('CACHE_CONTRACTS_TTL_MS', 30_000); // 30 seconds default
-  const contractsMaxEntries = parseIntEnv('CACHE_CONTRACTS_MAX_ENTRIES', 1000);
+  const rawTtlMs = parseIntEnv('CACHE_CONTRACTS_TTL_MS', 30_000); // 30 seconds default
+  const rawMaxEntries = parseIntEnv('CACHE_CONTRACTS_MAX_ENTRIES', 1000);
+
+  // Normalize: reject NaN/Infinity/negative, clamp to safe bounds. This makes
+  // concurrent or repeated loads deterministic even under hostile env input.
+  const contractsTtlMs = clampInt(rawTtlMs, 0, MAX_TTL_MS, 30_000);
+  const contractsMaxEntries = clampInt(rawMaxEntries, 1, MAX_ENTRIES_LIMIT, 1000);
 
   if (contractsTtlMs < 1000) {
     console.warn(
@@ -83,4 +105,18 @@ export function loadCacheConfig(env: NodeJS.ProcessEnv = process.env): CacheConf
     contractsTtlMs,
     contractsMaxEntries,
   };
+}
+
+/**
+ * Clamps an integer to `[min, max]`, falling back to `fallback` when the input
+ * is not a finite number. Pure function — safe under concurrent invocation.
+ */
+function clampInt(value: number, min: number, max: number, fallback: number): number {
+  if (typeof value !== 'number' || !Number.isFinite(value)) {
+    return fallback;
+  }
+  const truncated = Math.trunc(value);
+  if (truncated < min) return min;
+  if (truncated > max) return max;
+  return truncated;
 }

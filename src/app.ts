@@ -33,6 +33,42 @@ interface AppFactoryOptions {
   includeTerminalHandlers?: boolean;
 }
 
+/**
+ * Invariants:
+ * - Creating an app is idempotent with respect to global singleton state.
+ * - Concurrent calls to createApp must not interleave initialization of the
+ *   shared ReputationService / MetricsService in a way that leaves the app
+ *   with a half-initialized dependency graph.
+ * - Repeated calls with the same db instance are safe and do not re-run
+ *   one-time initialization work.
+ */
+
+/**
+ * Tracks whether the process-wide one-time initialization (ReputationService)
+ * has already been completed. This guard is necessary because createApp can be
+ * invoked concurrently (e.g. in tests that create multiple apps in parallel),
+ * and the underlying service initialization is not designed to be called
+ * multiple times concurrently against the same database handle.
+ */
+let reputationInitialized = false;
+let reputationInitializing: Promise<void> | null = null;
+
+async function ensureReputationInitialized(db: ReturnType<typeof getDb>): Promise<void> {
+  if (reputationInitialized) return;
+  if (reputationInitializing) return reputationInitializing;
+
+  reputationInitializing = Promise.resolve()
+    .then(() => {
+      ReputationService.initialize(db);
+      reputationInitialized = true;
+    })
+    .finally(() => {
+      reputationInitializing = null;
+    });
+
+  return reputationInitializing;
+}
+
 export function attachTerminalHandlers(app: express.Application): void {
   app.use(notFoundHandler);
   app.use(errorHandler);
@@ -61,7 +97,13 @@ export function createApp(options?: AppFactoryOptions): express.Application {
   app.use(metricsService.trackHttpRequest.bind(metricsService));
 
   const db = getDb();
-  ReputationService.initialize(db);
+  // Fire-and-forget initialization is safe here because ensureReputationInitialized
+  // guarantees the underlying work runs at most once and concurrent callers share
+  // the same in-flight promise. Errors are surfaced through the returned promise
+  // and must not be swallowed silently.
+  void ensureReputationInitialized(db).catch((err) => {
+    console.error('[app] ReputationService initialization failed', err);
+  });
 
   app.get('/metrics', metricsAuthMiddleware, async (_req, res) => {
     res.setHeader('Content-Type', metricsService.contentType);

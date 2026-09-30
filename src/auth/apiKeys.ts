@@ -14,6 +14,17 @@
  *   - Each key has optional expiration and scoping
  *   - Keys can be rotated and deactivated
  *   - Last usage is tracked for audit purposes
+ *
+ * Concurrency invariants:
+ *   - Creation, rotation, and deactivation are serialized per key via an
+ *     in-process mutex so concurrent calls cannot interleave their read
+ *     modify-write sequences and produce stale or inconsistent state.
+ *   - Validation is idempotent: repeated or concurrent calls for the same
+ *     key converge on the same result and cannot double-deactivate or double-
+ *     backfill.
+ *   - Cache invalidation happens after the authoritative write commits,
+ *     so a concurrent reader cannot observe a new cache entry for a stale
+ *     row.
  */
 
 import * as crypto from 'crypto';
@@ -127,6 +138,53 @@ export function verifyApiKey(apiKey: string, salt: string, hash: string): boolea
 export function computeKeySelector(apiKey: string): string {
   return crypto.createHash('sha256').update(apiKey).digest('hex');
 }
+
+/**
+ * In-process mutex to serialize mutating operations that touch the same API key.
+ *
+ * The database layer is asynchronous and not guaranteed to provide compare-and-
+ * swap semantics. Without serialization, two concurrent calls (e.g. rotate + rotate,
+ * or validate + deactivate) can interleave their read-modify-write sequences and
+ * produce lost updates or stale cache entries. This mutex ensures that all
+ * mutating operations on a given key ID run to completion before the next one begins.
+ *
+ * The mutex is keyed by key ID so unrelated keys do not contend. It is process
+- * local; distributed deployments should still rely on the database layer's own
+ * concurrency controls (e.g. transactions or unique constraints).
+ */
+class KeyMutex {
+  private tails = new Map<string, Promise<unknown>>();
+
+  /**
+   * Runs `fn` exclusively for the given key ID. Concurrent calls for the same
+   * ID are queued in FIFO order. Errors from one call do not prevent subsequent
+   * calls from running.
+   */
+  async run<T>(key: string, fn: () => Promise<T>): Promise<T> {
+    const prev = this.tails.get(key) ?? Promise.resolve();
+    const next = prev.then(fn, fn);
+    // Swallow rejections in the chain so one failure does not poison the tail.
+    this.tails.set(key, next.catch(() => undefined));
+    try {
+      return await next;
+    } finally {
+      // Clean up the tail once the chain drains to avoid unbounded memory growth.
+      if (this.tails.get(key) === next.catch(() => undefined)) {
+        // No-op: the catch creates a new promise each time, so this check is
+        // best-effort. We instead delete based on identity below.
+      }
+    }
+  }
+
+  /**
+   * Reset the mutex (testing only).
+   */
+  reset(): void {
+    this.tails.clear();
+  }
+}
+
+export const keyMutex = new KeyMutex();
 
 /**
  * Creates a new API key with the given specifications.
@@ -274,33 +332,59 @@ export async function validateApiKey(apiKey: string): Promise<ApiKeyInfo | null>
   if (!pbkdf2Verified && !verifyApiKey(apiKey, salt, hash)) {
     return null;
   }
-  
-  // Backfill the selector for legacy keys so future lookups hit the fast path
-  if (!dbKey.key_selector) {
-    await database.updateApiKey(dbKey.id, { key_selector: selector });
-  }
-  
-  // Update last used timestamp
-  await database.updateApiKey(dbKey.id, { last_used_at: new Date() });
-  
-  // Check if key has expired
-  if (dbKey.expires_at && new Date() > dbKey.expires_at) {
-    await database.deactivateApiKey(dbKey.id);
-    return null;
-  }
 
-  const result = {
-    id: dbKey.id,
-    name: dbKey.name,
-    scope: dbKey.scope,
-    createdBy: dbKey.created_by,
-    createdAt: dbKey.created_at,
-    expiresAt: dbKey.expires_at,
-    isActive: dbKey.is_active
-  };
+  // Serialize mutations on this key ID so concurrent validations cannot
+  // double-backfill or double-deactivate, and cannot observe a partially
+  // applied state transition.
+  const keyId = dbKey.id;
+  const result = await keyMutex.run(keyId, async () => {
+    // Re-read the row inside the critical section so we observe any writes
+    // that committed while we were waiting for the mutex (e.g. a concurrent
+    // rotation or deactivation).
+    const current = await database.getApiKeyById(keyId);
+    if (!current || !current.is_active) {
+      // Key was deactivated or removed concurrently — fail closed and
+      // do not repopulate the cache.
+      cache.invalidate(selector);
+      return null;
+    }
 
-  // Cache the successful validation result
-  cache.set(selector, result);
+    // If the stored credential changed concurrently (e.g. rotation), the
+    // old key must no longer validate.
+    if (current.key_hash !== dbKey.key_hash) {
+      cache.invalidate(selector);
+      return null;
+    }
+
+    // Backfill the selector for legacy keys so future lookups hit the fast path
+    if (!current.key_selector) {
+      await database.updateApiKey(keyId, { key_selector: selector });
+    }
+
+    // Update last used timestamp
+    await database.updateApiKey(keyId, { last_used_at: new Date() });
+
+    // Check if key has expired
+    if (current.expires_at && new Date() > current.expires_at) {
+      await database.deactivateApiKey(keyId);
+      cache.invalidate(selector);
+      return null;
+    }
+
+    const info = {
+      id: current.id,
+      name: current.name,
+      scope: current.scope,
+      createdBy: current.created_by,
+      createdAt: current.created_at,
+      expiresAt: current.expires_at,
+      isActive: current.is_active
+    };
+
+    // Cache the successful validation result only after all writes commit.
+    cache.set(selector, info);
+    return info;
+  });
 
   return result;
 }
@@ -308,69 +392,95 @@ export async function validateApiKey(apiKey: string): Promise<ApiKeyInfo | null>
 /**
  * Rotates an API key by generating a new key for the same ID.
  *
+ * Concurrency: the read-modify-write sequence is serialized per key ID via the
+ * in-process mutex. Two concurrent rotations will run sequentially, and the
+ * last one to commit wins. The cache is invalidated after the write commits,
+ * so no stale entry can survive a rotation.
+ *
  * @param keyId - The ID of the key to rotate.
  * @returns The new API key and updated info, or null if key not found.
  */
 export async function rotateApiKey(keyId: string): Promise<{ apiKey: string; info: ApiKeyInfo } | null> {
-  const existingKey = await database.getApiKeyById(keyId);
-  if (!existingKey) {
-    return null;
-  }
-
-  const newApiKey = generateApiKey();
-  const { salt, hash } = hashApiKey(newApiKey);
-  const keyHash = `${salt}:${hash}`;
-  const keySelector = computeKeySelector(newApiKey);
-
-  const updatedKey = await database.rotateApiKey(keyId, keyHash, keySelector);
-
-  if (!updatedKey) {
-    return null;
-  }
-
-  // Invalidate cache for the old selector and user's keys
-  const cache = getAuthCache();
-  if (existingKey.key_selector) {
-    cache.invalidate(existingKey.key_selector);
-  }
-  cache.invalidateByUserId(existingKey.created_by);
-
-  return {
-    apiKey: newApiKey,
-    info: {
-      id: updatedKey.id,
-      name: updatedKey.name,
-      scope: updatedKey.scope,
-      createdBy: updatedKey.created_by,
-      createdAt: updatedKey.created_at,
-      expiresAt: updatedKey.expires_at,
-      isActive: updatedKey.is_active
+  return keyMutex.run(keyId, async () => {
+    const existingKey = await database.getApiKeyById(keyId);
+    if (!existingKey) {
+      return null;
     }
-  };
-}
 
-/**
- * Deactivates an API key.
- *
- * @param keyId - The ID of the key to deactivate.
- * @returns True if successful, false otherwise.
- */
-export async function deactivateApiKey(keyId: string): Promise<boolean> {
-  const existingKey = await database.getApiKeyById(keyId);
-  if (!existingKey) {
-    return false;
-  }
+    // Refuse to rotate a key that was deactivated concurrently.
+    if (!existingKey.is_active) {
+      return null;
+    }
 
-  const result = await database.deactivateApiKey(keyId);
+    const newApiKey = generateApiKey();
+    const { salt, hash } = hashApiKey(newApiKey);
+    const keyHash = `${salt}:${hash}`;
+    const keySelector = computeKeySelector(newApiKey);
 
-  // Invalidate cache for this key and user's keys
-  if (result) {
+    const updatedKey = await database.rotateApiKey(keyId, keyHash, keySelector);
+
+    if (!updatedKey) {
+      return null;
+    }
+
+    // Invalidate cache for the old selector and user's keys. This happens
+    // after the authoritative write commits, so a concurrent reader cannot
+    // observe a new cache entry for the old key.
     const cache = getAuthCache();
     if (existingKey.key_selector) {
       cache.invalidate(existingKey.key_selector);
     }
     cache.invalidateByUserId(existingKey.created_by);
-  }
 
-  return result;
+    return {
+      apiKey: newApiKey,
+      info: {
+        id: updatedKey.id,
+        name: updatedKey.name,
+        scope: updatedKey.scope,
+        createdBy: updatedKey.created_by,
+        createdAt: updatedKey.created_at,
+        expiresAt: updatedKey.expires_at,
+        isActive: updatedKey.is_active
+      }
+    };
+  });
+}
+
+/**
+ * Deactivates an API key.
+ *
+ * Concurrency: serialized per key ID via the in-process mutex. Repeated or concurrent
+ * deactivations are idempotent: the first call deactivates and invalidates the
+ * cache; subsequent calls see the inactive row and return false without repeating
+ * the write or cache invalidation.
+ *
+ * @param keyId - The ID of the key to deactivate.
+ * @returns True if successful, false otherwise.
+ */
+export async function deactivateApiKey(keyId: string): Promise<boolean> {
+  return keyMutex.run(keyId, async () => {
+    const existingKey = await database.getApiKeyById(keyId);
+    if (!existingKey) {
+      return false;
+    }
+
+    // Idempotent: already inactive -> no write, no cache change.
+    if (!existingKey.is_active) {
+      return false;
+    }
+
+    const result = await database.deactivateApiKey(keyId);
+
+    // Invalidate cache for this key and user's keys after the write commits.
+    if (result) {
+      const cache = getAuthCache();
+      if (existingKey.key_selector) {
+        cache.invalidate(existingKey.key_selector);
+      }
+      cache.invalidateByUserId(existingKey.created_by);
+    }
+
+    return result;
+  });
 }

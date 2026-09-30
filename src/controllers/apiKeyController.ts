@@ -46,6 +46,11 @@ const SCOPE_ITEM_MAX_LEN = 64;
 /** Allowed top-level fields on the create request body. */
 const ALLOWED_CREATE_FIELDS = new Set(['name', 'scope', 'expiresAt']);
 
+// ─── Concurrency guards ──────────────────────────────────────────────────────
+
+/** In-flight mutation locks keyed by API key id, to serialize rotate/deactivate. */
+const inFlightMutations = new Map<string, Promise<unknown>>();
+
 // ─── Validation helper ───────────────────────────────────────────────────────
 
 /**
@@ -175,6 +180,29 @@ export function validateApiKeyRequestBody(body: unknown): Record<string, unknown
 }
 
 /**
+ * Serializes async mutations for a given API key id.
+ *
+ * Concurrent rotate/deactivate requests for the same key are chained so that
+ * only one store mutation is in flight at a time. This prevents lost updates
+ * and stale reads (e.g. two rotations racing, or a deactivate racing a rotate).
+ *
+ * The lock entry is removed once the chained promise settles, so the map does
+ * not grow unbounded. Errors from the previous holder are swallowed here and
+ * surfaced to their own caller; the next holder still runs.
+ */
+async function withApiKeyLock<T>(id: string, fn: () => Promise<T>): Promise<T> {
+  const previous = inFlightMutations.get(id) ?? Promise.resolve();
+  const run = previous.then(fn, fn);
+  const guarded = run.finally(() => {
+    if (inFlightMutations.get(id) === guarded) {
+      inFlightMutations.delete(id);
+    }
+  });
+  inFlightMutations.set(id, guarded);
+  return guarded;
+}
+
+/**
  * Create a new API key.
  *
  * Validates the request body via {@link validateApiKeyRequestBody} before
@@ -293,29 +321,37 @@ export async function rotateApiKeyController(req: AuthenticatedRequest, res: Res
       return;
     }
 
-    // First check if the key belongs to the user
-    const existingKey = await database.getApiKeyById(id);
-    if (!existingKey) {
-      res.status(404).json({ error: 'API key not found' });
-      return;
-    }
+    const userId = req.user.userId;
 
-    if (existingKey.created_by !== req.user.userId) {
-      res.status(403).json({ error: 'Access denied' });
-      return;
-    }
+    // Serialize per-key so concurrent rotate/deactivate cannot interleave.
+    const outcome = await withApiKeyLock(id, async () => {
+      // Re-read inside the lock: ownership and existence may have changed
+      // while a prior mutation was in flight.
+      const existingKey = await database.getApiKeyById(id);
+      if (!existingKey) {
+        return { status: 404 as const, body: { error: 'API key not found' } };
+      }
 
-    const result = await rotateApiKey(id);
-    if (!result) {
-      res.status(404).json({ error: 'API key not found' });
-      return;
-    }
+      if (existingKey.created_by !== userId) {
+        return { status: 403 as const, body: { error: 'Access denied' } };
+      }
 
-    res.json({
-      message: 'API key rotated successfully',
-      apiKey: result.apiKey, // Only returned once
-      info: result.info
+      const result = await rotateApiKey(id);
+      if (!result) {
+        return { status: 404 as const, body: { error: 'API key not found' } };
+      }
+
+      return {
+        status: 200 as const,
+        body: {
+          message: 'API key rotated successfully',
+          apiKey: result.apiKey, // Only returned once
+          info: result.info
+        }
+      };
     });
+
+    res.status(outcome.status).json(outcome.body);
   } catch (error) {
     console.error('Error rotating API key:', error);
     res.status(500).json({ error: 'Internal server error' });
@@ -337,27 +373,33 @@ export async function deactivateApiKeyController(req: AuthenticatedRequest, res:
       return;
     }
 
-    // First check if the key belongs to the user
-    const existingKey = await database.getApiKeyById(id);
-    if (!existingKey) {
-      res.status(404).json({ error: 'API key not found' });
-      return;
-    }
+    const userId = req.user.userId;
 
-    if (existingKey.created_by !== req.user.userId) {
-      res.status(403).json({ error: 'Access denied' });
-      return;
-    }
+    // Serialize per-key so concurrent rotate/deactivate cannot interleave.
+    const outcome = await withApiKeyLock(id, async () => {
+      // Re-read inside the lock: ownership and existence may have changed
+      // while a prior mutation was in flight.
+      const existingKey = await database.getApiKeyById(id);
+      if (!existingKey) {
+        return { status: 404 as const, body: { error: 'API key not found' } };
+      }
 
-    const success = await deactivateApiKey(id);
-    if (!success) {
-      res.status(404).json({ error: 'API key not found' });
-      return;
-    }
+      if (existingKey.created_by !== userId) {
+        return { status: 403 as const, body: { error: 'Access denied' } };
+      }
 
-    res.json({
-      message: 'API key deactivated successfully'
+      const success = await deactivateApiKey(id);
+      if (!success) {
+        return { status: 404 as const, body: { error: 'API key not found' } };
+      }
+
+      return {
+        status: 200 as const,
+        body: { message: 'API key deactivated successfully' }
+      };
     });
+
+    res.status(outcome.status).json(outcome.body);
   } catch (error) {
     console.error('Error deactivating API key:', error);
     res.status(500).json({ error: 'Internal server error' });

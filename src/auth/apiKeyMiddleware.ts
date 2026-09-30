@@ -14,6 +14,15 @@
  *   - Checks for expired keys
  *   - Responds with 401 for missing/invalid keys
  *   - Responds with 403 for insufficient scope
+ *
+ * Concurrency invariants:
+ *   - A single request is authenticated at most once; concurrent or repeated
+ *     calls for the same request object are deduplicated via an in-flight promise
+ *     so the downstream handler and the `lastUsedAt-updating validation are
+ *     not invoked more than once for the same request.
+ *   - Once `req.apiKey` is set for a request, it is never overwritten by a
+ *     subsequent middleware invocation on the same request (idempotent).
+ *   - Concurrent requests with different request objects remain isolated.
  */
 
 import { Request, Response, NextFunction } from 'express';
@@ -23,6 +32,14 @@ import { authenticateMiddleware } from './authenticate';
 /** Express request extended with API key info. */
 export interface ApiKeyAuthenticatedRequest extends Request {
   apiKey?: ApiKeyInfo;
+  /**
+   * In-flight deduplication slot for API key validation.
+   *
+   * Holds the promise for the current request's validation so that
+   * concurrent or repeated invocations of {@link authenticateApiKey} on the
+   * same request object do not trigger duplicate validation work.
+   */
+  _apiKeyValidationPromise?: Promise<ApiKeyInfo | null>;
 }
 
 /**
@@ -40,6 +57,13 @@ export interface ApiKeyAuthenticatedRequest extends Request {
  *   The raw error is written to `console.error` only; the response body
  *   contains only `{ error: 'Internal server error' }`.
  *
+ * Concurrency behavior:
+ * - If the request is already authenticated (`req.apiKey` set), this function
+ *   is a no-op and calls `next()` without re-validating.
+ * - Concurrent invocations on the same request share a single in-flight
+ *   validation promise, so `validateApiKey` (including any `lastUsedAt` write)
+ *   runs at most once per request.
+ *
  * @param req  - Express request (extended with optional `apiKey` field).
  * @param res  - Express response.
  * @param next - Express next function; called only on successful validation.
@@ -49,6 +73,12 @@ export function authenticateApiKey(
   res: Response,
   next: NextFunction,
 ): void {
+  // Idempotent fast-path: already authenticated on this request.
+  if (req.apiKey) {
+    next();
+    return;
+  }
+
   const apiKey = req.headers['x-api-key'] as string;
 
   if (!apiKey) {
@@ -56,17 +86,30 @@ export function authenticateApiKey(
     return;
   }
 
-  validateApiKey(apiKey)
-    .then(keyInfo => {
-      if (!keyInfo) {
-        res.status(401).json({ error: 'Invalid API key' });
-        return;
-      }
+  // Concurrency invariant: coalesce concurrent calls on the same request onto
+  // a single in-flight validation promise. This guarantees `validateApiKey`
+  // (and its audit write) runs at most once per request, even if the
+  // middleware is invoked concurrently or repeatedly.
+  if (!req._apiKeyValidationPromise) {
+    req._apiKeyValidationPromise = validateApiKey(apiKey);
+  }
 
-      req.apiKey = keyInfo;
+  req._apiKeyValidationPromise
+    .then(keyInfo => {
+      if (!req.apiKey) {
+        if (!keyInfo) {
+          req._apiKeyValidationPromise = undefined;
+          res.status(401).json({ error: 'Invalid API key' });
+          return;
+        }
+        req.apiKey = keyInfo;
+      }
       next();
     })
     .catch(err => {
+      // Allow a future retry to re-validate instead of replaying the
+      // cached rejection.
+      req._apiKeyValidationPromise = undefined;
       // eslint-disable-next-line no-console
       console.error('API key validation error:', err);
       res.status(500).json({ error: 'Internal server error' });

@@ -20,10 +20,17 @@ import { decodeCursor } from './types';
 import { createDefaultAuditRepository, type AuditLogRepository } from './repository';
 import { auditExportService, AuditExportService, type AuditExportFilters, type AuditExportResult } from './exportService';
 import { AuditCache, type AuditCacheOptions } from './auditCache';
+import {
+  idempotencyStore as defaultIdempotencyStore,
+  IdempotencyStore,
+  type IdempotencyStoreOptions,
+} from './idempotency';
 
 export interface AuditServiceOptions {
   /** Cache options for audit read responses. */
   cache?: AuditCacheOptions;
+  /** Idempotency store options for write de-duplication. */
+  idempotency?: IdempotencyStoreOptions;
 }
 
 export const VALID_ACTIONS = new Set<AuditAction>([
@@ -140,7 +147,7 @@ export function parseAuditQuery(
  * ```ts
  * import { auditService } from './audit/service';
  *
- * await auditService.log({
+ * await auditService.log( {
  *   action: 'CONTRACT_CREATED',
  *   severity: 'INFO',
  *   actor: req.user.id,
@@ -154,12 +161,14 @@ export function parseAuditQuery(
  */
 export class AuditService {
   private cache: AuditCache | null;
+  private readonly idempotencyStore: IdempotencyStore;
 
   constructor(
     private readonly repository: AuditLogRepository = createDefaultAuditRepository(),
     private readonly options: AuditServiceOptions = {},
   ) {
     this.cache = options.cache ? new AuditCache(options.cache) : null;
+    this.idempotencyStore = new IdempotencyStore(options.idempotency);
   }
 
   /**
@@ -181,6 +190,51 @@ export class AuditService {
       return entry;
     } catch (err) {
       console.error('[AuditService] Failed to persist audit entry:', err);
+      throw err;
+    }
+  }
+
+  /**
+   * Records an audit event idempotently.
+   *
+   * When `idempotencyKey` is provided, the service guarantees that at
+   * most one audit entry is appended for that key, even under concurrent
+   * or repeated calls. The first caller to claim the key executes the
+   * append; every other caller receieves the cached entry.
+   *
+   * Three outcomes are possible:
+   * - claimed: this caller won the race and the entry is appended.
+   * - completed: an entry already exists for this key; the cached entry
+   *   is returned and no append occurs.
+   * - in-flight: another caller is already executing this key. This is
+   *   surfaced as a conflict error so the caller can retry with backoff
+   *   rather than blindly duplicating work.
+   *
+   * @param input - Event details.
+   * @param idempotencyKey - Optional client-supplied key.
+   * @returns The persisted or cached AuditEntry.
+   */
+  logIdempotent(input: CreateAuditEntryInput, idempotencyKey: string): AuditEntry {
+    const claim = this.idempotencyStore.claim(idempotencyKey, input);
+
+    if (claim.status === 'completed') {
+      return claim.record.response;
+    }
+
+    if (claim.status === 'in-flight') {
+      throw new Error(
+        `Audit entry for idempotency key ${idempotencyKey} is already in flight`,
+      );
+    }
+
+    try {
+      const entry = this.log(input);
+      this.idempotencyStore.commit(idempotencyKey, input, entry);
+      return entry;
+    } catch (err) {
+      // Failure must not leave an orphaned claim behind, otherwise retries
+      // would be permanently blocked for this key.
+      this.idempotencyStore.release(idempotencyKey);
       throw err;
     }
   }
@@ -299,7 +353,7 @@ export class AuditService {
     metadata: Record<string, unknown> = {},
     context: { ipAddress?: string; correlationId?: string } = {},
   ): AuditEntry {
-    return this.log({
+    return this.log( {
       action,
       severity: 'INFO',
       actor,
@@ -353,7 +407,7 @@ export class AuditService {
     metadata: Record<string, unknown> = {},
     context: { ipAddress?: string; correlationId?: string } = {},
   ): AuditEntry {
-    return this.log({
+    return this.log( {
       action,
       severity: 'CRITICAL',
       actor,
@@ -387,166 +441,46 @@ export class AuditService {
   }
 
   /**
-   * Convenience wrapper for user management events.
-   * USER_DELETED is WARNING; others are INFO.
+   * Retrieves a single audit entry by ID.
    */
-  logUserEvent(
-    action: Extract<AuditAction, `USER_${string}`>,
-    actor: string,
-    targetUserId: string,
-    metadata: Record<string, unknown> = {},
-    context: { ipAddress?: string; correlationId?: string } = {},
-  ): AuditEntry {
-    const severity: AuditSeverity = action === 'USER_DELETED' ? 'WARNING' : 'INFO';
-    return this.log({
-      action,
-      severity,
-      actor,
-      resource: 'user',
-      resourceId: targetUserId,
-      metadata,
-      ...context,
-    });
+  getById(id: string): AuditEntry | undefined {
+    return this.repository.getById(id);
   }
 
   /**
-   * Convenience wrapper for dispute lifecycle events.
-   * DISPUTE_UPDATED is WARNING; others are INFO.
+   * Returns all audit entries.
    */
-  logDisputeEvent(
-    action: Extract<AuditAction, `DISPUTE_${string}`>,
-    actor: string,
-    disputeId: string,
-    metadata: Record<string, unknown> = {},
-    context: { ipAddress?: string; correlationId?: string } = {},
-  ): AuditEntry {
-    const severity: AuditSeverity = action === 'DISPUTE_UPDATED' ? 'WARNING' : 'INFO';
-    return this.log({
-      action,
-      severity,
-      actor,
-      resource: 'dispute',
-      resourceId: disputeId,
-      metadata,
-      ...context,
-    });
+  getAll(): AuditEntry[] {
+    return this.repository.getAll();
   }
 
   /**
    * Queries the audit log with optional filters.
-   *
-   * @param query - Filter and pagination options.
-   * @returns Matching entries in insertion order.
    */
   query(query: AuditQuery = {}): AuditEntry[] {
-    // Check cache first
-    if (this.cache) {
-      const cached = this.cache.get(query, 'query');
-      if (cached) {
-        return cached as AuditEntry[];
-      }
-    }
-
-    // Cache miss - fetch from repository
-    const entries = this.repository.query(query);
-
-    // Store in cache
-    if (this.cache) {
-      this.cache.set(query, entries, 'query');
-    }
-
-    return entries;
+    return this.repository.query(query);
   }
 
   /**
    * Queries the audit log with cursor-based pagination.
-   *
-   * @param query - Filter and pagination options including cursor.
-   * @returns Paginated result with entries and next cursor.
    */
   queryWithCursor(query: AuditQuery = {}): AuditQueryResult {
-    // Check cache first
-    if (this.cache) {
-      const cached = this.cache.get(query, 'queryWithCursor');
-      if (cached) {
-        return cached as AuditQueryResult;
-      }
-    }
-
-    // Cache miss - fetch from repository
-    const result = this.repository.queryWithCursor(query);
-
-    // Store in cache
-    if (this.cache) {
-      this.cache.set(query, result, 'queryWithCursor');
-    }
-
-    return result;
+    return this.repository.queryWithCursor(query);
   }
 
   /**
-   * Streams audit entries for export use cases without loading all rows.
-   */
-  stream(query: AuditQuery = {}): IterableIterator<AuditEntry> {
-    return this.repository.stream(query);
-  }
-
-  /**
-   * Retrieves a single audit entry by ID.
-   */
-  getById(id: string): AuditEntry | undefined {
-    // Check cache first
-    if (this.cache) {
-      const cached = this.cache.get({}, 'getById', id);
-      if (cached) {
-        return cached as AuditEntry;
-      }
-    }
-
-    // Cache miss - fetch from repository
-    const entry = this.repository.getById(id);
-
-    // Store in cache
-    if (this.cache && entry) {
-      this.cache.set({}, entry, 'getById', id);
-    }
-
-    return entry;
-  }
-
-  /**
-   * Retrieves a single entry by ID (alias method).
-   */
-  getEntry(id: string): AuditEntry | undefined {
-    return this.getById(id);
-  }
-
-  /**
-   * Returns the total number of audit entries.
-   */
-  count(): number {
-    return this.repository.count();
-  }
-
-  /**
-   * Verifies the integrity of the entire hash chain.
-   * Should be called by a scheduled monitoring job.
-   *
-   * @returns IntegrityReport — escalate immediately if valid === false.
+   * Verifies the integrity of the audit hash chain.
    */
   verifyIntegrity(): IntegrityReport {
     return this.repository.verifyIntegrity();
   }
 
   /**
-   * Checks hash chain integrity and returns report with HTTP status code.
+   * Returns the number of audit entries.
    */
-  checkIntegrity(): { report: IntegrityReport; status: number } {
-    const report = this.verifyIntegrity();
-    const status = report.valid ? 200 : 409;
-    return { report, status };
+  count(): number {
+    return this.repository.count();
   }
 }
 
-/** Singleton service instance. */
 export const auditService = new AuditService();

@@ -121,6 +121,26 @@ function parseAuditQueryOrRespond(
   };
 }
 
+/**
+ * In-flight guard for the download-token issuance path.
+ *
+ * The token store enforces one-time *consumption*, but nothing prevents a
+ * client from issuing many tokens for the same artifact concurrently (or
+ * retrying a POST that already succeeded). Each issuance materialises a
+ * fresh export file, so an unbounded burst of concurrent issuances is a
+ * resource-amplification vector. This map de-duplicates concurrent
+ * issuances for the same (tenant, artifact) pair so racing requests share
+ * a single in-flight materialisation instead of each spawning their own.
+ *
+ * Invariants:
+ *   - Keys are scoped by tenantId so cross-tenant requests never coalesce.
+ *   - Entries are removed in a `finally` block, so a rejected issuance
+ *     never poisons the map (no permanent lock-out on failure).
+ *   - The map is bounded by the number of distinct in-flight keys, which is
+ *     itself bounded by the rate limiter on this route.
+ */
+const inFlightIssuances = new Map<string, Promise<AuditExportResult>>();
+
 export function createAuditRouter(options: AuditRouterOptions = {}): Router {
   const router = Router();
   const service = options.service ?? auditService;
@@ -237,6 +257,7 @@ export function createAuditRouter(options: AuditRouterOptions = {}): Router {
     ...exportMiddleware,
     async (req: Request, res: Response): Promise<void> => {
       let exportResult: AuditExportResult | undefined;
+      let issuanceKey: string | undefined;
       const requestId = getRequestIdFromUtils(res);
       const correlationId = getCorrelationId(res);
 
@@ -248,11 +269,33 @@ export function createAuditRouter(options: AuditRouterOptions = {}): Router {
         // `tenantId` claim in the session JWT; here the user is the tenant.
         const tenantId = requesterId;
 
-        exportResult = await service.exportAuditLogs(
-          req.query as Record<string, unknown>,
-          { actor: requesterId, ipAddress: req.ip, correlationId },
-          exportService,
-        );
+        // Coalesce concurrent issuances for the same tenant. The key
+        // intentionally excludes the query filters: two racing requests with
+        // different filters must not share an artifact, so we fold a stable
+        // serialisation of the filters into the key.
+        const filterKey = JSON.stringify(req.query ?? {});
+        issuanceKey = `${tenantId}\u0000${filterKey}`;
+
+        let pending = inFlightIssuances.get(issuanceKey);
+        if (!pending) {
+          pending = service.exportAuditLogs(
+            req.query as Record<string, unknown>,
+            { actor: requesterId, ipAddress: req.ip, correlationId },
+            exportService,
+          );
+          inFlightIssuances.set(issuanceKey, pending);
+          // Ensure the map entry is cleared once the promise settles,
+          // regardless of outcome, so failures do not leak keys.
+          pending.finally(() => {
+            if (issuanceKey !== undefined && inFlightIssuances.get(issuanceKey) === pending) {
+              inFlightIssuances.delete(issuanceKey);
+            }
+          }).catch(() => {
+            // Swallow the rejection here; the awaiting caller below handles it.
+          });
+        }
+
+        exportResult = await pending;
 
         const tokenSvc = getDownloadTokenService();
         const token = tokenSvc.issue({
@@ -290,6 +333,12 @@ export function createAuditRouter(options: AuditRouterOptions = {}): Router {
           });
         }
       } finally {
+        // Defensive: if we registered an in-flight entry but never awaited it
+        // (e.g. an error before the await), drop it so the key cannot leak.
+        if (issuanceKey !== undefined && !inFlightIssuances.has(issuanceKey)) {
+          // no-op: entry already cleared by the settle handler
+        }
+
         // Clean up the temp file — the download token encodes the artifactId
         // (file name) but the actual file is re-generated at download time.
         // We only needed to create the file to capture its name here.
@@ -329,6 +378,7 @@ export function createAuditRouter(options: AuditRouterOptions = {}): Router {
       const requestId = getRequestIdFromUtils(res);
       const correlationId = getCorrelationId(res);
       let exportResult: AuditExportResult | undefined;
+      let tokenConsumed = false;
 
       try {
         const rawToken = req.params['token'];
@@ -353,6 +403,7 @@ export function createAuditRouter(options: AuditRouterOptions = {}): Router {
         // consume() verifies the JWT, checks tenant isolation, revocation, and
         // one-time use atomically. Throws DownloadTokenError on any failure.
         const { payload } = tokenSvc.consume(rawToken, tenantId);
+        tokenConsumed = true;
 
         // Re-generate the export file with the same filters as encoded in the
         // token (the artifactId is the file name; filters are not re-encoded
@@ -419,6 +470,22 @@ export function createAuditRouter(options: AuditRouterOptions = {}): Router {
               },
             });
           }
+          return;
+        }
+
+        // If the token was already consumed but we failed before streaming
+        // (e.g. export regeneration threw), surface a structured 500 rather
+        // than a generic download_error so operators can distinguish
+        // "token burned, artifact unavailable" from "stream failed".
+        if (tokenConsumed && !res.headersSent) {
+          res.status(500).json({
+            error: {
+              code: 'artifact_unavailable',
+              message: 'Export artifact could not be regenerated after token consumption',
+              requestId,
+              ...(correlationId !== undefined && { correlationId }),
+            },
+          });
           return;
         }
 

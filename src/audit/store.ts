@@ -23,6 +23,15 @@ import type { AuditLogRepository } from './repository';
 export const GENESIS_HASH = 'GENESIS';
 
 /**
+ * Maximum number of entries retained in the in-memory log.
+ * Bounds memory growth under sustained concurrent appends.
+ */
+const MAX_LOG_SIZE = 100_000;
+
+/** Maximum number of concurrent append operations allowed. */
+const MAX_CONCURRENT_APPENDS = 1;
+
+/**
  * Computes the SHA-256 hash for an audit entry.
  * The hash covers all content fields (excluding the hash field itself)
  * plus the previousHash, making the chain tamper-evident.
@@ -61,13 +70,20 @@ export class AuditStore implements AuditLogRepository {
   private readonly log: AuditEntry[] = [];
 
   private _appendGuard = false;
+  private _pendingAppends = 0;
+  private _lastAppendError: Error | undefined;
 
   append(input: CreateAuditEntryInput): AuditEntry {
     if (this._appendGuard) {
       throw new Error('AuditStore append re-entrancy detected');
     }
 
+    if (this._pendingAppends >= MAX_CONCURRENT_APPENDS) {
+      throw new Error('AuditStore append concurrency limit exceeded');
+    }
+
     this._appendGuard = true;
+    this._pendingAppends += 1;
     try {
       const previousHash =
         this.log.length === 0 ? GENESIS_HASH : this.log[this.log.length - 1].hash;
@@ -91,9 +107,17 @@ export class AuditStore implements AuditLogRepository {
         hash: computeEntryHash(partial),
       });
 
+      if (this.log.length >= MAX_LOG_SIZE) {
+        throw new Error('AuditStore log capacity exceeded');
+      }
+
       this.log.push(entry);
       return entry;
+    } catch (err) {
+      this._lastAppendError = err instanceof Error ? err : new Error(String(err));
+      throw this._lastAppendError;
     } finally {
+      this._pendingAppends -= 1;
       this._appendGuard = false;
     }
   }
@@ -288,6 +312,8 @@ export class AuditStore implements AuditLogRepository {
   _reset(): void {
     this.log.length = 0;
     this._appendGuard = false;
+    this._pendingAppends = 0;
+    this._lastAppendError = undefined;
   }
 }
 

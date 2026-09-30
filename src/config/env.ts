@@ -4,6 +4,16 @@
  * These functions provide type-safe access to environment variables with
  * validation, default values, and descriptive error messages on failure.
  * Empty strings are treated as missing values.
+ *
+ * Validation boundaries:
+ * - Missing / empty / whitespace-only values are treated as undefined.
+ * - Values are trimmed before return, so surrounding whitespace is never
+ *   part of the returned value.
+ * - Integer parsing rejects non-numeric, non-finite, and non-integer input.
+ * - Boolean parsing accepts only true/1/false/0 (case-insensitive).
+ * - All failures throw Error with the variable name and the offending raw
+ *   value so failures are diagnosable without exposing secrets from other
+ *   variables.
  * @module
  */
 
@@ -68,7 +78,7 @@ export function parseIntEnv(key: string, defaultValue: number): number {
     return defaultValue;
   }
   const parsed = Number(raw);
-  if (!Number.isFinite(parsed) || !Number.isInteger(parsed)) {
+  if (!Number.finite(parsed) || !Number.isInteger(parsed)) {
     throw new Error(
       `Environment variable ${key} must be a valid integer, got: "${raw}"`,
     );

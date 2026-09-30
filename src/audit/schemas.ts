@@ -12,23 +12,10 @@
  */
 
 import { z } from 'zod';
-import { decodeCursor } from './types';
+import { AUDIT_ACTIONS, AUDIT_SEVERITIES, decodeCursor } from './types';
 
-/** Mirrors the `AuditAction` union in `./types.ts`. Keep these in sync. */
-export const AUDIT_ACTIONS = [
-  'CONTRACT_CREATED', 'CONTRACT_UPDATED', 'CONTRACT_CANCELLED', 'CONTRACT_COMPLETED',
-  'PAYMENT_INITIATED', 'PAYMENT_RELEASED', 'PAYMENT_DISPUTED',
-  'REPUTATION_UPDATED',
-  'USER_CREATED', 'USER_UPDATED', 'USER_DELETED',
-  'AUTH_LOGIN', 'AUTH_LOGOUT', 'AUTH_FAILED',
-  'AUTH_LOCKOUT_TRIGGERED', 'AUTH_LOCKOUT_RELEASED',
-  'ADMIN_ACTION',
-  'ENDPOINT_ACCESS', 'ENDPOINT_MUTATION',
-  'DEPLOYMENT_PROMOTED', 'DEPLOYMENT_ROLLED_BACK',
-] as const;
-
-/** Mirrors the `AuditSeverity` union in `./types.ts`. */
-export const AUDIT_SEVERITIES = ['INFO', 'WARNING', 'CRITICAL'] as const;
+// Preserve the schema module's previous exports while keeping the type module authoritative.
+export { AUDIT_ACTIONS, AUDIT_SEVERITIES } from './types';
 
 export const auditActionSchema = z.enum(AUDIT_ACTIONS);
 export const auditSeveritySchema = z.enum(AUDIT_SEVERITIES);

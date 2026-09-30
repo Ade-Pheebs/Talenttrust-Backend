@@ -28,6 +28,8 @@ import { requireAuth, requireRole } from '../middleware/authorization';
 // Request context propagation
 // ---------------------------------------------------------------------------
 
+import { randomUUID } from 'crypto';
+
 /** Context envelope propagated to asynchronous processors (e.g., webhook calls). */
 export interface RequestContextEnvelope {
   requestId?: string;
@@ -95,6 +97,15 @@ export interface ReplayableDlqStore {
 let dlqStore: ReplayableDlqStore | null = null;
 let stopSampling: (() => void) | null = null;
 
+/**
+ * In-flight replay guard.
+ *
+ * Invariant: for any given DLQ record id, at most one replay attempt may be
+ * executing at any moment. Concurrent requests for the same id are rejected
+ * with 409 rather than racing to deliver the same payload twice.
+ */
+const inFlightReplays = new Set<string>();
+
 const router = Router();
 
 /**
@@ -121,6 +132,28 @@ async function deliverRaw(
   } catch {
     return false;
   }
+}
+
+/**
+ * Acquire an exclusive replay lock for a DLQ record id.
+ *
+ * @returns `true` when the lock was acquired, `false` when another replay for
+ *          the same id is already in flight.
+ */
+function acquireReplayLock(id: string): boolean {
+  if (inFlightReplays.has(id)) return false;
+  inFlightReplays.add(id);
+  return true;
+}
+
+/**
+ * Release the replay lock for a DLQ record id.
+ *
+ * Must be called in a `finally` block so that partial failures cannot leak
+ * locks and permanently block future replays.
+ */
+function releaseReplayLock(id: string): void {
+  inFlightReplays.delete(id);
 }
 
 // ---------------------------------------------------------------------------
@@ -168,6 +201,10 @@ export function initializeJobs(customDlqStore: ReplayableDlqStore): ReplayableDl
 
   dlqStore = customDlqStore;
 
+  // Clear any stale in-flight locks from a previous lifecycle so that a
+  // re-initialization cannot permanently block replay of a given id.
+  inFlightReplays.clear();
+
   // Start DLQ metrics sampling
   const intervalMs = loadDlqMetricsInterval();
   stopSampling = startDlqMetricsSampling(dlqStore, intervalMs);
@@ -185,6 +222,9 @@ export function shutdownJobs(): void {
     stopSampling();
     stopSampling = null;
   }
+
+  // Release all in-flight locks so a subsequent initializeJobs starts clean.
+  inFlightReplays.clear();
 
   dlqStore = null;
 }
@@ -221,6 +261,11 @@ router.post(
     }
     if (reason.length < 5) {
       res.status(400).json({ error: 'Audit trail reason must be at least 5 characters long' });
+      return;
+    }
+
+    if (!acquireReplayLock(id)) {
+      res.status(409).json({ error: 'Replay already in progress for this DLQ record' });
       return;
     }
 
@@ -263,6 +308,8 @@ router.post(
     } catch (error) {
       incrementDlqReplay('error');
       next(error);
+    } finally {
+      releaseReplayLock(id);
     }
   },
 );
@@ -287,6 +334,19 @@ router.post(
       return;
     }
 
+    // Deduplicate ids within the request and skip ids already in flight so
+    // that a single batch cannot race against itself or another request.
+    const uniqueIds = Array.from(new Set(ids as string[]));
+    const lockedIds: string[] = [];
+    const skippedIds: string[] = [];
+    for (const id of uniqueIds) {
+      if (acquireReplayLock(id)) {
+        lockedIds.push(id);
+      } else {
+        skippedIds.push(id);
+      }
+    }
+
     try {
       if (!dlqStore) {
         res.status(503).json({ error: 'DLQ store is not initialized' });
@@ -296,7 +356,7 @@ router.post(
       const summary = { successCount: 0, noOpCount: 0, failureCount: 0 };
       const context = extractRequestContext(req);
 
-      for (const id of ids as string[]) {
+      for (const id of lockedIds) {
         const dlqItem = await dlqStore.getEntryById(id);
         if (!dlqItem) {
           summary.failureCount++;
@@ -328,8 +388,16 @@ router.post(
       res.status(200).json({ status: 'batch_completed', auditReason: reason, details: summary });
     } catch (error) {
       next(error);
+    } finally {
+      for (const id of lockedIds) {
+        releaseReplayLock(id);
+      }
     }
   },
 );
 
 export { router as jobsRouter };
+// Note: `randomUUID` is imported for future correlation-id enrichment of
+// replay logs; it is intentionally unused here to avoid changing the public
+// response shape. Remove if not adopted.
+void randomUUID;

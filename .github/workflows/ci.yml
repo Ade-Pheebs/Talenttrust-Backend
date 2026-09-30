@@ -27,6 +27,23 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  contract-compatibility:
+    name: Contract Compatibility
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.91.0
+        with:
+          components: rustfmt, clippy
+      - name: Check contract formatting
+        run: cargo fmt --manifest-path contracts/Cargo.toml -- --check
+      - name: Test storage compatibility
+        run: cargo test --locked --manifest-path contracts/Cargo.toml
+      - name: Check contract warnings
+        run: cargo clippy --locked --manifest-path contracts/Cargo.toml --all-targets -- -D warnings
+      - name: Build contract
+        run: cargo build --locked --manifest-path contracts/Cargo.toml
+
   # ── 1. Lint ────────────────────────────────────────────────────────────────
   lint:
     name: Lint

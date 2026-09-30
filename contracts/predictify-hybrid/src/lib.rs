@@ -17,6 +17,9 @@ mod bets;
 mod errors;
 mod storage;
 
+#[cfg(test)]
+mod storage_compatibility_tests;
+
 pub use bets::Bet;
 pub use errors::Error;
 pub use storage::{DataKey, IDEM_KEY_TTL_LEDGERS};

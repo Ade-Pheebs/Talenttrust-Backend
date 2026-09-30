@@ -16,4 +16,8 @@ pub enum Error {
 
     /// The `bets` vector was empty.  At least one bet is required.
     EmptyBatch = 2,
+
+    /// The saved idempotency marker is not the supported boolean `true`.
+    /// Fail closed without repairing state or exposing its contents.
+    InvalidIdempotencyState = 4,
 }

@@ -2,7 +2,7 @@ use soroban_sdk::{Address, BytesN, Env, Vec};
 
 use crate::{
     errors::Error,
-    storage::{DataKey, IDEM_KEY_TTL_LEDGERS},
+    storage::{is_idempotency_key_consumed, DataKey, IDEM_KEY_TTL_LEDGERS},
 };
 
 /// A single bet submitted inside a batch.
@@ -23,18 +23,19 @@ pub struct Bet {
 ///
 /// * `env`             – Soroban host environment.
 /// * `caller`          – Address of the submitting account; `require_auth` is
-///                       called to authenticate the caller.
+///   called to authenticate the caller.
 /// * `bets`            – Non-empty vector of [`Bet`] entries.
 /// * `idempotency_key` – 32-byte caller-generated token that makes this
-///                       submission unique.  The key is bound to `caller` so
-///                       the same token may be used by different callers
-///                       without conflict.
+///   submission unique. The key is bound to `caller` so the same token may be
+///   used by different callers without conflict.
 ///
 /// # Errors
 ///
 /// * [`Error::EmptyBatch`]                   – `bets` is empty.
 /// * [`Error::IdempotentBatchAlreadyApplied`] – the `(caller, idempotency_key)`
-///                                              pair has already been consumed.
+///   pair has already been consumed.
+/// * [`Error::InvalidIdempotencyState`]       – the saved marker is malformed;
+///   no state is repaired or replaced.
 ///
 /// # Idempotency semantics
 ///
@@ -73,7 +74,7 @@ pub fn place_bets(
     if idempotency_key != zero_key {
         let idem_key = DataKey::PlaceBetsIdem(caller.clone(), idempotency_key.clone());
 
-        if env.storage().instance().has(&idem_key) {
+        if is_idempotency_key_consumed(env, &idem_key)? {
             return Err(Error::IdempotentBatchAlreadyApplied);
         }
 

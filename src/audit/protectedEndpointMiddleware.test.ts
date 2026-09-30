@@ -221,7 +221,7 @@ describe('createProtectedEndpointAuditMiddleware', () => {
 
     expect(consoleSpy).toHaveBeenCalledWith(
       expect.stringContaining('[protectedEndpointAuditMiddleware]'),
-      expect.any(Error),
+      { code: 'protected_audit_write_failed' },
     );
 
     consoleSpy.mockRestore();

@@ -180,7 +180,9 @@ export class AuditService {
       
       return entry;
     } catch (err) {
-      console.error('[AuditService] Failed to persist audit entry:', err);
+      // Persistence exceptions can contain SQL parameters or request metadata.
+      // Keep the diagnostic stable without leaking the rejected entry.
+      console.error('[AuditService] Failed to persist audit entry', { code: 'audit_persist_failed' });
       throw err;
     }
   }

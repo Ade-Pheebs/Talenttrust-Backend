@@ -9,10 +9,13 @@
 //! `DataKey::PlaceBetsIdem(caller, key)` as a
 //! [`bets::BatchReceipt`], with a TTL of
 //! [`storage::IDEM_KEY_TTL_LEDGERS`] ledgers (~24 h).  Repeated
-//! submissions with the same `(caller, key)` pair are rejected with
-//! `Error::IdempotentBatchAlreadyApplied`; once the receipt has expired
-//! the network has deleted it, so the token may be reused as a fresh
-//! batch.
+//! submissions with the same `(caller, key)` pair are rejected: with
+//! `Error::IdempotentBatchAlreadyApplied` when the batch matches the one
+//! the token was spent on, and with
+//! `Error::IdempotencyKeyReusedWithDifferentBatch` when it does not, so
+//! a client can distinguish a harmless duplicate from a token collision.
+//! Once the receipt has expired the network has deleted it, so the token
+//! may be reused as a fresh batch.
 //!
 //! Temporary rather than instance storage is deliberate: the contract
 //! instance is a single bounded ledger entry, so accumulating one
@@ -37,6 +40,8 @@ mod storage;
 
 #[cfg(test)]
 mod batch_operations_tests;
+#[cfg(test)]
+mod bets_concurrency_tests;
 #[cfg(test)]
 mod bets_invariants_tests;
 

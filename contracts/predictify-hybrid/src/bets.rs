@@ -41,25 +41,105 @@
 //!   succeed and expired receipts are deleted by the network rather than
 //!   archived. See [`DataKey`] for why instance and persistent storage are
 //!   both unsafe here.
+//! * **I8 — a spent token is reported honestly.** A replay under a live
+//!   token is classified by comparing the incoming batch against the one the
+//!   token was accepted for: an identical batch returns
+//!   [`Error::IdempotentBatchAlreadyApplied`], a different one returns
+//!   [`Error::IdempotencyKeyReusedWithDifferentBatch`]. Neither is applied,
+//!   and the rejected batch cannot overwrite or disturb the stored receipt.
+//! * **I9 — one claim per invocation, on every path.** The idempotency check
+//!   reads and writes its storage keys exactly once regardless of whether a
+//!   receipt already exists. This keeps the prepared transaction footprint
+//!   read-write in both branches, so a batch is never left un-applied
+//!   because a duplicate raced it; see *Concurrency model* below.
+//!
+//! # Concurrency model
+//!
+//! There is no compare-and-swap in Soroban storage, so mutual exclusion is
+//! provided by the **transaction footprint** rather than by the contract.
+//! The host builds a footprint while simulating and refuses to include two
+//! transactions in one ledger that both declare the same entry
+//! read-write. Everything below follows from taking part in that scheme
+//! deliberately rather than by accident.
+//!
+//! **Same ledger.** Two transactions claiming the same `(caller, key)`
+//! both declare the receipt entry read-write, so the ledger admits at most
+//! one. The loser is *not* rejected by this contract and does not receive
+//! [`Error::IdempotentBatchAlreadyApplied`] — it never executes, and the
+//! submitting client sees a ledger-level transaction-set conflict. That is
+//! a retryable condition: resubmit, and the resubmission lands in a later
+//! ledger, takes the I3 branch, and returns the typed error.
+//!
+//! **Later ledger.** The receipt is authoritative. The winner's entry is
+//! visible, so the replay takes the read path and returns a typed error.
+//! This is why I8 exists: without the fingerprint the loser of a
+//! same-ledger race and a harmless duplicate are indistinguishable, and a
+//! client that treats the response as "already applied" silently drops a
+//! batch it never sent.
+//!
+//! **Different keys and callers.** Receipt entries are keyed per
+//! `(caller, key)`, so unrelated batches never share an entry and never
+//! conflict with each other. The one exception is the contract instance,
+//! discussed below.
+//!
+//! **Stale footprints.** A transaction simulates against one ledger and
+//! may execute against a later one, where storage has moved underneath it.
+//! Two cases follow, and neither is specific to this contract:
+//!
+//! - Simulated with no receipt (declares the entry read-write), executed
+//!   after the receipt exists: the write conflicts with the live entry and
+//!   the host rejects the transaction. The caller re-simulates and gets
+//!   the typed error.
+//! - Simulated with a live receipt (declares the entry read-only, because
+//!   the function returned before writing), executed after the receipt
+//!   expires: the function reaches its write against a read-only footprint
+//!   and the host rejects the transaction.
+//!
+//! I9 keeps the second case from silently changing meaning: the replay path
+//! re-writes the receipt it just read, so both branches declare the same
+//! access type and the footprint never depends on state that can change
+//! between simulation and execution.
+//!
+//! **The contract instance is a shared write point.** Every accepted
+//! batch bumps the contract instance/code TTL, and the contract instance is
+//! a single ledger entry shared by every caller. Because that bump is
+//! threshold-guarded ([`CONTRACT_TTL_THRESHOLD_LEDGERS`]), it performs a
+//! write only while the instance is already close to archival, and so
+//! declares read-write only in that window. In other words: while the
+//! contract is healthy, callers do not serialize on it; while it is within
+//! ~1.4 h of being archived, concurrent `place_bets` calls can start
+//! failing with ledger-level conflicts. The bump is worth keeping — without
+//! it an idle contract is archived and every later call fails outright — but
+//! this coupling is why there is deliberately **no reentrancy guard** here:
+//! one would need an unconditional instance write, permanently serializing
+//! every caller in the contract.
+//!
+//! # Forward-looking constraints for market state
+//!
+//! When market mutations land, they must not read-modify-write shared
+//! market entries without their own conflict handling. Two batches touching
+//! the same market in one ledger will conflict at the footprint level, and
+//! the loser must be retried rather than assumed applied — the same rule
+//! that applies to the receipt entry above.
 //!
 //! # Failure modes
 //!
 //! Every rejection is a typed [`Error`] returned *before* any state is
 //! written: empty batch, oversized batch, `market_id == 0`, non-positive
-//! `amount`, total overflow, and duplicate idempotency key. Because I2
-//! and I4 hold, a caller may retry the *same* token after a rejection —
-//! the token was never consumed. A caller that loses the response of a
-//! *successful* call cannot retry with that token; it should submit a
-//! new batch under a fresh token, which is the only state change a
-//! replay could cause.
+//! `amount`, total overflow, spent idempotency key, and idempotency key
+//! reused with a different batch. Because I2 and I4 hold, a caller may
+//! retry the *same* token after a validation rejection — the token was
+//! never consumed. A caller that loses the response of a *successful* call
+//! cannot retry with that token; it should resubmit the identical batch to
+//! learn which case applies, or submit a new batch under a fresh token.
 
-use soroban_sdk::{Address, BytesN, Env, Symbol, Vec};
+use soroban_sdk::{Address, Bytes, BytesN, Env, Symbol, Vec};
 
 use crate::{
     errors::Error,
     storage::{
         DataKey, CONTRACT_TTL_LEDGERS, CONTRACT_TTL_THRESHOLD_LEDGERS, IDEM_KEY_TTL_LEDGERS,
-        IDEM_KEY_TTL_THRESHOLD_LEDGERS,
+        RECEIPT_EXTEND_THRESHOLD_LEDGERS,
     },
 };
 
@@ -137,9 +217,12 @@ pub struct BatchReceipt {
 /// * [`Error::InvalidBetAmount`]            – a bet had `amount <= 0`.
 /// * [`Error::BatchAmountOverflow`]         – the batch total does not fit in an `i128`.
 /// * [`Error::IdempotentBatchAlreadyApplied`] – the `(caller, idempotency_key)`
-///                                              pair has already been consumed.
+///                                              pair was already spent on *this*
+///                                              batch.
+/// * [`Error::IdempotencyKeyReusedWithDifferentBatch`] – the pair was already
+///                                              spent on a *different* batch.
 ///
-/// All six are returned *before* any state is written, so the caller may
+/// All seven are returned *before* any state is written, so the caller may
 /// correct the payload and retry with the same idempotency key.
 ///
 /// # Idempotency semantics
@@ -147,8 +230,9 @@ pub struct BatchReceipt {
 /// The receipt is written to temporary storage **before** the batch is
 /// applied, and only after the batch has fully validated. If a previous
 /// call with the same key succeeded, the function returns
-/// [`Error::IdempotentBatchAlreadyApplied`] immediately without
-/// re-applying the batch. Once written, the receipt expires after
+/// [`Error::IdempotentBatchAlreadyApplied`] or
+/// [`Error::IdempotencyKeyReusedWithDifferentBatch`] without re-applying
+/// the batch. Once written, the receipt expires after
 /// [`IDEM_KEY_TTL_LEDGERS`] ledgers; after expiry the network has deleted
 /// it, a new submission with the same token is accepted as a fresh
 /// batch, and a client that lost the response of a successful call can
@@ -157,12 +241,14 @@ pub struct BatchReceipt {
 /// instance or persistent storage.
 ///
 /// Writing the receipt before applying is what makes the guarantee hold
-/// under same-ledger concurrency: a second transaction that touches the
-/// same receipt entry conflicts in the host's transaction footprint and
-/// is rejected before it executes; resubmitted in a later ledger it then
-/// fails the `has` check below. If this call instead fails, the host
-/// reverts the receipt together with everything else, so a rejected batch
-/// never burns a token.
+/// under concurrency: the receipt entry is declared read-write by every
+/// invocation, so a racing transaction that targets the same token cannot
+/// be included in the same ledger, and one that lands later sees the
+/// receipt. If this call instead fails, the host reverts the receipt
+/// together with everything else, so a rejected batch never burns a token.
+/// See *Concurrency model* in the module documentation for the exact
+/// guarantees and for what a client observes when it loses a same-ledger
+/// race.
 ///
 /// # Deprecation note — zero-key backward path
 ///
@@ -213,29 +299,66 @@ pub fn place_bets(
 
     if deduplicated {
         let idem_key = DataKey::PlaceBetsIdem(caller.clone(), idempotency_key.clone());
+        let digest_key = DataKey::PlaceBetsDigest(caller.clone(), idempotency_key.clone());
+        let digest = batch_digest(env, &bets);
 
-        // A live receipt means this pair was already applied. Reject
-        // before any mutation so a replay is read-only (I3).
-        if env.storage().temporary().has(&idem_key) {
-            return Err(Error::IdempotentBatchAlreadyApplied);
+        match env
+            .storage()
+            .temporary()
+            .get::<DataKey, BatchReceipt>(&idem_key)
+        {
+            // A live receipt means this pair was already applied. Tell an
+            // honest duplicate apart from a token collision (I8) so the
+            // caller can tell "retry" from "use a new token".
+            Some(_) => {
+                let previous = env
+                    .storage()
+                    .temporary()
+                    .get::<DataKey, BytesN<32>>(&digest_key);
+
+                return Err(match previous {
+                    Some(previous) => {
+                        if previous == digest {
+                            Error::IdempotentBatchAlreadyApplied
+                        } else {
+                            Error::IdempotencyKeyReusedWithDifferentBatch
+                        }
+                    }
+                    // Receipt predates the fingerprint (or the fingerprint
+                    // aged out on its own). Treat it as applied rather
+                    // than as a collision: we cannot prove the batches
+                    // differ, and claiming a conflict we cannot verify
+                    // would be worse than the ambiguity.
+                    None => Error::IdempotentBatchAlreadyApplied,
+                });
+            }
+            None => {
+                // Claim the token *before* the batch is applied. See the
+                // module documentation for why, and for why a later
+                // failure does not burn the token.
+                env.storage().temporary().set(
+                    &idem_key,
+                    &BatchReceipt {
+                        bet_count,
+                        total_amount,
+                        applied_at_ledger: env.ledger().sequence(),
+                    },
+                );
+                env.storage().temporary().extend_ttl(
+                    &idem_key,
+                    RECEIPT_EXTEND_THRESHOLD_LEDGERS,
+                    IDEM_KEY_TTL_LEDGERS,
+                );
+
+                // Fingerprint of the batch this token was spent on.
+                env.storage().temporary().set(&digest_key, &digest);
+                env.storage().temporary().extend_ttl(
+                    &digest_key,
+                    RECEIPT_EXTEND_THRESHOLD_LEDGERS,
+                    IDEM_KEY_TTL_LEDGERS,
+                );
+            }
         }
-
-        // Claim the key *before* the batch is applied. See the module
-        // documentation for why, and for why a later failure does not
-        // burn the token.
-        env.storage().temporary().set(
-            &idem_key,
-            &BatchReceipt {
-                bet_count,
-                total_amount,
-                applied_at_ledger: env.ledger().sequence(),
-            },
-        );
-        env.storage().temporary().extend_ttl(
-            &idem_key,
-            IDEM_KEY_TTL_THRESHOLD_LEDGERS,
-            IDEM_KEY_TTL_LEDGERS,
-        );
     }
 
     // Keep the contract itself reachable. The instance/code entry has its
@@ -269,6 +392,51 @@ pub fn place_bets(
     publish_legacy_place_bets(env, &caller, bet_count);
 
     Ok(())
+}
+
+/// Domain-separation tag for [`batch_digest`].
+///
+/// Versioned so the fingerprint scheme can change later without silently
+/// reinterpreting receipts already on chain: a digest computed under a
+/// different tag simply never matches, which degrades to the I8 fallback
+/// (`IdempotentBatchAlreadyApplied`) instead of a false collision.
+const BATCH_DIGEST_DOMAIN: &[u8] = b"talenttrust/place_bets/batch/v1";
+
+/// Fingerprint the batch a token was spent on, for I8.
+///
+/// SHA-256 over a fixed-width, self-delimiting encoding: the domain tag,
+/// the bet count as 4 little-endian bytes, then 8 bytes of `market_id`
+/// and 16 bytes of `amount` per bet. Fixed widths make the encoding
+/// unambiguous without length prefixes, and every field is written at its
+/// natural width so no value can be re-encoded into a different preimage.
+///
+/// Only fields that decide *what* was submitted are covered. `caller` and
+/// `idempotency_key` are deliberately excluded: they are already part of
+/// the storage key, so including them would add nothing, and this keeps
+/// the fingerprint a property of the batch alone.
+///
+/// The result is order-sensitive, which is the conservative choice: a
+/// reordered batch is a different submission, and reporting it as a
+/// collision is safe in a way that silently treating it as a duplicate
+/// would not be. Callers do not control ordering across a retry anyway —
+/// they resend what they built — so this only ever fires on a genuine
+/// mismatch.
+pub(crate) fn batch_digest(env: &Env, bets: &Vec<Bet>) -> BytesN<32> {
+    let mut preimage = Bytes::from_slice(env, BATCH_DIGEST_DOMAIN);
+
+    for byte in bets.len().to_le_bytes() {
+        preimage.push_back(byte);
+    }
+    for bet in bets.iter() {
+        for byte in bet.market_id.to_le_bytes() {
+            preimage.push_back(byte);
+        }
+        for byte in bet.amount.to_le_bytes() {
+            preimage.push_back(byte);
+        }
+    }
+
+    env.crypto().sha256(&preimage).to_bytes()
 }
 
 /// Validate a batch and return its total stake in stroops.

@@ -380,10 +380,20 @@ fn duplicate_key_after_success_is_read_only() {
     client.place_bets(&user, &batch_of(&env, &[bet(1, 100)]), &idem);
     let after_first = receipt(&env, &id, &user, &idem).expect("receipt must exist");
 
+    // An honest retry of the same batch reads as a duplicate.
+    for _ in 0..3 {
+        assert_eq!(
+            client.try_place_bets(&user, &batch_of(&env, &[bet(1, 100)]), &idem),
+            Err(Ok(Error::IdempotentBatchAlreadyApplied))
+        );
+    }
+
+    // A different batch under the same token reads as a collision, but is
+    // still rejected before any mutation (I8).
     for _ in 0..3 {
         assert_eq!(
             client.try_place_bets(&user, &batch_of(&env, &[bet(2, 999)]), &idem),
-            Err(Ok(Error::IdempotentBatchAlreadyApplied))
+            Err(Ok(Error::IdempotencyKeyReusedWithDifferentBatch))
         );
     }
 

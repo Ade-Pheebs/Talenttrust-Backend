@@ -21,6 +21,12 @@
  * 4. Each convenience wrapper (`logContractEvent`, `logPaymentEvent`,
  *    `logAuthEvent`, `logUserEvent`) sets the correct `resource`,
  *    `resourceId`, and per-action `severity` rule.
+ * 5. Compatibility contracts are pinned at the service boundary:
+ *    `createEntry` rejects missing required fields with a stable message,
+ *    `validateAndParseQuery` rejects malformed action/severity/limit/offset/
+ *    timestamp/cursor inputs and clamps limits, and `exportAuditLogs`
+ *    emits a compliance `ADMIN_ACTION` entry with the caller's context.
+ *    These are the public behaviors that must survive refactors.
  *
  * These tests use a pure in-memory mock `AuditLogRepository` so they are
  * **DB-isolated** (no SQLite, no shared singleton) and **deterministic**.

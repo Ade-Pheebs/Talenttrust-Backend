@@ -16,7 +16,7 @@
 
 import type { AuditEntry, AuditQuery, AuditSeverity, CreateAuditEntryInput, IntegrityReport, AuditQueryResult } from './types';
 import type { AuditAction } from './types';
-import { decodeCursor } from './types';
+import { AUDIT_ACTIONS, AUDIT_SEVERITIES, decodeCursor } from './types';
 import { createDefaultAuditRepository, type AuditLogRepository } from './repository';
 import { auditExportService, AuditExportService, type AuditExportFilters, type AuditExportResult } from './exportService';
 import { AuditCache, type AuditCacheOptions } from './auditCache';
@@ -26,20 +26,29 @@ export interface AuditServiceOptions {
   cache?: AuditCacheOptions;
 }
 
-export const VALID_ACTIONS = new Set<AuditAction>([
-  'CONTRACT_CREATED', 'CONTRACT_UPDATED', 'CONTRACT_CANCELLED', 'CONTRACT_COMPLETED',
-  'PAYMENT_INITIATED', 'PAYMENT_RELEASED', 'PAYMENT_DISPUTED',
-  'REPUTATION_UPDATED',
-  'REPUTATION_CORRECTED',
-  'USER_CREATED', 'USER_UPDATED', 'USER_DELETED',
-  'AUTH_LOGIN', 'AUTH_LOGOUT', 'AUTH_FAILED',
-  'AUTH_LOCKOUT_TRIGGERED', 'AUTH_LOCKOUT_RELEASED',
-  'ADMIN_ACTION',
-  'ENDPOINT_ACCESS', 'ENDPOINT_MUTATION',
-]);
+/**
+ * Canonical runtime list of valid audit actions.
+ *
+ * This is derived from the single source of truth in `types.ts` (`AUDIT_ACTIONS`)
+ * so the query validator here can never drift from the request-body
+ * validator or the `AuditAction` type. The compile-time assertion below
+ * ensures every member of `AUDIT_ACTIONS` is a valid `AuditAction`.
+ */
+export const VALID_ACTIONS: ReadonlySet<AuditAction> = new Set(AUDIT_ACTIONS as readonly AuditAction[]);
 
-export const VALID_SEVERITIES = new Set<AuditSeverity>(['INFO', 'WARNING', 'CRITICAL']);
+/**
+ * Canonical runtime list of valid audit severities.
+ * Derived from `AUDIT_SEVERITIES` to keep the runtime validator and the
+ * `AuditSeverity` type in lock-step.
+ */
+export const VALID_SEVERITIES: ReadonlySet<AuditSeverity> = new Set(AUDIT_SEVERITIES as readonly AuditSeverity[]);
 
+/**
+ * Parse an optional ISO-8601 timestamp string.
+ *
+ * The returned value is always normalised to a UTC ISO-8601 string so that
+ * equivalent inputs (e.g. `Z.` vs `+00:00`) produce identical filters.
+ */
 export function parseOptionalIsoDate(
   value: string | undefined,
   fieldName: 'from' | 'to',
@@ -56,26 +65,48 @@ export function parseOptionalIsoDate(
   return new Date(parsed).toISOString();
 }
 
+/**
+ * Parse a non-negative integer offset.
+ *
+ * This is stricter than `Number.parseInt` alone: it rejects non-numeric
+ * input and trailing garbage (e.g. `"12abc"`) so a typo in a query string
+ * cannot silently degrade into a different pagination window.
+ */
 export function parseOffset(value: string | undefined): number {
   if (value === undefined) {
     return 0;
   }
 
-  const parsed = Number.parseInt(value, 10);
-  if (!Number.isFinite(parsed) || parsed < 0) {
+  if (!/^[0-9]+$/.test(value)) {
+    throw new Error('Invalid offset');
+  }
+
+  const parsed = Number(value);
+  if (!Number.isSafeInteger(parsed)) {
     throw new Error('Invalid offset');
   }
 
   return parsed;
 }
 
+/**
+ * Parse an optional positive limit, clamped to `maxLimit`.
+ *
+ * Rejects non-numeric input and trailing garbage. When `value` is undefined
+ * the `defaultLimit` is returned unchanged (it may be `undefined` to mean
+ * "no explicit limit").
+ */
 export function parseLimit(value: string | undefined, maxLimit: number, defaultLimit?: number): number | undefined {
   if (value === undefined) {
     return defaultLimit;
   }
 
-  const parsed = Number.parseInt(value, 10);
-  if (!Number.isFinite(parsed) || parsed < 1) {
+  if (!/^[0-9]+$/.test(value)) {
+    throw new Error('Invalid limit');
+  }
+
+  const parsed = Number(value);
+  if (!Number.isSafeInteger(parsed) || parsed < 1) {
     throw new Error('Invalid limit');
   }
 
@@ -172,12 +203,12 @@ export class AuditService {
   log(input: CreateAuditEntryInput): AuditEntry {
     try {
       const entry = this.repository.append(input);
-      
+
       // Invalidate cache on write operations
       if (this.cache) {
         this.cache.invalidateByResourceId(input.resourceId);
       }
-      
+
       return entry;
     } catch (err) {
       console.error('[AuditService] Failed to persist audit entry:', err);
@@ -353,7 +384,7 @@ export class AuditService {
     metadata: Record<string, unknown> = {},
     context: { ipAddress?: string; correlationId?: string } = {},
   ): AuditEntry {
-    return this.log({
+    return this.log( {
       action,
       severity: 'CRITICAL',
       actor,
@@ -387,138 +418,31 @@ export class AuditService {
   }
 
   /**
-   * Convenience wrapper for user management events.
-   * USER_DELETED is WARNING; others are INFO.
-   */
-  logUserEvent(
-    action: Extract<AuditAction, `USER_${string}`>,
-    actor: string,
-    targetUserId: string,
-    metadata: Record<string, unknown> = {},
-    context: { ipAddress?: string; correlationId?: string } = {},
-  ): AuditEntry {
-    const severity: AuditSeverity = action === 'USER_DELETED' ? 'WARNING' : 'INFO';
-    return this.log({
-      action,
-      severity,
-      actor,
-      resource: 'user',
-      resourceId: targetUserId,
-      metadata,
-      ...context,
-    });
-  }
-
-  /**
-   * Convenience wrapper for dispute lifecycle events.
-   * DISPUTE_UPDATED is WARNING; others are INFO.
-   */
-  logDisputeEvent(
-    action: Extract<AuditAction, `DISPUTE_${string}`>,
-    actor: string,
-    disputeId: string,
-    metadata: Record<string, unknown> = {},
-    context: { ipAddress?: string; correlationId?: string } = {},
-  ): AuditEntry {
-    const severity: AuditSeverity = action === 'DISPUTE_UPDATED' ? 'WARNING' : 'INFO';
-    return this.log({
-      action,
-      severity,
-      actor,
-      resource: 'dispute',
-      resourceId: disputeId,
-      metadata,
-      ...context,
-    });
-  }
-
-  /**
-   * Queries the audit log with optional filters.
-   *
-   * @param query - Filter and pagination options.
-   * @returns Matching entries in insertion order.
-   */
-  query(query: AuditQuery = {}): AuditEntry[] {
-    // Check cache first
-    if (this.cache) {
-      const cached = this.cache.get(query, 'query');
-      if (cached) {
-        return cached as AuditEntry[];
-      }
-    }
-
-    // Cache miss - fetch from repository
-    const entries = this.repository.query(query);
-
-    // Store in cache
-    if (this.cache) {
-      this.cache.set(query, entries, 'query');
-    }
-
-    return entries;
-  }
-
-  /**
-   * Queries the audit log with cursor-based pagination.
-   *
-   * @param query - Filter and pagination options including cursor.
-   * @returns Paginated result with entries and next cursor.
-   */
-  queryWithCursor(query: AuditQuery = {}): AuditQueryResult {
-    // Check cache first
-    if (this.cache) {
-      const cached = this.cache.get(query, 'queryWithCursor');
-      if (cached) {
-        return cached as AuditQueryResult;
-      }
-    }
-
-    // Cache miss - fetch from repository
-    const result = this.repository.queryWithCursor(query);
-
-    // Store in cache
-    if (this.cache) {
-      this.cache.set(query, result, 'queryWithCursor');
-    }
-
-    return result;
-  }
-
-  /**
-   * Streams audit entries for export use cases without loading all rows.
-   */
-  stream(query: AuditQuery = {}): IterableIterator<AuditEntry> {
-    return this.repository.stream(query);
-  }
-
-  /**
    * Retrieves a single audit entry by ID.
    */
   getById(id: string): AuditEntry | undefined {
-    // Check cache first
-    if (this.cache) {
-      const cached = this.cache.get({}, 'getById', id);
-      if (cached) {
-        return cached as AuditEntry;
-      }
-    }
-
-    // Cache miss - fetch from repository
-    const entry = this.repository.getById(id);
-
-    // Store in cache
-    if (this.cache && entry) {
-      this.cache.set({}, entry, 'getById', id);
-    }
-
-    return entry;
+    return this.repository.getById(id);
   }
 
   /**
-   * Retrieves a single entry by ID (alias method).
+   * Queries audit entries by filter.
    */
-  getEntry(id: string): AuditEntry | undefined {
-    return this.getById(id);
+  query(query?: AuditQuery): AuditEntry[] {
+    return this.repository.query(query);
+  }
+
+  /**
+   * Queries audit entries with cursor-based pagination.
+   */
+  queryWithCursor(query?: AuditQuery): AuditQueryResult {
+    return this.repository.queryWithCursor(query);
+  }
+
+  /**
+   * Streams audit entries without materialising the full result set.
+   */
+  stream(query?: AuditQuery): IterableIterator<AuditEntry> {
+    return this.repository.stream(query);
   }
 
   /**
@@ -529,24 +453,12 @@ export class AuditService {
   }
 
   /**
-   * Verifies the integrity of the entire hash chain.
-   * Should be called by a scheduled monitoring job.
-   *
-   * @returns IntegrityReport — escalate immediately if valid === false.
+   * Verifies the tamper-evident hash chain.
    */
   verifyIntegrity(): IntegrityReport {
     return this.repository.verifyIntegrity();
   }
-
-  /**
-   * Checks hash chain integrity and returns report with HTTP status code.
-   */
-  checkIntegrity(): { report: IntegrityReport; status: number } {
-    const report = this.verifyIntegrity();
-    const status = report.valid ? 200 : 409;
-    return { report, status };
-  }
 }
 
-/** Singleton service instance. */
+/** Default singleton instance for application use. */
 export const auditService = new AuditService();

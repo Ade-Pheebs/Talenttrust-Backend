@@ -16,12 +16,20 @@
  * and both the request-body validator (`audit/inputValidation`) and the query
  * filter validator (`audit/router`) validate against this same array, so a new
  * action can never be accepted by one path and rejected by the other.
+ *
+ * Compatibility contract:
+ * - This array is the canonical runtime enumeration of every accepted action.
+ * - The `AuditAction` type is derived from it, so type and runtime cannot drift.
+ * - Adding a new action is backward-compatible (only widens the union).
+ * - Removing or renaming an action is a breaking change and requires a
+ *   migration plan because persisted entries may reference it.
  */
 export const AUDIT_ACTIONS = [
   'CONTRACT_CREATED',
   'CONTRACT_UPDATED',
   'CONTRACT_CANCELLED',
   'CONTRACT_COMPLETED',
+  'CONTRACT_DELETED',
   'PAYMENT_INITIATED',
   'PAYMENT_RELEASED',
   'PAYMENT_DISPUTED',
@@ -40,41 +48,34 @@ export const AUDIT_ACTIONS = [
   'ENDPOINT_MUTATION',
   'DEPLOYMENT_PROMOTED',
   'DEPLOYMENT_ROLLED_BACK',
+  'MILESTONES_CREATED',
+  'MILESTONES_UPDATED',
+  'MILESTONES_DELETED',
 ] as const;
 
 /** Categories of sensitive state changes that must be audited. */
-export type AuditAction =
-  | 'CONTRACT_CREATED'
-  | 'CONTRACT_UPDATED'
-  | 'CONTRACT_CANCELLED'
-  | 'CONTRACT_COMPLETED'
-  | 'CONTRACT_DELETED'
-  | 'PAYMENT_INITIATED'
-  | 'PAYMENT_RELEASED'
-  | 'PAYMENT_DISPUTED'
-  | 'REPUTATION_UPDATED'
-  | 'REPUTATION_CORRECTED'
-  | 'USER_CREATED'
-  | 'USER_UPDATED'
-  | 'USER_DELETED'
-  | 'AUTH_LOGIN'
-  | 'AUTH_LOGOUT'
-  | 'AUTH_FAILED'
-  | 'AUTH_LOCKOUT_TRIGGERED'
-  | 'AUTH_LOCKOUT_RELEASED'
-  | 'ADMIN_ACTION'
-  | 'ENDPOINT_ACCESS'
-  | 'ENDPOINT_MUTATION'
-  | 'DEPLOYMENT_PROMOTED'
-  | 'DEPLOYMENT_ROLLED_BACK'
-  | 'MILESTONES_CREATED'
-  | 'MILESTONES_UPDATED'
-  | 'MILESTONES_DELETED';
+export type AuditAction = (typeof AUDIT_ACTIONS)[number];
+
+/**
+ * Runtime membership check for audit actions.
+ *
+ * Exposed so that both the request-body validator and the query-filter validator
+ * share exactly the same acceptance rule, preserving the compatibility contract
+ * between the two paths. Narrowing behavior is a type guard, not a coercion.
+ */
+export function isAuditAction(value: unknown): value is AuditAction {
+  return typeof value === 'string' && (AUDIT_ACTIONS as readonly string[]).includes(value);
+}
 
 export const AUDIT_SEVERITIES = ['INFO', 'WARNING', 'CRITICAL'] as const;
 
 /** Severity level of the audit event. */
 export type AuditSeverity = (typeof AUDIT_SEVERITIES)[number];
+
+/** Runtime membership check for audit severities. */
+export function isAuditSeverity(value: unknown): value is AuditSeverity {
+  return typeof value === 'string' && (AUDIT_SEVERITIES as readonly string[]).includes(value);
+}
 
 /**
  * An immutable audit log entry.
@@ -99,7 +100,7 @@ export interface AuditEntry {
    * Structured metadata about the change.
    * Must NOT contain raw PII — callers are responsible for sanitisation.
    */
-  readonly metadata: Readonly<Record<string, unknown>>;
+  readonly metadata: Readonly<Record<string, unknown>;
   /** IP address of the request origin, if available. */
   readonly ipAddress?: string;
   /** Correlation ID for tracing across services. */

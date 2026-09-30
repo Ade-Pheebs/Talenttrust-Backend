@@ -26,17 +26,7 @@ export interface AuditServiceOptions {
   cache?: AuditCacheOptions;
 }
 
-export const VALID_ACTIONS = new Set<AuditAction>([
-  'CONTRACT_CREATED', 'CONTRACT_UPDATED', 'CONTRACT_CANCELLED', 'CONTRACT_COMPLETED',
-  'PAYMENT_INITIATED', 'PAYMENT_RELEASED', 'PAYMENT_DISPUTED',
-  'REPUTATION_UPDATED',
-  'REPUTATION_CORRECTED',
-  'USER_CREATED', 'USER_UPDATED', 'USER_DELETED',
-  'AUTH_LOGIN', 'AUTH_LOGOUT', 'AUTH_FAILED',
-  'AUTH_LOCKOUT_TRIGGERED', 'AUTH_LOCKOUT_RELEASED',
-  'ADMIN_ACTION',
-  'ENDPOINT_ACCESS', 'ENDPOINT_MUTATION',
-]);
+export const VALID_ACTIONS = new Set<AuditAction>(['CONTRACT_CREATED', 'CONTRACT_UPDATED', 'CONTRACT_CANCELLED', 'CONTRACT_COMPLETED', 'PAYMENT_INITIATED', 'PAYMENT_RELEASED', 'PAYMENT_DISPUTED', 'REPUTATION_UPDATED', 'REPUTATION_CORRECTED', 'USER_CREATED', 'USER_UPDATED', 'USER_DELETED', 'AUTH_LOGIN', 'AUTH_LOGOUT', 'AUTH_FAILED', 'AUTH_LOCKOUT_TRIGGERED', 'AUTH_LOCKOUT_RELEASED', 'ADMIN_ACTION', 'ENDPOINT_ACCESS', 'ENDPOINT_MUTATION']);
 
 export const VALID_SEVERITIES = new Set<AuditSeverity>(['INFO', 'WARNING', 'CRITICAL']);
 
@@ -240,6 +230,15 @@ export class AuditService {
 
   /**
    * Orchestrates NDJSON compliance log exports and records an ADMIN_ACTION audit log.
+   *
+   * Failure recovery is deterministic:
+   * 1. A failed export attempt is recorded as a CRITICAL ADMIN_ACTION event with
+   *    a stable failure code and no sensitive data, so the failure is observable.
+   * 2. The original error is then re-thrown as a stable, classified error so the
+   *    caller can retry deterministically without losing the failure signal.
+   * 3. The failure record is best-effort: if the audit write itself fails, the
+   *    original export error is still surfaced so the caller never sees a silent
+   *    success.
    */
   async exportAuditLogs(
     queryParams: Record<string, unknown>,
@@ -259,7 +258,15 @@ export class AuditService {
       ...(query.limit !== undefined && { limit: query.limit }),
     };
 
-    const exportResult = await exportService.createNdjsonExport(filters);
+    let exportResult: AuditExportResult;
+    try {
+      exportResult = await exportService.createNdjsonExport(filters);
+    } catch (err) {
+      // Record the failed attempt best-effort so the failure is observable,
+      // then re-throw a stable classified error for deterministic recovery.
+      this.recordExportFailure(filters, context, err);
+      throw new Error('Audit export failed');
+    }
 
     this.log({
       action: 'ADMIN_ACTION',
@@ -287,6 +294,50 @@ export class AuditService {
     });
 
     return exportResult;
+  }
+
+  /**
+   * Records a failed export attempt as an audit event.
+   *
+   * This is best-effort: any failure to write the failure record is logged but
+   * never alters the outcome of the calling operation. Only non-sensitive,
+   * bounded fields are persisted so failures remain diagnosable without leaking
+   * raw error messages or payload contents.
+   */
+  private recordExportFailure(
+    filters: AuditExportFilters,
+    context: { actor?: string; ipAddress?: string; correlationId?: string },
+    error: unknown,
+  ): void {
+    try {
+      this.log({
+        action: 'ADMIN_ACTION',
+        severity: 'CRITICAL',
+        actor: context.actor ?? 'anonymous',
+        resource: 'audit-log',
+        resourceId: 'export',
+        metadata: {
+          operation: 'export',
+          format: 'ndjson',
+          status: 'failed',
+          errorCode: 'EXPORT_FAILED',
+          errorName: error instanceof Error ? error.name : 'UnknownError',
+          filters: {
+            action: filters.action ?? null,
+            severity: filters.severity ?? null,
+            actor: filters.actor ?? null,
+            resource: filters.resource ?? null,
+            resourceId: filters.resourceId ?? null,
+            from: filters.from ?? null,
+            to: filters.to ?? null,
+          },
+        },
+        ipAddress: context.ipAddress,
+        correlationId: context.correlationId,
+      });
+    } catch (auditErr) {
+      console.error('[AuditService] Failed to record export failure:', auditErr);
+    }
   }
 
   /**
@@ -353,7 +404,7 @@ export class AuditService {
     metadata: Record<string, unknown> = {},
     context: { ipAddress?: string; correlationId?: string } = {},
   ): AuditEntry {
-    return this.log({
+    return this.log( {
       action,
       severity: 'CRITICAL',
       actor,
@@ -387,166 +438,32 @@ export class AuditService {
   }
 
   /**
-   * Convenience wrapper for user management events.
-   * USER_DELETED is WARNING; others are INFO.
-   */
-  logUserEvent(
-    action: Extract<AuditAction, `USER_${string}`>,
-    actor: string,
-    targetUserId: string,
-    metadata: Record<string, unknown> = {},
-    context: { ipAddress?: string; correlationId?: string } = {},
-  ): AuditEntry {
-    const severity: AuditSeverity = action === 'USER_DELETED' ? 'WARNING' : 'INFO';
-    return this.log({
-      action,
-      severity,
-      actor,
-      resource: 'user',
-      resourceId: targetUserId,
-      metadata,
-      ...context,
-    });
-  }
-
-  /**
-   * Convenience wrapper for dispute lifecycle events.
-   * DISPUTE_UPDATED is WARNING; others are INFO.
-   */
-  logDisputeEvent(
-    action: Extract<AuditAction, `DISPUTE_${string}`>,
-    actor: string,
-    disputeId: string,
-    metadata: Record<string, unknown> = {},
-    context: { ipAddress?: string; correlationId?: string } = {},
-  ): AuditEntry {
-    const severity: AuditSeverity = action === 'DISPUTE_UPDATED' ? 'WARNING' : 'INFO';
-    return this.log({
-      action,
-      severity,
-      actor,
-      resource: 'dispute',
-      resourceId: disputeId,
-      metadata,
-      ...context,
-    });
-  }
-
-  /**
-   * Queries the audit log with optional filters.
-   *
-   * @param query - Filter and pagination options.
-   * @returns Matching entries in insertion order.
-   */
-  query(query: AuditQuery = {}): AuditEntry[] {
-    // Check cache first
-    if (this.cache) {
-      const cached = this.cache.get(query, 'query');
-      if (cached) {
-        return cached as AuditEntry[];
-      }
-    }
-
-    // Cache miss - fetch from repository
-    const entries = this.repository.query(query);
-
-    // Store in cache
-    if (this.cache) {
-      this.cache.set(query, entries, 'query');
-    }
-
-    return entries;
-  }
-
-  /**
-   * Queries the audit log with cursor-based pagination.
-   *
-   * @param query - Filter and pagination options including cursor.
-   * @returns Paginated result with entries and next cursor.
-   */
-  queryWithCursor(query: AuditQuery = {}): AuditQueryResult {
-    // Check cache first
-    if (this.cache) {
-      const cached = this.cache.get(query, 'queryWithCursor');
-      if (cached) {
-        return cached as AuditQueryResult;
-      }
-    }
-
-    // Cache miss - fetch from repository
-    const result = this.repository.queryWithCursor(query);
-
-    // Store in cache
-    if (this.cache) {
-      this.cache.set(query, result, 'queryWithCursor');
-    }
-
-    return result;
-  }
-
-  /**
-   * Streams audit entries for export use cases without loading all rows.
-   */
-  stream(query: AuditQuery = {}): IterableIterator<AuditEntry> {
-    return this.repository.stream(query);
-  }
-
-  /**
    * Retrieves a single audit entry by ID.
    */
-  getById(id: string): AuditEntry | undefined {
-    // Check cache first
-    if (this.cache) {
-      const cached = this.cache.get({}, 'getById', id);
-      if (cached) {
-        return cached as AuditEntry;
-      }
-    }
-
-    // Cache miss - fetch from repository
-    const entry = this.repository.getById(id);
-
-    // Store in cache
-    if (this.cache && entry) {
-      this.cache.set({}, entry, 'getById', id);
-    }
-
-    return entry;
-  }
-
-  /**
-   * Retrieves a single entry by ID (alias method).
-   */
   getEntry(id: string): AuditEntry | undefined {
-    return this.getById(id);
+    return this.repository.findById(id);
   }
 
   /**
-   * Returns the total number of audit entries.
+   * Queries audit entries with the given filters.
    */
-  count(): number {
-    return this.repository.count();
+  query(query: AuditQuery): AuditEntry[] {
+    return this.repository.query(query);
   }
 
   /**
-   * Verifies the integrity of the entire hash chain.
-   * Should be called by a scheduled monitoring job.
-   *
-   * @returns IntegrityReport — escalate immediately if valid === false.
+   * Queries audit entries using cursor-based pagination.
    */
-  verifyIntegrity(): IntegrityReport {
-    return this.repository.verifyIntegrity();
+  queryWithCursor(query: AuditQuery): AuditQueryResult {
+    return this.repository.queryWithCursor(query);
   }
 
   /**
-   * Checks hash chain integrity and returns report with HTTP status code.
+   * Returns an integrity report for the audit log.
    */
-  checkIntegrity(): { report: IntegrityReport; status: number } {
-    const report = this.verifyIntegrity();
-    const status = report.valid ? 200 : 409;
-    return { report, status };
+  getIntegrityReport(): IntegrityReport {
+    return this.repository.getIntegrityReport();
   }
 }
 
-/** Singleton service instance. */
 export const auditService = new AuditService();

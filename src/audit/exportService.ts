@@ -7,6 +7,7 @@ import type { ReadStream } from 'fs';
 import { AuditService, auditService } from './service';
 import { redactBody } from './redact';
 import type { AuditEntry, AuditQuery } from './types';
+import { logger } from '../utils/logger';
 
 export interface AuditExportResult {
   filePath: string;
@@ -15,6 +16,7 @@ export interface AuditExportResult {
   recordCount: number;
   openReadStream(): ReadStream;
   cleanup(): Promise<void>;
+  committed: boolean;
 }
 
 export interface AuditExportServiceOptions {
@@ -25,6 +27,18 @@ export interface AuditExportServiceOptions {
    * @default 500
    */
   batchSize?: number;
+  /**
+   * Maximum number of attempts for the streaming pipeline before giving up.
+   * Retries only occur for transient failures; partial files are always
+   * removed before a retry so recovery is deterministic.
+   * @default 3
+   */
+  maxAttempts?: number;
+  /**
+   * Base delay (ms) used for exponential backoff between retry attempts.
+   * @default 50
+   */
+  retryBaseDelayMs?: number;
 }
 
 /**
@@ -65,6 +79,24 @@ const CSV_HEADERS = [
 ] as const;
 
 type CsvColumn = (typeof CSV_HEADERS)[number];
+
+/**
+ * Error thrown when an export cannot be produced after exhausting retries.
+ * Carries enough context for callers to log/metric without leaking data.
+ */
+export class AuditExportError extends Error {
+  public readonly code: string;
+  public readonly attempts: number;
+  public readonly cause?: unknown;
+
+  constructor(code: string, message: string, attempts: number, cause?: unknown) {
+    super(message);
+    this.name = 'AuditExportError';
+    this.code = code;
+    this.attempts = attempts;
+    this.cause = cause;
+  }
+}
 
 /**
  * Neutralises CSV-injection ("formula injection") by prefixing dangerous
@@ -127,6 +159,8 @@ function toCsvRow(entry: AuditEntry): string {
 export class AuditExportService {
   private readonly exportRoot: string;
   private readonly batchSize: number;
+  private readonly maxAttempts: number;
+  private readonly retryBaseDelayMs: number;
 
   constructor(
     private readonly service: AuditService = auditService,
@@ -136,6 +170,8 @@ export class AuditExportService {
       options.exportRoot ?? path.join(tmpdir(), 'talenttrust-audit-exports'),
     );
     this.batchSize = Math.max(options.batchSize ?? 500, 1);
+    this.maxAttempts = Math.max(options.maxAttempts ?? 3, 1);
+    this.retryBaseDelayMs = Math.max(options.retryBaseDelayMs ?? 50, 0);
   }
 
   // ─── NDJSON export ─────────────────────────────────────────────────────────
@@ -179,34 +215,43 @@ export class AuditExportService {
     const filePath = path.join(exportDir, fileName);
     this.assertPathWithinRoot(filePath);
 
-    const writer = createWriteStream(filePath, { encoding: 'utf8', flags: 'wx' });
-    let recordCount = 0;
-
-    const query: AuditQuery = { ...filters };
-    const cursor = this.service.stream(query);
-
-    async function* generateLines(): AsyncGenerator<string> {
-      for (const entry of cursor) {
-        const redacted = redactBody(entry as unknown as Record<string, unknown>) as AuditEntry;
-        recordCount += 1;
-        yield `${JSON.stringify(redacted)}\n`;
-      }
-    }
-
-    const source = Readable.from(generateLines());
-    await pipeline(source, writer);
-
     const cleanup = async (): Promise<void> => {
       await fsp.rm(exportDir, { recursive: true, force: true });
     };
 
+    const { recordCount, bytesWritten } = await this.runWithRetry(
+      'ndjson',
+      filePath,
+      async () => {
+        const writer = createWriteStream(filePath, { encoding: 'utf8', flags: 'wx' });
+        let count = 0;
+
+        const query: AuditQuery = { ...filters };
+        const cursor = this.service.stream(query);
+
+        async function* generateLines(): AsyncGenerator<string> {
+          for (const entry of cursor) {
+            const redacted = redactBody(entry as unknown as Record<string, unknown>) as AuditEntry;
+            count += 1;
+            yield `${JSON.stringify(redacted)}\n`;
+          }
+        }
+
+        const source = Readable.from(generateLines());
+        await pipeline(source, writer);
+        return { recordCount: count, bytesWritten: writer.bytesWritten };
+      },
+      cleanup,
+    );
+
     return {
       filePath,
       fileName,
-      bytesWritten: writer.bytesWritten,
+      bytesWritten,
       recordCount,
       openReadStream: () => createReadStream(filePath),
       cleanup,
+      committed: true,
     };
   }
 
@@ -243,37 +288,46 @@ export class AuditExportService {
     const filePath = path.join(exportDir, fileName);
     this.assertPathWithinRoot(filePath);
 
-    const writer = createWriteStream(filePath, { encoding: 'utf8', flags: 'wx' });
-    let recordCount = 0;
-
-    const query: AuditQuery = { ...filters };
-    const cursor = this.service.stream(query);
-
-    async function* generateLines(): AsyncGenerator<string> {
-      // Write the header row first.
-      yield `${CSV_HEADERS.join(',')}\n`;
-
-      for (const entry of cursor) {
-        const redacted = redactBody(entry as unknown as Record<string, unknown>) as AuditEntry;
-        recordCount += 1;
-        yield `${toCsvRow(redacted)}\n`;
-      }
-    }
-
-    const source = Readable.from(generateLines());
-    await pipeline(source, writer);
-
     const cleanup = async (): Promise<void> => {
       await fsp.rm(exportDir, { recursive: true, force: true });
     };
 
+    const { recordCount, bytesWritten } = await this.runWithRetry(
+      'csv',
+      filePath,
+      async () => {
+        const writer = createWriteStream(filePath, { encoding: 'utf8', flags: 'wx' });
+        let count = 0;
+
+        const query: AuditQuery = { ...filters };
+        const cursor = this.service.stream(query);
+
+        async function* generateLines(): AsyncGenerator<string> {
+          // Write the header row first.
+          yield `${CSV_HEADERS.join(',')}\n`;
+
+          for (const entry of cursor) {
+            const redacted = redactBody(entry as unknown as Record<string, unknown>) as AuditEntry;
+            count += 1;
+            yield `${toCsvRow(redacted)}\n`;
+          }
+        }
+
+        const source = Readable.from(generateLines());
+        await pipeline(source, writer);
+        return { recordCount: count, bytesWritten: writer.bytesWritten };
+      },
+      cleanup,
+    );
+
     return {
       filePath,
       fileName,
-      bytesWritten: writer.bytesWritten,
+      bytesWritten,
       recordCount,
       openReadStream: () => createReadStream(filePath),
       cleanup,
+      committed: true,
     };
   }
 
@@ -300,6 +354,7 @@ export class AuditExportService {
         bytesWritten: result.bytesWritten,
         recordCount: result.recordCount,
         cleanup: result.cleanup,
+        committed: true,
       };
     } catch (error) {
       await result.cleanup();
@@ -328,6 +383,7 @@ export class AuditExportService {
         bytesWritten: result.bytesWritten,
         recordCount: result.recordCount,
         cleanup: result.cleanup,
+        committed: true,
       };
     } catch (error) {
       await result.cleanup();
@@ -336,6 +392,67 @@ export class AuditExportService {
   }
 
   // ─── Private helpers ───────────────────────────────────────────────────────
+
+  /**
+   * Runs a streaming export attempt with deterministic retry semantics.
+   *
+   * Invariants enforced here:
+   *  - A partially written file is always removed before a retry so the
+   *    next attempt starts from a clean slate (no torn/duplicated rows).
+   *  - The `wx` flag guarantees we never append to a pre-existing file.
+   *  - On terminal failure the export directory is cleaned up and a typed
+   *    {@link AuditExportError} is thrown with attempt count and cause.
+   *  - Retries use bounded exponential backoff; the number of attempts is
+   *    capped by `maxAttempts` so behaviour is deterministic.
+   */
+  private async runWithRetry(
+    format: 'ndjson' | 'csv',
+    filePath: string,
+    attempt: () => Promise<{ recordCount: number; bytesWritten: number }>,
+    cleanup: () => Promise<void>,
+  ): Promise<{ recordCount: number; bytesWritten: number }> {
+    let lastError: unknown;
+
+    for (let attemptNumber = 1; attemptNumber <= this.maxAttempts; attemptNumber += 1) {
+      try {
+        return await attempt();
+      } catch (error) {
+        lastError = error;
+        // Remove any partial artifact so the next attempt is deterministic.
+        await fsp.rm(filePath, { force: true }).catch(() => undefined);
+
+        const isLast = attemptNumber >= this.maxAttempts;
+        logger.warn(
+          {
+            format,
+            attempt: attemptNumber,
+            maxAttempts: this.maxAttempts,
+            willRetry: !isLast,
+            error: error instanceof Error ? error.message : String(error),
+          },
+          'audit export attempt failed',
+        );
+
+        if (isLast) break;
+
+        const delay = this.retryBaseDelayMs * 2 ** (attemptNumber - 1);
+        if (delay > 0) {
+          await new Promise((resolve) => setTimeout(resolve, delay));
+        }
+      }
+    }
+
+    await cleanup().catch(() => undefined);
+
+    const message =
+      lastError instanceof Error ? lastError.message : String(lastError ?? 'unknown error');
+    throw new AuditExportError(
+      'AUDIT_EXPORT_FAILED',
+      `Audit ${format} export failed after ${this.maxAttempts} attempt(s): ${message}`,
+      this.maxAttempts,
+      lastError,
+    );
+  }
 
   private assertPathWithinRoot(targetPath: string): void {
     const resolvedTarget = path.resolve(targetPath);

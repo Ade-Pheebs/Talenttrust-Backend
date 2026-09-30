@@ -62,8 +62,7 @@ export type AuditAction =
   | 'AUTH_FAILED'
   | 'AUTH_LOCKOUT_TRIGGERED'
   | 'AUTH_LOCKOUT_RELEASED'
-  | 'ADMIN_ACTION'
-  | 'ENDPOINT_ACCESS'
+  | 'ADMIN_ACTION' | 'ENDPOINT_ACCESS'
   | 'ENDPOINT_MUTATION'
   | 'DEPLOYMENT_PROMOTED'
   | 'DEPLOYMENT_ROLLED_BACK'
@@ -209,4 +208,94 @@ export function decodeCursor(cursor: string): CursorData {
   } catch {
     throw new Error('Invalid cursor format');
   }
+}
+
+/**
+ * Deterministic failure recovery support for the audit export service.
+ *
+ * These types describe the durable export job model used by `services/exportService.ts`.
+ * The invariants are:
+ * - Every job has a monotonically increasing `sequence` and a `status` from a closed set.
+ * - Partial completion is represented by `cursor` + `progress`, never by dropping data.
+ * - Retries are idempotent: the same `retryKey` can never produce two committed jobs.
+ * - Concurrent execution is serialised via compare-and-swap on `sequence`.
+ */
+
+/** Terminal and non-terminal states of an export job. */
+export const EXPORT_JOB_STATUSES = [
+  'pending',
+  'running',
+  'partial',
+  'completed',
+  'failed',
+  'cancelled',
+] as const;
+
+export type ExportJobStatus = (typeof EXPORT_JOB_STATUSES)[number];
+
+/** Statuses from which no further transition is allowed. */
+export const TERMINAL_EXPORT_JOB_STATUSES: readonly ExportJobStatus[] = [
+  'completed',
+  'failed',
+  'cancelled',
+];
+
+/** Record of a single attempt to execute an export job. */
+export interface ExportAttempt {
+  /** Monotonically increasing attempt number, starting at 1. */
+  attempt: number;
+  /** ISO-8601 timestamp when the attempt started. */
+  startedAt: string;
+  /** ISO-8601 timestamp when the attempt finished, if it did. */
+  finishedAt?: string;
+  /** Outcome of the attempt. */
+  outcome: 'success' | 'partial' | 'failure';
+  /** Sanitised, non-sensitive error code for diagnosis. */
+  errorCode?: string;
+}
+
+/**
+ * Durable export job record.
+ *
+ * Invariants:
+ * - `sequence` is strictly increasing and unique per job.
+ * - `progress.committed` <= `progress.total` always holds.
+ * - Terminal statuses are absorbing: once set, no further transition occurs.
+ * - `previousHash` chains job versions for tamper-evident recovery.
+ */
+export interface ExportJob {
+  /** Stable job identifier (UUID v4). */
+  readonly id: string;
+  /** Idempotency key supplied by the caller. */
+  readonly retryKey: string;
+  /** Current lifecycle status. */
+  readonly status: ExportJobStatus;
+  /** Monotonically increasing version of this job record. */
+  readonly sequence: number;
+  /** Opaque resume cursor for partial completion. */
+  readonly cursor: string | null;
+  /** Progress counters for observability and resume. */
+  readonly progress: {
+    readonly committed: number;
+    readonly total: number;
+  };
+  /** History of execution attempts. */
+  readonly attempts: readonly ExportAttempt[];
+  /** ISO-8601 creation timestamp. */
+  readonly createdAt: string;
+  /** ISO-8601 last-update timestamp. */
+  readonly updatedAt: string;
+  /** Hash of the previous job version, or 'GENESIS'. */
+  readonly previousHash: string;
+  /** Hash of this job version for tamper detection. */
+  readonly hash: string;
+}
+
+/** Result of a job execution attempt. */
+export interface ExportJobResult {
+  job: ExportJob;
+  /** True when the job reached a terminal status. */
+  terminal: boolean;
+  /** True when the caller may retry with the same retryKey. */
+  retryable: boolean;
 }

@@ -24,6 +24,9 @@
  *   - Non-empty userId: req.user.userId is always a non-empty string
  *   - Deterministic validation: Same input always produces same output
  *   - Fail-safe: Validation failure results in 401, never calls next()
+ *   - Response integrity: Middleware never sends response if already sent
+ *   - Tamper-proof: req.user is frozen to prevent downstream mutation
+ *   - Runtime validation: Existing req.user is validated before reuse
  */
 
 import { Request, Response, NextFunction } from 'express';
@@ -52,8 +55,50 @@ export interface TokenPayload {
 }
 
 /** Express request extended with authenticated user info. */
-export interface AuthenticatedRequest extends Request {
+export interface AuthenticatedRequest extends Omit<Request, 'user'> {
   user?: TokenPayload;
+}
+
+/**
+ * Validates that an object conforms to TokenPayload structure at runtime.
+ * This protects against tampering of req.user by downstream middleware.
+ *
+ * @param value - The value to validate.
+ * @returns True if the value is a valid TokenPayload, false otherwise.
+ */
+function isValidTokenPayload(value: unknown): value is TokenPayload {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+    return false;
+  }
+
+  const payload = value as Record<string, unknown>;
+  
+  // Validate userId
+  if (typeof payload.userId !== 'string' || payload.userId.trim().length === 0) {
+    return false;
+  }
+
+  // Validate role
+  if (typeof payload.role !== 'string') {
+    return false;
+  }
+
+  if (!VALID_ROLES.includes(payload.role as Role)) {
+    return false;
+  }
+
+  return true;
+}
+
+/**
+ * Checks if the response has already been sent.
+ * This prevents double-sending responses which would cause an error.
+ *
+ * @param res - Express response object.
+ * @returns True if response headers have been sent, false otherwise.
+ */
+function isResponseSent(res: Response): boolean {
+  return res.headersSent;
 }
 
 /**
@@ -145,6 +190,9 @@ export function createToken(userId: string, role: Role): string {
  * State invariants enforced:
  *   - Single authentication: req.user is set exactly once per request
  *   - Immutable identity: If req.user already exists, it is not overwritten
+ *   - Tamper-proof: req.user is frozen after setting to prevent downstream mutation
+ *   - Runtime validation: Existing req.user is validated before reuse
+ *   - Response integrity: Never sends response if already sent
  *   - Fail-safe: Validation failure results in 401, never calls next()
  *   - Deterministic: Same request always produces same result
  *   - Consistent error format: All 401 responses have { error: string }
@@ -154,8 +202,21 @@ export function authenticateMiddleware(
   res: Response,
   next: NextFunction,
 ): void {
+  // Invariant: Response integrity - check before attempting to send
+  if (isResponseSent(res)) {
+    authLogger.error('Response already sent, cannot authenticate');
+    return;
+  }
+
   // Invariant: Single authentication - prevent identity changes mid-request
   if (req.user) {
+    // Invariant: Runtime validation - ensure existing user is still valid
+    if (!isValidTokenPayload(req.user)) {
+      authLogger.error('Existing req.user is invalid or tampered, rejecting request');
+      res.status(500).json({ error: 'Internal authentication error' });
+      return;
+    }
+
     // Identity already established - log and continue (idempotency)
     authLogger.warn('Authentication already performed, skipping re-authentication', {
       existingUserId: req.user.userId,
@@ -170,7 +231,9 @@ export function authenticateMiddleware(
   // Invariant: Header must exist and be a string
   if (!header || typeof header !== 'string') {
     authLogger.warn('Missing Authorization header');
-    res.status(401).json({ error: 'Missing or invalid Authorization header' });
+    if (!isResponseSent(res)) {
+      res.status(401).json({ error: 'Missing or invalid Authorization header' });
+    }
     return;
   }
 
@@ -179,7 +242,9 @@ export function authenticateMiddleware(
     authLogger.warn('Invalid Authorization header format', {
       prefix: header.substring(0, 10),
     });
-    res.status(401).json({ error: 'Missing or invalid Authorization header' });
+    if (!isResponseSent(res)) {
+      res.status(401).json({ error: 'Missing or invalid Authorization header' });
+    }
     return;
   }
 
@@ -188,7 +253,9 @@ export function authenticateMiddleware(
   // Invariant: Token must not be empty after 'Bearer ' prefix
   if (token.length === 0) {
     authLogger.warn('Empty token after Bearer prefix');
-    res.status(401).json({ error: 'Invalid token' });
+    if (!isResponseSent(res)) {
+      res.status(401).json({ error: 'Invalid token' });
+    }
     return;
   }
 
@@ -199,16 +266,21 @@ export function authenticateMiddleware(
     authLogger.warn('Token validation failed', {
       tokenLength: token.length,
     });
-    res.status(401).json({ error: 'Invalid token' });
+    if (!isResponseSent(res)) {
+      res.status(401).json({ error: 'Invalid token' });
+    }
     return;
   }
 
   // Invariant: Set req.user exactly once (single authentication)
   req.user = payload;
 
-  // Invariant: Log successful authentication for diagnostics
+  // Invariant: Tamper-proof - freeze req.user to prevent downstream mutation
+  Object.freeze(req.user);
+
+  // Invariant: Log successful authentication for diagnostics (redact sensitive data)
   authLogger.info('Authentication successful', {
-    userId: payload.userId,
+    userId: payload.userId.substring(0, 8) + '...', // Redact for security
     role: payload.role,
   });
 

@@ -125,8 +125,9 @@ export class PerContractEventOrdering {
   private static readonly MAX_REJECTIONS = 100;
 
   constructor(config: Partial<EventOrderingConfig> = {}) {
-    this.config = { ...DEFAULT_ORDERING_CONFIG, ...config };
-    this.clock = this.config.clock ?? SystemClock;
+    const clock = config.clock ?? SystemClock;
+    this.config = { ...DEFAULT_ORDERING_CONFIG, ...config, clock };
+    this.clock = clock;
   }
 
   /** Expected next sequence for a contract, or `null` when unanchored. */

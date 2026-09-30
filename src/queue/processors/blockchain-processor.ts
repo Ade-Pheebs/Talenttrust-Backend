@@ -9,6 +9,16 @@ import { BlockchainSyncPayload, JobResult } from '../types';
 import { createLogger } from '../../logger';
 import { InvalidJobPayloadError } from '../queue-errors';
 import { eventAuditService } from '../../events/registry';
+import { evaluateReorg, ReorgDetectorConfig } from '../../finality/reorgDetector';
+import { rewindAfterReorg } from '../../finality/rewindService';
+import type { ReorgEvaluation } from '../../finality/reorgDetector';
+
+const DEFAULT_REORG_CONFIG: ReorgDetectorConfig = { maxRewindDepth: 100 };
+const lastKnownHeads = new Map<string, number>();
+async function reorgHandler(network: string, reorgEval: ReorgEvaluation, previousHead: number): Promise<void> {
+  const currentHead = previousHead - reorgEval.depth;
+  await rewindAfterReorg(network, previousHead, currentHead, DEFAULT_REORG_CONFIG);
+}
 
 /**
  * Finality promotion callback invoked after a successful sync. Flips
@@ -111,7 +121,7 @@ export async function processBlockchainSync(
     });
 
     try {
-      await reorgHandler(payload.network, reorgEval);
+      await reorgHandler(payload.network, reorgEval, previousHead);
     } catch (error) {
       log.error('Blockchain sync aborted: reorg rewind failed', {
         error: error instanceof Error ? error.message : 'Unknown reorg error',

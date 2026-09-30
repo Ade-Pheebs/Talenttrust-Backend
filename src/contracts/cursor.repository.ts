@@ -60,7 +60,7 @@ export function decodeCursor(cursor: string): CursorPosition {
     typeof parsed !== 'object' ||
     parsed === null ||
     typeof (parsed as Record<string, unknown>)['createdAt'] !== 'string' ||
-    typeof (parsed as Record<string, unknown>)[id'] !== 'string'
+    typeof (parsed as Record<string, unknown>)['id'] !== 'string'
   ) {
     throw new Error('Invalid pagination cursor: missing required fields');
   }
@@ -235,8 +235,10 @@ export class InMemoryCursorRepository implements CursorRepository {
     if (existing === undefined) {
       // No cursor to rewind — create one at the target sequence.
       const now = new Date().toISOString();
+      const parsed = parseSourceId(sourceId);
       const cursor: IndexerCursor = {
         sourceId,
+        ...parsed,
         lastSequence: toSequence,
         updatedAt: now,
       };

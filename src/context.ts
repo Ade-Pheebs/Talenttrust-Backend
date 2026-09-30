@@ -19,6 +19,8 @@
  */
 
 import { AsyncLocalStorage } from 'async_hooks';
+import type { Request, Response, NextFunction } from 'express';
+import { requestContextStore } from './middleware/requestContext';
 
 /**
  * Arbitrary request-scoped metadata carried through an async call chain.
@@ -42,4 +44,25 @@ export const requestContextStorage = new AsyncLocalStorage<RequestContext>();
  */
 export function getContext(): RequestContext | undefined {
   return requestContextStorage.getStore();
+}
+
+/**
+ * Express middleware that seeds the AsyncLocalStorage context with the
+ * requestId and correlationId from the request headers / res.locals.
+ *
+ * Re-exported here so `app.ts` can import it from `./context` without
+ * importing from the middleware sub-folder directly.
+ */
+export function requestContextMiddleware(
+  req: Request,
+  res: Response,
+  next: NextFunction,
+): void {
+  const existing = requestContextStore.getStore();
+  const enriched: RequestContext = {
+    ...(existing ?? {}),
+    requestId: res.locals.requestId ?? req.headers['x-request-id'],
+    correlationId: res.locals.correlationId ?? req.headers['x-correlation-id'],
+  };
+  requestContextStorage.run(enriched, () => next());
 }

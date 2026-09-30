@@ -46,16 +46,8 @@ export interface HealthRouterOptions {
   /** List of probes to run. Defaults to the built-in probe registry. */
   probes?: Probe[];
   /** Optional metrics service for recording health status gauges. */
-  metricsService?: MetricsService;
-  /** Optional logger override (defaults to the root application logger). */
-  log?: typeof rootLogger;
-}
-
-// ─── Builder ──────────────────────────────────────────────────────────────────
-
-export interface HealthRouterOptions {
-  probes?: Probe[];
   metricsService?: Pick<MetricsServiceLike, "recordHealthStatus">;
+  /** Optional logger override (defaults to the root application logger). */
   log?: Pick<Logger, "info">;
 }
 

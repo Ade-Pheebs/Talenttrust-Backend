@@ -47,8 +47,6 @@ export function getMetricsService(): MetricsServiceLike {
       recordHealthStatus: () => {},
       recordWebhookDelivery: () => {},
       setWebhookDlqDepth: () => {},
-      recordCacheHit: () => {},
-      recordCacheMiss: () => {},
     };
   }
   return _metricsService;

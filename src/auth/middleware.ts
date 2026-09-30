@@ -12,7 +12,7 @@ export function requirePermission(resource: Resource, action: Action) {
     }
     const user = req.user;
     const current = getContext() ?? {};
-    const enriched = { ...current, actorId: user.id };
+    const enriched = { ...current, actorId: user.userId };
     requestContextStorage.run(enriched, () => {
       if (!isAllowed(user.role, resource, action)) {
         res.status(403).json({ error: 'Forbidden: insufficient permissions' });

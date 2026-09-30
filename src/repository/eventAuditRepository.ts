@@ -181,6 +181,9 @@ export class InMemoryEventAuditRepository implements IEventAuditRepository {
 }
 
 export class EventAuditService {
+  /** Optional per-contract ordering gate (set via {@link setOrdering}). */
+  private ordering?: PerContractEventOrdering;
+
   constructor(
     private repository: IEventAuditRepository,
     private logger: Logger = console,

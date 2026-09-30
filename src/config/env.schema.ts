@@ -279,6 +279,29 @@ export const envSchema = z.object({
 
   // Reputation Read Cache Configuration
   /**
+   * Time-to-live (ms) for cached auth validation results (API keys).
+   * Default: 300 000 (5 min).
+   */
+  AUTH_CACHE_TTL_MS: z.string()
+    .default('300000')
+    .transform((val) => parseInt(val, 10))
+    .pipe(z.number()
+      .int('AUTH_CACHE_TTL_MS must be an integer')
+      .positive('AUTH_CACHE_TTL_MS must be greater than 0')),
+
+  /**
+   * Maximum number of auth validation results to hold in the LRU cache.
+   * Default: 1000.
+   */
+  AUTH_CACHE_MAX_ENTRIES: z.string()
+    .default('1000')
+    .transform((val) => parseInt(val, 10))
+    .pipe(z.number()
+      .int('AUTH_CACHE_MAX_ENTRIES must be an integer')
+      .positive('AUTH_CACHE_MAX_ENTRIES must be greater than 0')),
+
+  // Reputation Read Cache Configuration
+  /**
    * Time-to-live (ms) for cached reputation profiles.
    * Reads within this window are served from in-memory LRU cache without
    * hitting the database. Must be a positive integer. Default: 60 000 (1 min).

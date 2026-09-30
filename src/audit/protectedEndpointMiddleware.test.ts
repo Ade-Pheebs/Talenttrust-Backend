@@ -14,11 +14,14 @@
  */
 
 import express from 'express';
+import { EventEmitter } from 'events';
+import jwt from 'jsonwebtoken';
 import request from 'supertest';
 import { AuditStore } from './store';
 import { AuditService } from './service';
 import { createProtectedEndpointAuditMiddleware } from './protectedEndpointMiddleware';
 import { createToken } from '../auth/authenticate';
+import { requireAuth } from '../middleware/authorization';
 import { REDACTED } from './redact';
 
 describe('createProtectedEndpointAuditMiddleware', () => {
@@ -171,6 +174,155 @@ describe('createProtectedEndpointAuditMiddleware', () => {
     expect(entry.resourceId).toBe('u1');
   });
 
+  it('preserves the full resource path and production JWT actor on a mounted router', async () => {
+    const previousSecret = process.env.JWT_SECRET;
+    process.env.JWT_SECRET = 'protected-endpoint-test-secret';
+    try {
+      const app = express();
+      const router = express.Router();
+      router.use(createProtectedEndpointAuditMiddleware(service));
+      router.use(requireAuth);
+      router.get('/contracts/:id', (_req, res) => res.status(200).json({ ok: true }));
+      app.use('/api/v1', router);
+      const token = jwt.sign(
+        { sub: 'jwt-user-42', email: 'user@example.com', role: 'client' },
+        process.env.JWT_SECRET,
+        { algorithm: 'HS256' },
+      );
+
+      await request(app).get('/api/v1/contracts/c-7?view=full')
+        .set('Authorization', `Bearer ${token}`).expect(200);
+
+      const entry = store.getAll()[0];
+      expect(entry.actor).toBe('jwt-user-42');
+      expect(entry.resource).toBe('contracts');
+      expect(entry.resourceId).toBe('c-7');
+      expect(entry.metadata['path']).toBe('/api/v1/contracts/c-7');
+      expect(JSON.stringify(entry)).not.toContain(token);
+    } finally {
+      if (previousSecret === undefined) delete process.env.JWT_SECRET;
+      else process.env.JWT_SECRET = previousSecret;
+    }
+  });
+
+  it('records a JWT authentication rejection as an anonymous auth failure', async () => {
+    const app = express();
+    app.use(createProtectedEndpointAuditMiddleware(service));
+    app.use(requireAuth);
+    app.get('/api/v1/contracts', (_req, res) => res.status(200).send());
+
+    await request(app).get('/api/v1/contracts').expect(401);
+    expect(store.count()).toBe(1);
+    expect(store.getAll()[0]).toMatchObject({
+      action: 'AUTH_FAILED', severity: 'WARNING', actor: 'anonymous',
+    });
+  });
+
+  it('writes only once when a protected response crosses duplicate mounts', async () => {
+    const app = express();
+    const middleware = createProtectedEndpointAuditMiddleware(service);
+    app.use(middleware);
+    app.use(middleware);
+    app.get('/api/v1/contracts', (_req, res) => res.status(200).json({ ok: true }));
+
+    await request(app).get('/api/v1/contracts').expect(200);
+    expect(store.count()).toBe(1);
+  });
+
+  it('records an interrupted response once with a warning and no raw credentials', () => {
+    const middleware = createProtectedEndpointAuditMiddleware(service);
+    const req = {
+      method: 'POST', baseUrl: '/api/v1', path: '/contracts/c-7',
+      headers: { authorization: 'Bearer private-token' }, body: { password: 'private' },
+      query: {}, ip: '127.0.0.1',
+    } as unknown as express.Request;
+    const res = Object.assign(new EventEmitter(), {
+      locals: { requestId: 'interrupted-request' }, statusCode: 200,
+      writableFinished: false,
+    }) as unknown as express.Response;
+    const next = jest.fn();
+
+    middleware(req, res, next);
+    res.emit('close');
+    res.emit('finish');
+
+    expect(next).toHaveBeenCalledTimes(1);
+    expect(store.count()).toBe(1);
+    expect(store.getAll()[0].severity).toBe('WARNING');
+    expect(store.getAll()[0].metadata).toMatchObject({ statusCode: 499, aborted: true });
+    expect(JSON.stringify(store.getAll()[0])).not.toContain('private-token');
+  });
+
+  it('keeps auth-failure classification if the 401 response closes early', () => {
+    const req = {
+      method: 'GET', baseUrl: '', path: '/api/v1/contracts',
+      headers: {}, query: {}, ip: '127.0.0.1',
+    } as unknown as express.Request;
+    const res = Object.assign(new EventEmitter(), {
+      locals: {}, statusCode: 401, writableFinished: false,
+    }) as unknown as express.Response;
+
+    createProtectedEndpointAuditMiddleware(service)(req, res, jest.fn());
+    res.emit('close');
+
+    expect(store.getAll()[0]).toMatchObject({
+      action: 'AUTH_FAILED', severity: 'WARNING',
+      metadata: { statusCode: 499, aborted: true },
+    });
+  });
+
+  it('does not retry when a repository throws after appending', () => {
+    const originalAppend = store.append.bind(store);
+    jest.spyOn(store, 'append').mockImplementation((input) => {
+      originalAppend(input);
+      throw new Error('error after append');
+    });
+    const consoleSpy = jest.spyOn(console, 'error').mockImplementation(() => {});
+    const req = {
+      method: 'POST', baseUrl: '', path: '/api/v1/contracts',
+      headers: {}, body: {}, query: {}, ip: '127.0.0.1',
+    } as unknown as express.Request;
+    const res = Object.assign(new EventEmitter(), {
+      locals: {}, statusCode: 201, writableFinished: false,
+    }) as unknown as express.Response;
+    try {
+      createProtectedEndpointAuditMiddleware(service)(req, res, jest.fn());
+      res.emit('close');
+      res.emit('finish');
+      expect(store.count()).toBe(1);
+    } finally {
+      consoleSpy.mockRestore();
+    }
+  });
+
+  it('retains a minimal audit entry when cyclic request metadata cannot be redacted', () => {
+    const middleware = createProtectedEndpointAuditMiddleware(service);
+    const body: Record<string, unknown> = { password: 'private-password' };
+    body['self'] = body;
+    const req = {
+      method: 'POST', baseUrl: '', path: '/api/v1/contracts',
+      headers: { authorization: 'Bearer private-token' }, body, query: {},
+      ip: '127.0.0.1',
+    } as unknown as express.Request;
+    const res = Object.assign(new EventEmitter(), {
+      locals: { requestId: { secret: 'private-token' } }, statusCode: 201,
+      writableFinished: true,
+    }) as unknown as express.Response;
+    const consoleSpy = jest.spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      middleware(req, res, jest.fn());
+      res.emit('finish');
+      expect(store.count()).toBe(1);
+      expect(store.getAll()[0].metadata).toMatchObject({
+        method: 'POST', statusCode: 201, metadataOmitted: true, requestId: null,
+      });
+      expect(JSON.stringify(store.getAll()[0])).not.toContain('private-');
+      expect(JSON.stringify(consoleSpy.mock.calls)).not.toContain('private-');
+    } finally {
+      consoleSpy.mockRestore();
+    }
+  });
+
   it('redacts Authorization header values from persisted metadata', async () => {
     const token = createToken('u1', 'admin');
     const app = buildApp({ withUser: false });
@@ -207,10 +359,11 @@ describe('createProtectedEndpointAuditMiddleware', () => {
   });
 
   it('swallows audit failures without breaking the HTTP response', async () => {
-    const brokenService = new AuditService(new AuditStore());
-    jest.spyOn(brokenService, 'log').mockImplementation(() => {
-      throw new Error('store exploded');
+    const brokenStore = new AuditStore();
+    jest.spyOn(brokenStore, 'append').mockImplementation(() => {
+      throw new Error('store exploded with private-token');
     });
+    const brokenService = new AuditService(brokenStore);
     const consoleSpy = jest.spyOn(console, 'error').mockImplementation(() => {});
 
     const app = express();
@@ -221,9 +374,8 @@ describe('createProtectedEndpointAuditMiddleware', () => {
 
     expect(consoleSpy).toHaveBeenCalledWith(
       expect.stringContaining('[protectedEndpointAuditMiddleware]'),
-      expect.any(Error),
     );
-
+    expect(JSON.stringify(consoleSpy.mock.calls)).not.toContain('private-token');
     consoleSpy.mockRestore();
   });
 });

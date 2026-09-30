@@ -210,6 +210,17 @@ The middleware registers a `res.on('finish')` hook so it writes the entry
 status code and the `req.user` identity (set by `authenticateMiddleware`) are
 both available when the entry is written.
 
+The same middleware also reads the `{ id }` identity set by the production JWT
+`requireAuth` middleware. It records the complete API path when mounted inside a
+router. Multiple mounts on one response produce one audit write attempt. An
+interrupted response is recorded once with a diagnostic `499` audit status,
+`WARNING` severity, and `metadata.aborted: true`; the HTTP response itself is
+unchanged. If request data is malformed or cyclic, the entry keeps safe method,
+path and status fields with `metadataOmitted: true` and omits the raw data. Audit
+store errors are logged without their potentially sensitive error payloads and
+do not change the primary HTTP result. A failed write is never retried blindly:
+the store may already have persisted the entry.
+
 ### Mounting
 
 ```typescript

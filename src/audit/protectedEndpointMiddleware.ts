@@ -5,10 +5,9 @@
  *
  * ## How it works
  *
- * The middleware registers a `res.on('finish')` listener before calling
- * `next()`. This guarantees that the audit entry is written **after** the
- * full middleware chain (including authentication) has run, so the final
- * HTTP status code and the resolved `req.user` identity are both available.
+ * The middleware registers response listeners before calling `next()`. Normal
+ * responses are recorded on `finish`, after authentication and the handler
+ * have run. Prematurely closed responses are recorded once on `close`.
  *
  * Mount this middleware **before** `authenticateMiddleware` / `requireAuth`
  * on any router or route group that requires authentication.
@@ -36,8 +35,7 @@
  * enabling end-to-end request tracing across logs.
  *
  * @security
- * - Audit failures are silently swallowed (with a console.error) so that a
- *   logging fault never breaks the primary request path.
+ * - Audit failures produce a generic diagnostic without breaking the request.
  * - No raw bearer tokens, passwords, or PII reach the audit store.
  *
  * @example
@@ -53,10 +51,25 @@
 
 import type { Request, Response, NextFunction, RequestHandler } from 'express';
 import type { AuditAction, AuditSeverity } from './types';
-import type { AuthenticatedRequest } from '../auth/authenticate';
 import { buildAuditMetadata } from './redact';
 import { auditService, AuditService } from './service';
 import { validateEnv } from '../config/env.schema';
+
+// A response can pass through the same protected router more than once. Keep
+// the guard on that response, rather than in process-wide state, so each HTTP
+// request has at most one audit write attempt.
+const auditListenerRegistered = Symbol('protectedEndpointAuditListenerRegistered');
+
+type AuditedResponse = Response & { [auditListenerRegistered]?: boolean };
+
+function resolveActor(req: Request): string {
+  const user = (req as Request & { user?: { userId?: unknown; id?: unknown } }).user;
+  // The simple bearer middleware uses userId; the production JWT middleware
+  // uses id. Preserve both contracts without trusting a malformed value.
+  if (typeof user?.userId === 'string' && user.userId) return user.userId;
+  if (typeof user?.id === 'string' && user.id) return user.id;
+  return 'anonymous';
+}
 
 // ─── Internal helpers ─────────────────────────────────────────────────────────
 
@@ -136,29 +149,56 @@ export function createProtectedEndpointAuditMiddleware(
       return;
     }
 
-    res.on('finish', () => {
-      try {
-        // req.user is populated by authenticateMiddleware after this runs
-        const actor =
-          (req as AuthenticatedRequest).user?.userId ?? 'anonymous';
+    const auditedResponse = res as AuditedResponse;
+    if (auditedResponse[auditListenerRegistered]) {
+      next();
+      return;
+    }
+    auditedResponse[auditListenerRegistered] = true;
 
+    let attempted = false;
+    const writeAuditEntry = (aborted: boolean): void => {
+      if (attempted) return;
+      // Never retry after service.log throws: the repository may already have
+      // appended the entry before a downstream step failed.
+      attempted = true;
+      try {
+        const statusCode = aborted ? 499 : res.statusCode;
+        const actor = resolveActor(req);
         const action = deriveAction(req.method, res.statusCode);
-        const severity = deriveSeverity(action, res.statusCode);
-        const resource = deriveResource(req.path);
-        const resourceId = deriveResourceId(req.path);
-        const requestId = res.locals['requestId'] as string | undefined;
+        const severity = aborted ? 'WARNING' : deriveSeverity(action, statusCode);
+        const path = `${req.baseUrl || ''}${req.path}`;
+        const resource = deriveResource(path);
+        const resourceId = deriveResourceId(path);
+        const rawRequestId = res.locals['requestId'];
+        const requestId = typeof rawRequestId === 'string' ? rawRequestId : undefined;
         const ipAddress =
           (req.ip ?? req.socket?.remoteAddress) as string | undefined;
 
-        const metadata = buildAuditMetadata(
-          req.method,
-          req.path,
-          req.headers as Record<string, string | string[] | undefined>,
-          req.body,
-          req.query as Record<string, unknown>,
-          res.statusCode,
-          requestId,
-        );
+        let metadata: Record<string, unknown>;
+        try {
+          metadata = buildAuditMetadata(
+            req.method,
+            path,
+            req.headers as Record<string, string | string[] | undefined>,
+            req.body,
+            req.query as Record<string, unknown>,
+            statusCode,
+            requestId,
+          );
+        } catch {
+          // Malformed or cyclic request data must not erase the entire audit
+          // event. Omit untrusted fields rather than persisting them raw.
+          metadata = {
+            method: req.method,
+            path,
+            statusCode,
+            requestId: requestId ?? null,
+            metadataOmitted: true,
+          };
+          console.error('[protectedEndpointAuditMiddleware] Request metadata omitted');
+        }
+        if (aborted) metadata['aborted'] = true;
 
         service.log({
           action,
@@ -170,10 +210,16 @@ export function createProtectedEndpointAuditMiddleware(
           ipAddress,
           correlationId: requestId,
         });
-      } catch (err) {
+      } catch {
         // Audit failures must never disrupt the request lifecycle.
-        console.error('[protectedEndpointAuditMiddleware] Failed to write audit entry:', err);
+        // Error objects from stores can contain request data or credentials.
+        console.error('[protectedEndpointAuditMiddleware] Failed to write audit entry');
       }
+    };
+
+    res.once('finish', () => writeAuditEntry(false));
+    res.once('close', () => {
+      if (!res.writableFinished) writeAuditEntry(true);
     });
 
     next();

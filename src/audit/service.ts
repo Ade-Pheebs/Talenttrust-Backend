@@ -180,7 +180,9 @@ export class AuditService {
       
       return entry;
     } catch (err) {
-      console.error('[AuditService] Failed to persist audit entry:', err);
+      // Repository errors may include request or credential values. Keep the
+      // signal while leaving the original error available to the caller.
+      console.error('[AuditService] Failed to persist audit entry');
       throw err;
     }
   }

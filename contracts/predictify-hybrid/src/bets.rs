@@ -1,4 +1,4 @@
-use soroban_sdk::{Address, BytesN, Env, Vec};
+use soroban_sdk::{Address, BytesN, Env, Symbol, Vec};
 
 use crate::{
     errors::Error,
@@ -96,6 +96,3 @@ pub fn place_bets(
 
     Ok(())
 }
-
-// Symbol is used above; import it here to keep the use-site clean.
-use soroban_sdk::Symbol;

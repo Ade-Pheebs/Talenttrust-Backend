@@ -228,6 +228,23 @@ describe('validateCreateAuditEntryInput — body shape', () => {
     expect(codesFor(issues, 'resourceId')).toContain(AUDIT_VALIDATION_CODES.INVALID_TYPE);
     expect(codesFor(issues, 'surprise')).toContain(AUDIT_VALIDATION_CODES.UNKNOWN_FIELD);
   });
+
+  it('rejects a duplicate submission deterministically', () => {
+    const body = validBody();
+    const first = validateCreateAuditEntryInput(body);
+    const second = validateCreateAuditEntryInput(body);
+
+    expect(first.ok).toBe(true);
+    expect(second.ok).toBe(true);
+    if (!first.ok || !second.ok) return;
+    expect(second.data).toEqual(first.data);
+  });
+
+  it('rejects a duplicate key in the raw body shape', () => {
+    const issues = expectInvalid(validBody({ action: 'CONTRACT_CREATED', Action: 'CONTRACT_CREATED' }));
+
+    expect(codesFor(issues, 'Action')).toEqual([AUDIT_VALIDATION_CODES.UNKNOWN_FIELD]);
+  });
 });
 
 // ── Enums ─────────────────────────────────────────────────────────────────────

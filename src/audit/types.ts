@@ -53,7 +53,7 @@ export type AuditAction =
   | 'PAYMENT_RELEASED'
   | 'PAYMENT_DISPUTED'
   | 'REPUTATION_UPDATED'
-  | 'REPUTATION_CORRECTED'
+  | 'REPTATION_CORRECTED'
   | 'USER_CREATED'
   | 'USER_UPDATED'
   | 'USER_DELETED'
@@ -193,6 +193,181 @@ export interface AuditQueryResult {
   limit: number;
   /** Opaque cursor for the next page, if more results exist. */
   nextCursor?: string;
+}
+
+/**
+ * Validation boundaries for the audit cache layer.
+ *
+ * These constants are the single source of truth for what the cache will
+ * accept as input. Every entry point (router, service, bulk handler) must
+ * validate against these bounds before calling into the cache so that an
+ * invalid key or oversized payload never reaches the store.
+ *
+ * Invariants:
+ * - A cache key must be a non-empty string of at most AUDIT_CACHE_MAX_KEY_LENGTH
+ *   characters and must not contain control characters.
+ * - A cache value must be serialisable to at most AUDIT_CACHE_MAX_VALUE_BYTES
+ *   bytes of UTF-8 JSON.
+ * - A cache TTL must be a positive integer no greater than AUDIT_CACHE_MAX_TTL_MS.
+ * - The cache capacity must be a positive integer no greater than
+ *   AUDIT_CACHE_MAX_CAPACITY and the cache must never exceed it.
+ */
+
+/** Maximum number of entries the audit cache may hold. */
+export const AUDIT_CACHE_MAX_CAPACITY = 10000;
+
+/** Maximum length of a cache key, in characters. */
+export const AUDIT_CACHE_MAX_KEY_LENGTH = 512;
+
+/** Maximum serialised size of a cache value, in UTF-8 bytes. */
+export const AUDIT_CACHE_MAX_VALUE_BYTES = 1024 * 1024;
+
+/** Maximum cache TTL in milliseconds (24 hours). */
+export const AUDIT_CACHE_MAX_TTL_MS = 24 * 60 * 60 * 1000;
+
+/** Default cache TT\ in milliseconds (5 minutes). */
+export const AUDIT_CACHE_DEFAULT_TTL_MS = 5 * 60 * 1000;
+
+/** Minimum cache TTL in milliseconds (1 second). */
+export const AUDIT_CACHE_MIN_TTL_MS = 1000;
+
+/** Maximum number of entries accepted in a single bulk request. */
+export const AUDIT_CACHE_MAX_BULK_SIZE = 500;
+
+/**
+ * Result of validating a cache key.
+ * Exactly one of the fields is populated.
+ */
+export type CacheKeyValidation =
+  | { valid: true; key: string }
+  | { valid: false; reason: string };
+
+/**
+ * Result of validating a cache TTL.
+ */
+export type CacheTtlValidation =
+  | { valid: true; ttlMs: number }
+  | { valid: false; reason: string };
+
+/**
+ * Result of validating a cache value for serialisation size.
+ */
+export type CacheValueValidation =
+  | { valid: true; bytes: number }
+  | { valid: false; reason: string };
+
+/** Control characters (U+0000-U-001F and U-007F) are never allowed in keys. */
+const CONTROL_CHAR_RE = /[\u0000-\u001F\u007F]/;
+
+/**
+ * Validate an audit cache key.
+ *
+ * Accepts a non-empty string of at most {@link AUDIT_CACHE_MAX_KEY_LENGTH}
+ * characters that contains no control characters. Whitespace is trimmed
+ * before validation so that duplicate submissions with incidental padding
+ * map to the same canonical key.
+ */
+export function validateCacheKey(key: unknown): CacheKeyValidation {
+  if (typeof key !== 'string') {
+    return { valid: false, reason: 'cache key must be a string' };
+  }
+  const trimmed = key.trim();
+  if (trimmed.length === 0) {
+    return { valid: false, reason: 'cache key must not be empty' };
+  }
+  if (trimmed.length > AUDIT_CACHE_MAX_KEY_LENGTH) {
+    return {
+      valid: false,
+      reason: `cache key must be at most ${AUDIT_CACHE_MAX_KEY_LENGTH} characters`,
+    };
+  }
+  if (CONTROL_CHAR_RE.test(trimmed)) {
+    return { valid: false, reason: 'cache key must not contain control characters' };
+  }
+  return { valid: true, key: trimmed };
+}
+
+/**
+ * Validate a cache TTL.
+ *
+ * Accepts a positive integer between {@link AUDIT_CACHE_MIN_TTL_MS} and
+ * {@link AUDIT_CACHE_MAX_TTL_MS} inclusive. Non-integer, non-finite, NAN and
+ * infinite values are rejected. Undefined maps to the default TTL.
+ */
+export function validateCacheTtl(ttl: unknown): CacheTtlValidation {
+  if (ttl === undefined) {
+    return { valid: true, ttlMs: AUDIT_CACHE_DEFAULT_TTL_MS };
+  }
+  if (typeof ttl !== 'number' || !Number.isFinite(ttl) || !Number.isInteger(ttl)) {
+    return { valid: false, reason: 'cache TTL must be a finite integer number of milliseconds' };
+  }
+  if (ttl < AUDIT_CACHE_MIN_TTL_MS) {
+    return {
+      valid: false,
+      reason: `cache TTL must be at least ${AUDIT_CACHE_MIN_TTL_MS} ms`,
+    };
+  }
+  if (ttl > AUDIT_CACHE_MAX_TTL_MS) {
+    return {
+      valid: false,
+      reason: `cache TTL must be at most ${AUDIT_CACHE_MAX_TTL_MS} ms`,
+    };
+  }
+  return { valid: true, ttlMs: ttl };
+}
+
+/**
+ * Validate the serialised size of a cache value.
+ *
+ * The value is serialised to UTF-8 JSON and rejected if it exceeds
+ * {@link AUDIT_CACHE_MAX_VALUE_BYTES}. Circular references and values that
+ * cannot be serialised are rejected rather than thrown, so the caller can
+ * report a deterministic error.
+ */
+export function validateCacheValue(value: unknown): CacheValueValidation {
+  if (value === undefined) {
+    return { valid: false, reason: 'cache value must not be undefined' };
+  }
+  let serialised: string;
+  try {
+    serialised = JSON.stringify(value);
+  } catch {
+    return { valid: false, reason: 'cache value is not JSON-serialisable' };
+  }
+  if (typeof serialised !== 'string') {
+    return { valid: false, reason: 'cache value is not JSON-serialisable' };
+  }
+  const bytes = Buffer.byteLength(serialised, 'utf-8');
+  if (bytes > AUDIT_CACHE_MAX_VALUE_BYTES) {
+    return {
+      valid: false,
+      reason: `cache value must be at most ${AUDIT_CACHE_MAX_VALUE_BYTES} bytes`,
+    };
+  }
+  return { valid: true, bytes };
+}
+
+/**
+ * Validate the configured capacity of the audit cache.
+ *
+ * Accepts a positive integer no greater than
+ * {@link AUDIT_CACHE_MAX_CAPACITY}. This is the boundary that prevents
+ * unbounded memory growth under adverse input.
+ */
+export function validateCacheCapacity(capacity: unknown): CacheTtlValidation {
+  if (typeof capacity !== 'number' || !Number.isFinite(capacity) || !Number.isInteger(capacity)) {
+    return { valid: false, reason: 'cache capacity must be a finite integer' };
+  }
+  if (capacity < 1) {
+    return { valid: false, reason: 'cache capacity must be at least 1' };
+  }
+  if (capacity > AUDIT_CACHE_MAX_CAPACITY) {
+    return {
+      valid: false,
+      reason: `cache capacity must be at most ${AUDIT_CACHE_MAX_CAPACITY}`,
+    };
+  }
+  return { valid: true, ttlMs: capacity };
 }
 
 /** Encodes cursor data to an opaque base64 string. */

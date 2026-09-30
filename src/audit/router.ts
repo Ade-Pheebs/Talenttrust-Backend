@@ -45,6 +45,7 @@ import { mapZodErrorToDetails, type ValidationErrorResponse } from '../middlewar
 import { idempotencyMiddleware } from '../middleware/idempotency';
 import { validateRequest } from '../middleware/validate.middleware';
 import { toAuditEntryResponseDto } from './dto/audit.dto';
+import { validateAuditQuery, validateAuditEntryBody, validateAuditBulkBody } from './dto/audit.dto';
 import { getCorrelationId, getRequestId as getRequestIdFromUtils } from '../utils/correlationId';
 import { DownloadTokenService, DownloadTokenError } from './downloadTokenService';
 import { SqliteDownloadTokenStore } from './downloadTokenStore';
@@ -80,6 +81,26 @@ function buildValidationErrorResponse(requestId: string, correlationId: string |
 }
 
 /**
+ * Validates the raw query object against the audit query DTO boundaries and
+ * returns a structured 400 response on failure. This is the single entry
+ * point for query validation so every route enforces the same invariants
+ * (limit clamping, offset >= 0, ISO date ordering, etc.).
+ */
+function validateAuditQueryOrRespond(
+  req: Request,
+  res: Response,
+): AuditQuery | undefined {
+  const result = validateAuditQuery(req.query);
+  if (!result.success) {
+    const requestId = getRequestIdFromUtils(res);
+    const correlationId = getCorrelationId(res);
+    res.status(400).json(buildValidationErrorResponse(requestId, correlationId, result.error));
+    return undefined;
+  }
+  return result.data;
+}
+
+/**
  * Parses and validates query filters against the audit query schema and, on
  * failure, writes the shared structured 400 validation response directly
  * instead of throwing. Used by every handler below that accepts query
@@ -102,6 +123,15 @@ function parseAuditQueryOrRespond(
 
   const params: AuditQueryParams = result.data;
   const { action, severity, actor, resource, resourceId, from, to, limit, offset, cursor } = params;
+
+  // Enforce DTO-level boundaries (limit range, offset >= 0, date ordering).
+  const dtoResult = validateAuditQuery(params);
+  if (!dtoResult.success) {
+    const requestId = getRequestIdFromUtils(res);
+    const correlationId = getCorrelationId(res);
+    res.status(400).json(buildValidationErrorResponse(requestId, correlationId, dtoResult.error));
+    return undefined;
+  }
 
   return {
     query: {
@@ -155,6 +185,14 @@ export function createAuditRouter(options: AuditRouterOptions = {}): Router {
     ...accessMiddleware,
     (req: Request, res: Response): void => {
       try {
+        const dtoResult = validateAuditEntryBody(req.body);
+        if (!dtoResult.success) {
+          const requestId = getRequestIdFromUtils(res);
+          const correlationId = getCorrelationId(res);
+          res.status(400).json(buildValidationErrorResponse(requestId, correlationId, dtoResult.error));
+          return;
+        }
+
         const parseResult = createAuditEntryBodySchema.safeParse(req.body);
 
         if (!parseResult.success) {

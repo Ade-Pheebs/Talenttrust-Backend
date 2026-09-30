@@ -38,6 +38,24 @@ export const auditSeveritySchema = z.enum(AUDIT_SEVERITIES);
 // ---------------------------------------------------------------------------
 
 /**
+ * Upper bounds for free-form string fields. These are the validation
+ * boundaries for the audit DTO: they cap payload size so a single request
+ * cannot exhaust memory or bloat the append-only audit log, while remaining
+ * generous enough for legitimate identifiers and correlation IDs.
+ *
+ * Invariants enforced by these bounds:
+ *   - actor/resource/resourceId are non-empty and bounded.
+ *   - ipAddress/correlationId are bounded when present.
+ *   - metadata is a flat-ish record with a bounded number of keys and
+ *     bounded key/value sizes, so a hostile payload cannot smuggle an
+ *     unbounded blob through the `unknown` value type.
+ */
+export const AUDIT_FIELD_MAX_LENGTH = 256;
+export const AUDIT_METADATA_MAX_KEYS = 64;
+export const AUDIT_METADATA_KEY_MAX_LENGTH = 128;
+export const AUDIT_METADATA_VALUE_MAX_LENGTH = 4096;
+
+/**
  * `POST /api/v1/audit` request body.
  * `metadata` defaults to `{}` when omitted (previously an omitted metadata
  * field silently passed `undefined` through to the repository; defaulting
@@ -46,12 +64,12 @@ export const auditSeveritySchema = z.enum(AUDIT_SEVERITIES);
 export const createAuditEntryBodySchema = z.object({
   action: auditActionSchema,
   severity: auditSeveritySchema,
-  actor: z.string().min(1, 'actor must not be empty'),
-  resource: z.string().min(1, 'resource must not be empty'),
-  resourceId: z.string().min(1, 'resourceId must not be empty'),
-  metadata: z.record(z.unknown()).optional().default({}),
-  ipAddress: z.string().min(1).optional(),
-  correlationId: z.string().min(1).optional(),
+  actor: z.string().min(1, 'actor must not be empty').max(AUDIT_FIELD_MAX_LENGTH, `actor must be at most ${AUDIT_FIELD_MAX_LENGTH} characters`),
+  resource: z.string().min(1, 'resource must not be empty').max(AUDIT_FIELD_MAX_LENGTH, `resource must be at most ${AUDIT_FIELD_MAX_LENGTH} characters`),
+  resourceId: z.string().min(1, 'resourceId must not be empty').max(AUDIT_FIELD_MAX_LENGTH, `resourceId must be at most ${AUDIT_FIELD_MAX_LENGTH} characters`),
+  metadata: boundedMetadataSchema.optional().default({}),
+  ipAddress: z.string().min(1).max(AUDIT_FIELD_MAX_LENGTH, `ipAddress must be at most ${AUDIT_FIELD_MAX_LENGTH} characters`).optional(),
+  correlationId: z.string().min(1).max(AUDIT_FIELD_MAX_LENGTH, `correlationId must be at most ${AUDIT_FIELD_MAX_LENGTH} characters`).optional(),
 });
 
 export type CreateAuditEntryBody = z.infer<typeof createAuditEntryBodySchema>;
@@ -61,6 +79,48 @@ const isoDateStringSchema = (fieldName: string) =>
     .string()
     .refine((value) => !Number.isNaN(Date.parse(value)), { message: `Invalid ${fieldName} timestamp` })
     .transform((value) => new Date(Date.parse(value)).toISOString());
+
+/**
+ * Metadata is a `Record<string, unknown>` at the type level, but accepting
+ * arbitrary `unknown` values would let callers persist unbounded or
+ * non-serialisable payloads (functions, symbols, deeply nested cycles) into
+ * the audit log. We constrain it to JSON-serialisable scalars, arrays of
+ * scalars, and one level of nested plain objects, with bounded sizes, so
+ * that:
+ *   - the entry remains hashable/serialisable by the integrity layer
+ *   - a single request cannot blow up storage or memory
+ *   - rejection is deterministic and diagnosable
+ */
+const metadataScalarSchema = z.union([
+  z.string().max(AUDIT_METADATA_VALUE_MAX_LENGTH),
+  z.number().finite(),
+  z.boolean(),
+  z.null(),
+]);
+
+const metadataValueSchema: z.ZodType<unknown> = z.lazy(() =>
+  z.union([
+    metadataScalarSchema,
+    z.array(metadataScalarSchema).max(AUDIT_METADATA_MAX_KEYS),
+    z
+      .record(metadataScalarSchema)
+      .refine(
+        (value) => Object.keys(value).length <= AUDIT_METADATA_MAX_KEYS,
+        { message: `metadata nested object must have at most ${AUDIT_METADATA_MAX_KEYS} keys` },
+      ),
+  ]),
+);
+
+const boundedMetadataSchema = z
+  .record(metadataValueSchema)
+  .refine(
+    (value) => Object.keys(value).length <= AUDIT_METADATA_MAX_KEYS,
+    { message: `metadata must have at most ${AUDIT_METADATA_MAX_KEYS} keys` },
+  )
+  .refine(
+    (value) => Object.keys(value).every((key) => key.length <= AUDIT_METADATA_KEY_MAX_LENGTH),
+    { message: `metadata keys must be at most ${AUDIT_METADATA_KEY_MAX_LENGTH} characters` },
+  );
 
 const positiveIntStringSchema = (message: string) =>
   z
@@ -114,9 +174,9 @@ export function buildAuditQuerySchema(options: { maxLimit: number; defaultLimit?
   return z.object({
     action: emptyStringToUndefined(auditActionSchema),
     severity: emptyStringToUndefined(auditSeveritySchema),
-    actor: emptyStringToUndefined(z.string().min(1)),
-    resource: emptyStringToUndefined(z.string().min(1)),
-    resourceId: emptyStringToUndefined(z.string().min(1)),
+    actor: emptyStringToUndefined(z.string().min(1).max(AUDIT_FIELD_MAX_LENGTH)),
+    resource: emptyStringToUndefined(z.string().min(1).max(AUDIT_FIELD_MAX_LENGTH)),
+    resourceId: emptyStringToUndefined(z.string().min(1).max(AUDIT_FIELD_MAX_LENGTH)),
     from: isoDateStringSchema('from').optional(),
     to: isoDateStringSchema('to').optional(),
     limit: positiveIntStringSchema('Invalid limit')

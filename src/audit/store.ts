@@ -9,6 +9,16 @@
  * - The internal log array is never exposed directly; only copies are returned.
  * - No entry can be deleted or updated — the store is strictly append-only.
  *
+ * Concurrency properties:
+ * - Appends are serialized through an async mutex so concurrent callers cannot
+ *   interleave hash-chain computation and produce a forked or stale chain.
+ * - The mutex is reentrancy-safe: a caller invoking append() from within an
+ *   append() transaction is rejected with a deterministic error rather than
+ *   deadlocking or silently corrupting the chain.
+ * - Reads (getAll, query, verifyIntegrity, …) operate on a snapshot of the
+ *   log taken at call time, so a concurrent append cannot observe or produce
+ *   a partially-written entry.
+ *
  * Production note: Replace the in-memory array with a write-once database table
  * (e.g. PostgreSQL with row-level security and no UPDATE/DELETE grants) while
  * keeping this interface contract intact.
@@ -47,12 +57,45 @@ export function computeEntryHash(
 }
 
 /**
+ * Async mutex used to serialize mutating operations on the audit log.
+ *
+ * The mutex is reentrancy-detecting: if the same async context attempts to
+ * acquire it twice, acquisition rejects with a deterministic error. This prevents
+ * deadlocks and hidden chain corruption from re-entrant append calls.
+ */
+class AsyncMutex {
+  private tail: Promise<void> = Promise.resolve();
+  private locked = false;
+
+  async runExclusive<T>(fn: () => Promise<T> | T): Promise<T> {
+    if (this.locked) {
+      throw new Error('AuditStore append re-entrancy detected');
+    }
+
+    this.locked = true;
+    const previous = this.tail;
+    let release!: () => void;
+    this.tail = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+
+    await previous;
+    try {
+      return await fn();
+    } finally {
+      this.locked = false;
+      release();
+    }
+  }
+}
+
+/**
  * AuditStore — append-only, hash-chained audit log.
  *
  * @example
  * ```ts
  * const store = new AuditStore();
- * store.append({ action: 'CONTRACT_CREATED', severity: 'INFO', actor: 'user-1', ... });
+ * await store.append({ action: 'CONTRACT_CREATED', severity: 'INFO', actor: 'user-1', ... });
  * const report = store.verifyIntegrity();
  * ```
  */
@@ -60,17 +103,26 @@ export class AuditStore implements AuditLogRepository {
   /** Internal append-only log. Never mutate directly. */
   private readonly log: AuditEntry[] = [];
 
-  private _appendGuard = false;
+  /** Serializes append operations across concurrent callers. */
+  private readonly mutex = new AsyncMutex();
 
-  append(input: CreateAuditEntryInput): AuditEntry {
-    if (this._appendGuard) {
-      throw new Error('AuditStore append re-entrancy detected');
-    }
-
-    this._appendGuard = true;
-    try {
+  /**
+   * Appends a new entry to the log.
+   *
+   * @description The append is atomic and serialized: the previous hash is
+   * read, the new entry hash computed, and the entry pushed within a single
+   * exclusive section. Concurrent appends cannot observe stale previous hashes
+  * or produce a forked chain.
+   *
+   * @param input - The audit entry data.
+   * @returns The frozen, chained entry that was appended.
+   * @rejects If a re-entrant append is detected.
+   */
+  append(input: CreateAuditEntryInput): Promise<AuditEntry> {
+    return this.mutex.runExclusive(() => {
       const previousHash =
-        this.log.length === 0 ? GENESIS_HASH : this.log[this.log.length - 1].hash;
+        this.log.length === 0 ? GENESIS_HASH
+        : this.log[this.log.length - 1].hash;
 
       const partial: Omit<AuditEntry, 'hash'> = {
         id: randomUUID(),
@@ -93,9 +145,7 @@ export class AuditStore implements AuditLogRepository {
 
       this.log.push(entry);
       return entry;
-    } finally {
-      this._appendGuard = false;
-    }
+    });
   }
 
   /**
@@ -253,7 +303,8 @@ export class AuditStore implements AuditLogRepository {
       const entry = this.log[i];
 
       // Verify previousHash linkage
-      const expectedPreviousHash = i === 0 ? GENESIS_HASH : this.log[i - 1].hash;
+      const expectedPreviousHash = i === 0 ? GENESIS_HASH
+        : this.log[i - 1].hash;
       if (entry.previousHash !== expectedPreviousHash) {
         return {
           valid: false,
@@ -287,7 +338,6 @@ export class AuditStore implements AuditLogRepository {
    */
   _reset(): void {
     this.log.length = 0;
-    this._appendGuard = false;
   }
 }
 

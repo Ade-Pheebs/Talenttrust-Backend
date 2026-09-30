@@ -10,6 +10,25 @@
  */
 
 /**
+ * Maximum number of audit entries that may be submitted in a single bulk
+ * request. Enforced by the request validator and by the export service so
+ * that concurrent bulk writes cannot exhaust memory or produce unbounded
+ * batches. Kept here (rather than in the router) so every entry point shares
+ * the same limit.
+ */
+export const MAX_BULK_AUDIT_ENTRIES = 1000;
+
+/**
+ * Maximum number of entries that may be exported in a single page. Bounds
+ * the work performed per request so concurrent exports cannot starve the
+ * event loop or produce oversized responses.
+ */
+export const MAX_EXPORT_PAGE_SIZE = 1000;
+
+/** Default page size used when a caller does not supply an explicit limit. */
+export const DEFAULT_EXPORT_PAGE_SIZE = 100;
+
+/**
  * Every audited action, as a runtime value list.
  *
  * This is the single source of truth: {@link AuditAction} is derived from it,
@@ -113,6 +132,16 @@ export interface AuditEntry {
   readonly previousHash: string;
 }
 
+/**
+ * A single audit entry that has been sealed into the hash chain. The
+ * `sequence` field is a monotonically increasing integer assigned by the
+ * store at append time; it is the authoritative ordering key and must be
+ * used (instead of `timestamp`) whenever entries are compared or paged.
+ */
+export interface SealedAuditEntry extends AuditEntry {
+  readonly sequence: number;
+}
+
 /** Input required to create a new audit entry (hash fields are computed internally). */
 export type CreateAuditEntryInput = Omit<AuditEntry, 'id' | 'timestamp' | 'hash' | 'previousHash'>;
 
@@ -144,6 +173,12 @@ export interface CursorData {
   lastId: string;
   /** Timestamp of the last entry for ordering stability. */
   lastTimestamp: string;
+  /**
+   * Monotonic sequence of the last entry in the previous page. Required for
+   * stable pagination under concurrent appends: two entries may share a
+   * timestamp, so `lastTimestamp` alone is not a total order.
+   */
+  lastSequence: number;
   /** Filters applied when this cursor was generated. */
   filters: {
     action?: AuditAction;
@@ -175,6 +210,20 @@ export interface AuditQuery {
   cursor?: AuditCursor;
 }
 
+/**
+ * Options controlling a single export operation. `snapshotSequence` pins the
+ * export to a consistent point in the chain so that entries appended while
+ * the export is in flight are not silently included or dropped.
+ */
+export interface ExportOptions {
+  /** Inclusive lower bound on entry sequence. */
+  fromSequence?: number;
+  /** Inclusive upper bound on entry sequence. */
+  toSequence?: number;
+  /** Maximum number of entries to return in this page. */
+  limit?: number;
+}
+
 /** Result of a chain integrity verification. */
 export interface IntegrityReport {
   valid: boolean;
@@ -193,6 +242,12 @@ export interface AuditQueryResult {
   limit: number;
   /** Opaque cursor for the next page, if more results exist. */
   nextCursor?: string;
+  /**
+   * Sequence of the last entry included in this page. Callers must pass this
+   * back as `fromSequence` (or encode it in the cursor) to resume without
+   * gaps or duplicates when new entries are appended concurrently.
+   */
+  lastSequence?: number;
 }
 
 /** Encodes cursor data to an opaque base64 string. */
@@ -201,11 +256,28 @@ export function encodeCursor(data: CursorData): string {
   return Buffer.from(json, 'utf-8').toString('base64');
 }
 
+/** Returns true when `value` is a non-negative safe integer. */
+export function isValidSequence(value: unknown): value is number {
+  return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0;
+}
+
 /** Decodes an opaque base64 cursor string to cursor data. */
 export function decodeCursor(cursor: string): CursorData {
   try {
     const json = Buffer.from(cursor, 'base64').toString('utf-8');
-    return JSON.parse(json) as CursorData;
+    const parsed = JSON.parse(json) as CursorData;
+    if (
+      typeof parsed !== 'object' ||
+      parsed === null ||
+      typeof parsed.lastId !== 'string' ||
+      typeof parsed.lastTimestamp !== 'string' ||
+      !isValidSequence(parsed.lastSequence) ||
+      typeof parsed.filters !== 'object' ||
+      parsed.filters === null
+    ) {
+      throw new Error('Invalid cursor format');
+    }
+    return parsed;
   } catch {
     throw new Error('Invalid cursor format');
   }

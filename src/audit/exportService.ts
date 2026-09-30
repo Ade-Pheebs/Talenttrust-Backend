@@ -7,6 +7,7 @@ import type { ReadStream } from 'fs';
 import { AuditService, auditService } from './service';
 import { redactBody } from './redact';
 import type { AuditEntry, AuditQuery } from './types';
+import { randomUUID } from 'crypto';
 
 export interface AuditExportResult {
   filePath: string;
@@ -25,6 +26,21 @@ export interface AuditExportServiceOptions {
    * @default 500
    */
   batchSize?: number;
+  /**
+   * Maximum number of concurrent in-flight export operations allowed per
+   * service instance. Additional requests are serialized through a FIFO
+   * queue so that concurrent callers cannot exhaust file descriptors,
+   * interleave writes to the same directory, or observe partially written
+   * files.
+   * @default 4
+   */
+  maxConcurrentExports?: number;
+  /**
+   * Maximum time (ms) a queued export may wait for a concurrency slot
+   * before being rejected. Prevents unbounded queue growth under load.
+   * @default 30000
+   */
+  queueTimeoutMs?: number;
 }
 
 /**
@@ -127,6 +143,14 @@ function toCsvRow(entry: AuditEntry): string {
 export class AuditExportService {
   private readonly exportRoot: string;
   private readonly batchSize: number;
+  private readonly maxConcurrentExports: number;
+  private readonly queueTimeoutMs: number;
+  private activeExports = 0;
+  private readonly waitQueue: Array<{
+    resolve: () => void;
+    reject: (err: Error) => void;
+    timer: NodeJS.Timeout;
+  }> = [];
 
   constructor(
     private readonly service: AuditService = auditService,
@@ -136,6 +160,61 @@ export class AuditExportService {
       options.exportRoot ?? path.join(tmpdir(), 'talenttrust-audit-exports'),
     );
     this.batchSize = Math.max(options.batchSize ?? 500, 1);
+    this.maxConcurrentExports = Math.max(options.maxConcurrentExports ?? 4, 1);
+    this.queueTimeoutMs = Math.max(options.queueTimeoutMs ?? 30_000, 0);
+  }
+
+  /**
+   * Acquires a concurrency slot for an export operation.
+   *
+   * Invariants:
+   * - At most `maxConcurrentExports` operations run concurrently.
+   * - Waiters are served in FIFO order.
+   * - A waiter that times out is removed from the queue and rejects with a
+   *   deterministic error so callers can retry safely.
+   */
+  private async acquireSlot(): Promise<void> {
+    if (this.activeExports < this.maxConcurrentExports) {
+      this.activeExports += 1;
+      return;
+    }
+    await new Promise<void>((resolve, reject) => {
+      const timer = setTimeout(() => {
+        const idx = this.waitQueue.findIndex((w) => w.resolve === resolve);
+        if (idx !== -1) this.waitQueue.splice(idx, 1);
+        reject(new Error('Audit export queue timeout: too many concurrent exports'));
+      }, this.queueTimeoutMs);
+      // Allow the process to exit even if a waiter is pending.
+      if (typeof timer.unref === 'function') timer.unref();
+      this.waitQueue.push({ resolve, reject, timer });
+    });
+  }
+
+  /**
+   * Releases a concurrency slot and wakes the next FIFO waiter, if any.
+   */
+  private releaseSlot(): void {
+    const next = this.waitQueue.shift();
+    if (next) {
+      clearTimeout(next.timer);
+      // Slot is handed off directly; activeExports stays the same.
+      next.resolve();
+      return;
+    }
+    if (this.activeExports > 0) this.activeExports -= 1;
+  }
+
+  /**
+   * Runs `fn` while holding a concurrency slot, guaranteeing the slot is
+   * released exactly once even if `fn` throws.
+   */
+  private async withSlot<T>(fn: () => Promise<T>): Promise<T> {
+    await this.acquireSlot();
+    try {
+      return await fn();
+    } finally {
+      this.releaseSlot();
+    }
   }
 
   // ─── NDJSON export ─────────────────────────────────────────────────────────
@@ -170,12 +249,13 @@ export class AuditExportService {
    * ```
    */
   async createNdjsonExport(filters: AuditExportFilters = {}): Promise<AuditExportResult> {
+    return this.withSlot(async () => {
     await fsp.mkdir(this.exportRoot, { recursive: true });
 
     const exportDir = await fsp.mkdtemp(path.join(this.exportRoot, 'audit-export-'));
     this.assertPathWithinRoot(exportDir);
 
-    const fileName = `audit-log-${new Date().toISOString().replace(/[:.]/g, '-')}.ndjson`;
+    const fileName = `audit-log-${new Date().toISOString().replace(/[:.]/g, '-')}-${randomUUID()}.ndjson`;
     const filePath = path.join(exportDir, fileName);
     this.assertPathWithinRoot(filePath);
 
@@ -194,7 +274,14 @@ export class AuditExportService {
     }
 
     const source = Readable.from(generateLines());
-    await pipeline(source, writer);
+    try {
+      await pipeline(source, writer);
+    } catch (error) {
+      // Ensure partial file is removed on failure so callers never observe
+      // a truncated export.
+      await fsp.rm(exportDir, { recursive: true, force: true }).catch(() => undefined);
+      throw error;
+    }
 
     const cleanup = async (): Promise<void> => {
       await fsp.rm(exportDir, { recursive: true, force: true });
@@ -208,6 +295,7 @@ export class AuditExportService {
       openReadStream: () => createReadStream(filePath),
       cleanup,
     };
+    });
   }
 
   // ─── CSV export ────────────────────────────────────────────────────────────
@@ -234,12 +322,13 @@ export class AuditExportService {
    * ```
    */
   async createCsvExport(filters: AuditExportFilters = {}): Promise<AuditExportResult> {
+    return this.withSlot(async () => {
     await fsp.mkdir(this.exportRoot, { recursive: true });
 
     const exportDir = await fsp.mkdtemp(path.join(this.exportRoot, 'audit-export-'));
     this.assertPathWithinRoot(exportDir);
 
-    const fileName = `audit-log-${new Date().toISOString().replace(/[:.]/g, '-')}.csv`;
+    const fileName = `audit-log-${new Date().toISOString().replace(/[:.]/g, '-')}-${randomUUID()}.csv`;
     const filePath = path.join(exportDir, fileName);
     this.assertPathWithinRoot(filePath);
 
@@ -261,7 +350,12 @@ export class AuditExportService {
     }
 
     const source = Readable.from(generateLines());
-    await pipeline(source, writer);
+    try {
+      await pipeline(source, writer);
+    } catch (error) {
+      await fsp.rm(exportDir, { recursive: true, force: true }).catch(() => undefined);
+      throw error;
+    }
 
     const cleanup = async (): Promise<void> => {
       await fsp.rm(exportDir, { recursive: true, force: true });
@@ -275,6 +369,7 @@ export class AuditExportService {
       openReadStream: () => createReadStream(filePath),
       cleanup,
     };
+    });
   }
 
   // ─── Streaming convenience helpers ─────────────────────────────────────────

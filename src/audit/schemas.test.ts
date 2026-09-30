@@ -135,6 +135,26 @@ describe('buildAuditQuerySchema', () => {
     }
   });
 
+  it('normalizes an explicit ISO timestamp with an offset to UTC', () => {
+    const result = schema.safeParse({ from: '2020-01-01T01:00:00+01:00' });
+    expect(result.success).toBe(true);
+    if (result.success) {
+      expect(result.data.from).toBe('2020-01-01T00:00:00.000Z');
+    }
+  });
+
+  it('normalizes an ISO date-only filter to midnight UTC', () => {
+    const result = schema.safeParse({ from: '2020-01-01' });
+    expect(result.success).toBe(true);
+    if (result.success) {
+      expect(result.data.from).toBe('2020-01-01T00:00:00.000Z');
+    }
+  });
+
+  it.each(['1', '2020-01-00', '2020-02-30', '2021-02-29'])('rejects a non-ISO or invalid calendar date: %s', (from) => {
+    expect(schema.safeParse({ from }).success).toBe(false);
+  });
+
   it('clamps a limit above maxLimit rather than rejecting it', () => {
     const result = schema.safeParse({ limit: '999999' });
     expect(result.success).toBe(true);
@@ -156,6 +176,7 @@ describe('buildAuditQuerySchema', () => {
     ['limit (zero)', { limit: '0' }],
     ['offset (negative)', { offset: '-1' }],
     ['offset (non-numeric)', { offset: 'abc' }],
+    ['offset (unsafe integer)', { offset: '9007199254740992' }],
     ['from (unparseable)', { from: 'not-a-date' }],
     ['to (unparseable)', { to: 'not-a-date' }],
     ['cursor (malformed)', { cursor: 'not-valid-base64-json!!' }],

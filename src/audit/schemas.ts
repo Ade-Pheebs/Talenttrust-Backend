@@ -43,18 +43,34 @@ export const createAuditEntryBodySchema = z.object({
 
 export type CreateAuditEntryBody = z.infer<typeof createAuditEntryBodySchema>;
 
+const hasValidCalendarDate = (value: string) => {
+  const [year, month, day] = value.slice(0, 10).split('-').map(Number);
+  const leapYear = year % 4 === 0 && (year % 100 !== 0 || year % 400 === 0);
+  const daysInMonth = [31, leapYear ? 29 : 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+  return day >= 1 && day <= daysInMonth[month - 1]!;
+};
+
+const isoDateTimeSchema = z.string().datetime({ offset: true });
+const isoDateOnlyPattern = /^\d{4}-\d{2}-\d{2}$/;
+
 const isoDateStringSchema = (fieldName: string) =>
   z
+    // Accept ISO calendar dates or zoned datetimes only, avoiding host-timezone
+    // parsing and permissive Date.parse rollover rules.
     .string()
-    .refine((value) => !Number.isNaN(Date.parse(value)), { message: `Invalid ${fieldName} timestamp` })
-    .transform((value) => new Date(Date.parse(value)).toISOString());
+    .refine(
+      (value) => isoDateOnlyPattern.test(value) || isoDateTimeSchema.safeParse(value).success,
+      { message: `Invalid ${fieldName} timestamp` },
+    )
+    .refine(hasValidCalendarDate, { message: `Invalid ${fieldName} timestamp` })
+    .transform((value) => new Date(value).toISOString());
 
 const positiveIntStringSchema = (message: string) =>
   z
     .string()
     .refine((value) => {
       const parsed = Number.parseInt(value, 10);
-      return Number.isFinite(parsed) && String(parsed) === value.trim() && parsed >= 1;
+      return Number.isSafeInteger(parsed) && String(parsed) === value.trim() && parsed >= 1;
     }, { message })
     .transform((value) => Number.parseInt(value, 10));
 
@@ -63,7 +79,7 @@ const nonNegativeIntStringSchema = (message: string) =>
     .string()
     .refine((value) => {
       const parsed = Number.parseInt(value, 10);
-      return Number.isFinite(parsed) && String(parsed) === value.trim() && parsed >= 0;
+      return Number.isSafeInteger(parsed) && String(parsed) === value.trim() && parsed >= 0;
     }, { message })
     .transform((value) => Number.parseInt(value, 10));
 

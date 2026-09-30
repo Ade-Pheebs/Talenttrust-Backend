@@ -5,11 +5,29 @@
 //! ## Idempotency
 //!
 //! `place_bets` accepts a caller-supplied `BytesN<32>` idempotency key.
-//! The key is stored in instance storage under
-//! `DataKey::PlaceBetsIdem(caller, key)` with a TTL of
+//! The key is stored in **temporary** storage under
+//! `DataKey::PlaceBetsIdem(caller, key)` as a
+//! [`bets::BatchReceipt`], with a TTL of
 //! [`storage::IDEM_KEY_TTL_LEDGERS`] ledgers (~24 h).  Repeated
 //! submissions with the same `(caller, key)` pair are rejected with
-//! `Error::IdempotentBatchAlreadyApplied`.
+//! `Error::IdempotentBatchAlreadyApplied`; once the receipt has expired
+//! the network has deleted it, so the token may be reused as a fresh
+//! batch.
+//!
+//! Temporary rather than instance storage is deliberate: the contract
+//! instance is a single bounded ledger entry, so accumulating one
+//! receipt per batch there would eventually exceed `max_entry_size` and
+//! disable the contract for every caller.  Persistent storage is avoided
+//! because deduplication must *read* the receipt, and an archived
+//! persistent entry cannot be read without a paid restore — which would
+//! make an expired token permanently unusable instead of reusable.  See
+//! [`storage::DataKey`].
+//!
+//! ## State invariants
+//!
+//! [`bets`] documents the authorization, validation and state-transition
+//! invariants this entry point owns, together with the failure modes
+//! that preserve them.
 
 #![no_std]
 
@@ -17,9 +35,14 @@ mod bets;
 mod errors;
 mod storage;
 
-pub use bets::Bet;
+#[cfg(test)]
+mod batch_operations_tests;
+#[cfg(test)]
+mod bets_invariants_tests;
+
+pub use bets::{BatchReceipt, Bet, MAX_BETS_PER_BATCH};
 pub use errors::Error;
-pub use storage::{DataKey, IDEM_KEY_TTL_LEDGERS};
+pub use storage::{DataKey, IDEM_KEY_TTL_LEDGERS, IDEM_KEY_TTL_THRESHOLD_LEDGERS};
 
 use soroban_sdk::{contract, contractimpl, Address, BytesN, Env, Vec};
 

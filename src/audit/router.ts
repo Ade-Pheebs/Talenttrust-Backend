@@ -46,9 +46,43 @@ import { idempotencyMiddleware } from '../middleware/idempotency';
 import { validateRequest } from '../middleware/validate.middleware';
 import { toAuditEntryResponseDto } from './dto/audit.dto';
 import { getCorrelationId, getRequestId as getRequestIdFromUtils } from '../utils/correlationId';
+import { createLogger } from '../logger';
 import { DownloadTokenService, DownloadTokenError } from './downloadTokenService';
 import { SqliteDownloadTokenStore } from './downloadTokenStore';
 import { getDb } from '../db/database';
+
+const routerLogger = createLogger({ module: 'audit.router' });
+
+/**
+ * Best-effort removal of a materialised export artifact.
+ *
+ * Cleanup runs from `finally` blocks. If it throws, an otherwise-successful
+ * response is turned into an unhandled rejection, and a failing cleanup can
+ * mask the real error already being reported. Swallow (but record) cleanup
+ * failures so the caller always gets a deterministic outcome.
+ *
+ * Only the error *name* is logged — the message/stack of a filesystem error
+ * can contain absolute paths that must not reach logs at this layer.
+ */
+async function safeCleanupExport(
+  result: AuditExportResult | undefined,
+  context: { route: string; requestId: string; correlationId?: string },
+): Promise<void> {
+  if (!result) {
+    return;
+  }
+
+  try {
+    await result.cleanup();
+  } catch (error) {
+    routerLogger.warn('Audit export cleanup failed', {
+      route: context.route,
+      requestId: context.requestId,
+      ...(context.correlationId !== undefined && { correlationId: context.correlationId }),
+      reason: error instanceof Error ? error.name : 'unknown',
+    });
+  }
+}
 
 export interface AuditRouterOptions {
   service?: AuditService;
@@ -294,9 +328,11 @@ export function createAuditRouter(options: AuditRouterOptions = {}): Router {
         // (file name) but the actual file is re-generated at download time.
         // We only needed to create the file to capture its name here.
         // NOTE: The download endpoint recreates the export on demand; see below.
-        if (exportResult) {
-          await exportResult.cleanup();
-        }
+        await safeCleanupExport(exportResult, {
+          route: 'POST /export/token',
+          requestId,
+          ...(correlationId !== undefined && { correlationId }),
+        });
       }
     },
   );
@@ -350,9 +386,21 @@ export function createAuditRouter(options: AuditRouterOptions = {}): Router {
 
         const tokenSvc = getDownloadTokenService();
 
-        // consume() verifies the JWT, checks tenant isolation, revocation, and
-        // one-time use atomically. Throws DownloadTokenError on any failure.
-        const { payload } = tokenSvc.consume(rawToken, tenantId);
+        // ── Failure-recovery ordering (issue #1358) ──────────────────────
+        // 1. VERIFY (non-destructive): signature, expiry, tenant, revocation,
+        //    and prior use are checked WITHOUT spending the one-time token.
+        // 2. GENERATE the artifact and confirm it is readable.
+        // 3. CONSUME the token atomically — the commit point. Only now is the
+        //    token irrevocably used.
+        // 4. STREAM.
+        //
+        // The previous order consumed the token first, so a transient export
+        // failure permanently burned a single-use credential and the caller
+        // could never retry. Moving the commit point after generation makes a
+        // dependency/disk failure recoverable by retrying with the same token,
+        // while one-time-use and concurrency safety are preserved: consume()
+        // is still the atomic gate, so a racing request loses with token_reused.
+        const { payload } = tokenSvc.verify(rawToken, tenantId);
 
         // Re-generate the export file with the same filters as encoded in the
         // token (the artifactId is the file name; filters are not re-encoded
@@ -375,7 +423,8 @@ export function createAuditRouter(options: AuditRouterOptions = {}): Router {
           exportService,
         );
 
-        // Verify the artifact file exists before committing headers.
+        // Verify the artifact file exists before consuming the token or
+        // committing headers, so a missing artifact leaves the token reusable.
         try {
           await fsp.access(exportResult.filePath);
         } catch {
@@ -389,6 +438,10 @@ export function createAuditRouter(options: AuditRouterOptions = {}): Router {
           });
           return;
         }
+
+        // Commit point: atomically spend the token. A concurrent caller that
+        // already consumed it loses here with `token_reused` (410).
+        tokenSvc.consume(rawToken, tenantId);
 
         res.setHeader('Content-Type', 'application/x-ndjson; charset=utf-8');
         res.setHeader(
@@ -422,6 +475,14 @@ export function createAuditRouter(options: AuditRouterOptions = {}): Router {
           return;
         }
 
+        // Non-token failure (export generation, disk, or a pipeline error
+        // after headers). Record it for operators; never echo driver text.
+        routerLogger.error('Audit export download failed', {
+          requestId,
+          ...(correlationId !== undefined && { correlationId }),
+          code: 'download_error',
+        });
+
         if (!res.headersSent) {
           res.status(500).json({
             error: {
@@ -433,9 +494,11 @@ export function createAuditRouter(options: AuditRouterOptions = {}): Router {
           });
         }
       } finally {
-        if (exportResult) {
-          await exportResult.cleanup();
-        }
+        await safeCleanupExport(exportResult, {
+          route: 'GET /export/download/:token',
+          requestId,
+          ...(correlationId !== undefined && { correlationId }),
+        });
       }
     },
   );
@@ -474,9 +537,13 @@ export function createAuditRouter(options: AuditRouterOptions = {}): Router {
         });
       }
     } finally {
-      if (exportResult) {
-        await exportResult.cleanup();
-      }
+      const requestId = getRequestIdFromUtils(res);
+      const correlationId = getCorrelationId(res);
+      await safeCleanupExport(exportResult, {
+        route: 'GET /export',
+        requestId,
+        ...(correlationId !== undefined && { correlationId }),
+      });
     }
   });
 

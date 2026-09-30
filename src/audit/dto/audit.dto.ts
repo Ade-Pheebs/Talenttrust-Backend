@@ -17,6 +17,18 @@
  *   unknown keys cannot reach the service layer.
  * - Optional/nullable fields in the domain type surface as optional in the
  *   DTO; required fields are always present.
+ *
+ * Concurrency invariants:
+ * - Mapping functions are pure and stateless: they never mutate their inputs
+ *   and never read or write shared module state. Concurrent invocations with
+ *   the same input therefore always produce structurally equal outputs.
+ * - Nested objects (`metadata`) are defensively copied on both directions of
+ *   the boundary so a caller mutating a DTO after mapping cannot retroactively
+ *   alter a domain object (or vice versa). This prevents stale/aliased state
+ *   from leaking across concurrent requests.
+ * - `toAuditQuery` performs all coercions on local variables only; it never
+ *   caches parsed values, so repeated/racing calls cannot observe partial
+ *   state from another in-flight call.
  */
 
 import type {
@@ -177,13 +189,16 @@ export interface IntegrityReportResponseDto {
 export function toCreateAuditEntryInput(
   dto: CreateAuditEntryRequestDto,
 ): CreateAuditEntryInput {
+  // Defensive deep-ish copy of metadata: a shallow spread would still share
+  // nested object references with the caller, allowing a concurrent mutation
+  // of the request body to corrupt the domain input after mapping.
   return {
     action: dto.action,
     severity: dto.severity,
     actor: dto.actor,
     resource: dto.resource,
     resourceId: dto.resourceId,
-    metadata: { ...dto.metadata },
+    metadata: cloneMetadata(dto.metadata),
     ...(dto.ipAddress !== undefined && { ipAddress: dto.ipAddress }),
     ...(dto.correlationId !== undefined && { correlationId: dto.correlationId }),
   };
@@ -211,14 +226,19 @@ export function toAuditQuery(
   dto: AuditQueryParamsDto,
   options: { maxLimit: number; defaultLimit?: number } = { maxLimit: 100 },
 ): AuditQuery {
+  // Snapshot the caller-supplied options once so a concurrent mutation of the
+  // options object cannot change the effective bounds mid-mapping.
+  const maxLimit = options.maxLimit;
+  const defaultLimit = options.defaultLimit;
+
   // Parse and clamp limit
-  let limit: number | undefined = options.defaultLimit;
+  let limit: number | undefined = defaultLimit;
   if (dto.limit !== undefined) {
     const parsed = Number.parseInt(dto.limit, 10);
     if (!Number.isFinite(parsed) || parsed < 1) {
       throw new Error('Invalid limit');
     }
-    limit = Math.min(parsed, options.maxLimit);
+    limit = Math.min(parsed, maxLimit);
   }
 
   // Parse and validate offset
@@ -250,6 +270,12 @@ export function toAuditQuery(
     to = new Date(parsed).toISOString();
   }
 
+  // Reject inverted ranges deterministically rather than letting the store
+  // interpret an ambiguous window under concurrency.
+  if (from !== undefined && to !== undefined && Date.parse(from) > Date.parse(to)) {
+    throw new Error('Invalid time range: from must be <= to');
+  }
+
   return {
     ...(dto.action !== undefined && { action: dto.action as AuditAction }),
     ...(dto.severity !== undefined && { severity: dto.severity as AuditSeverity }),
@@ -277,6 +303,43 @@ export function toAuditQuery(
  * @param entry - Domain entry from the store or service.
  * @returns A plain-object DTO safe for JSON serialisation.
  */
+/**
+ * Recursively clones a metadata object so that no nested reference is shared
+ * between the DTO and the domain object. This is what makes concurrent
+ * mapping safe: a mutation on one side can never be observed on the other.
+ *
+ * Only plain objects and arrays are cloned; primitives are returned as-is.
+ * Cycles are not expected in audit metadata and are not supported.
+ */
+function cloneMetadata(value: Record<string, unknown>): Record<string, unknown> {
+  const out: Record<string, unknown> = {};
+  for (const key of Object.keys(value)) {
+    out[key] = cloneValue(value[key]);
+  }
+  return out;
+}
+
+function cloneValue(value: unknown): unknown {
+  if (Array.isArray(value)) {
+    return value.map(cloneValue);
+  }
+  if (value !== null && typeof value === 'object') {
+    return cloneMetadata(value as Record<string, unknown>);
+  }
+  return value;
+}
+
+/**
+ * Maps an internal {@link AuditEntry} domain object to the stable public
+ * {@link AuditEntryResponseDto} shape.
+ *
+ * Fields are listed explicitly so that any future additions to `AuditEntry`
+ * do not accidentally appear in the API response until this mapping is
+ * deliberately updated.
+ *
+ * @param entry - Domain entry from the store or service.
+ * @returns A plain-object DTO safe for JSON serialisation.
+ */
 export function toAuditEntryResponseDto(entry: AuditEntry): AuditEntryResponseDto {
   return {
     id: entry.id,
@@ -286,7 +349,7 @@ export function toAuditEntryResponseDto(entry: AuditEntry): AuditEntryResponseDt
     actor: entry.actor,
     resource: entry.resource,
     resourceId: entry.resourceId,
-    metadata: { ...(entry.metadata as Record<string, unknown>) },
+    metadata: cloneMetadata(entry.metadata as Record<string, unknown>),
     ...(entry.ipAddress !== undefined && { ipAddress: entry.ipAddress }),
     ...(entry.correlationId !== undefined && { correlationId: entry.correlationId }),
     hash: entry.hash,

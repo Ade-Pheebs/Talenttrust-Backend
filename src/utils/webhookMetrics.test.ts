@@ -21,10 +21,13 @@
 
 import {
   webhookDlqRegistry,
+  webhookDlqOperationsTotal,
   incrementDlqOperation,
+  webhookDlqReplaysTotal,
   incrementDlqReplay,
-  resetWebhookMetrics,
 } from './webhookMetrics';
+
+// ─── Helper functions ─────────────────────────────────────────────────────────
 
 /**
  * Extract the current value of a counter for a specific label set.
@@ -103,9 +106,18 @@ async function getMetricLabelValues(
   return Array.from(seen).sort();
 }
 
+// ─── Tests ────────────────────────────────────────────────────────────────────
+
 describe('incrementDlqOperation', () => {
   beforeEach(() => {
     resetWebhookMetrics();
+  });
+
+  it('throws TypeError for invalid operation', () => {
+    expect(() => incrementDlqOperation('invalid' as any)).toThrow(TypeError);
+    expect(() => incrementDlqOperation('invalid' as any)).toThrow(
+      'Invalid DLQ operation',
+    );
   });
 
   it('increments the enqueue counter', async () => {
@@ -122,6 +134,15 @@ describe('incrementDlqOperation', () => {
 
     const value = await getCounterValue('webhook_dlq_operations_total', {
       operation: 'drop_overflow',
+    });
+    expect(value).toBe(1);
+  });
+
+  it('increments the drop_poison counter', async () => {
+    incrementDlqOperation('drop_poison');
+
+    const value = await getCounterValue('webhook_dlq_operations_total', {
+      operation: 'drop_poison',
     });
     expect(value).toBe(1);
   });
@@ -223,6 +244,13 @@ describe('incrementDlqOperation', () => {
 describe('incrementDlqReplay', () => {
   beforeEach(() => {
     resetWebhookMetrics();
+  });
+
+  it('throws TypeError for invalid replay outcome', () => {
+    expect(() => incrementDlqReplay('invalid' as any)).toThrow(TypeError);
+    expect(() => incrementDlqReplay('invalid' as any)).toThrow(
+      'Invalid DLQ replay outcome',
+    );
   });
 
   it('increments the success counter', async () => {
@@ -400,12 +428,19 @@ describe('webhookDlqRegistry isolation', () => {
 });
 
 describe('metric name constants', () => {
-  it('exports counters registered to the isolated registry', async () => {
-    const metrics = await webhookDlqRegistry.getMetricsAsJSON();
-    const opsMetric = metrics.find((m: any) => m.name === 'webhook_dlq_operations_total');
-    const replaysMetric = metrics.find((m: any) => m.name === 'webhook_dlq_replays_total');
-    expect(opsMetric).toBeDefined();
-    expect(replaysMetric).toBeDefined();
+  it('exports the expected counter metric names', () => {
+    expect(webhookDlqOperationsTotal.name).toBe('webhook_dlq_operations_total');
+    expect(webhookDlqReplaysTotal.name).toBe('webhook_dlq_replays_total');
+  });
+
+  it('exports counters with the correct help text', () => {
+    expect(webhookDlqOperationsTotal.help).toContain('DLQ');
+    expect(webhookDlqReplaysTotal.help).toContain('DLQ');
+  });
+
+  it('exports counters registered to the isolated registry', () => {
+    expect(webhookDlqOperationsTotal.registers).toContain(webhookDlqRegistry);
+    expect(webhookDlqReplaysTotal.registers).toContain(webhookDlqRegistry);
   });
 });
 
@@ -466,3 +501,7 @@ describe('label cardinality guard', () => {
     expect(labelNames).toHaveLength(1);
   });
 });
+
+function resetWebhookMetrics(): void {
+  webhookDlqRegistry.resetMetrics();
+}

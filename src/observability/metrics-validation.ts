@@ -223,3 +223,120 @@ export function assertServiceStatus(value: unknown): ServiceStatus {
   }
   return result.data;
 }
+
+// ---------------------------------------------------------------------------
+// Disputes request metrics
+// ---------------------------------------------------------------------------
+
+/**
+ * Finite set of error-cause labels for disputes request metrics.
+ * Mapped from HTTP status codes — never from raw error messages.
+ */
+export const DISPUTES_ERROR_CAUSES = [
+  'success',
+  '4xx_client_error',
+  '5xx_server_error',
+  'unknown',
+] as const;
+export type DisputesErrorCause = (typeof DISPUTES_ERROR_CAUSES)[number];
+
+export const DisputesErrorCauseSchema = z.enum(DISPUTES_ERROR_CAUSES, {
+  errorMap: () => ({
+    message: `error_cause must be one of: ${DISPUTES_ERROR_CAUSES.join(', ')}`,
+  }),
+});
+
+/**
+ * Map an HTTP status code to a cardinality-safe disputes error-cause label.
+ */
+export function mapDisputesErrorCause(statusCode: number): DisputesErrorCause {
+  if (statusCode >= 200 && statusCode < 300) {
+    return 'success';
+  }
+  if (statusCode >= 400 && statusCode < 500) {
+    return '4xx_client_error';
+  }
+  if (statusCode >= 500 && statusCode < 600) {
+    return '5xx_server_error';
+  }
+  return 'unknown';
+}
+
+/**
+ * Validate a disputes error-cause label at runtime.
+ * Throws a TypeError for unknown values.
+ */
+export function assertDisputesErrorCause(value: unknown): DisputesErrorCause {
+  const result = DisputesErrorCauseSchema.safeParse(value);
+  if (!result.success) {
+    throw new TypeError(
+      `Invalid disputes error_cause: ${JSON.stringify(value)}. ` +
+        `Must be one of: ${DISPUTES_ERROR_CAUSES.join(', ')}`,
+    );
+  }
+  return result.data;
+}
+
+// ---------------------------------------------------------------------------
+// Contracts request metrics
+// ---------------------------------------------------------------------------
+
+export const CONTRACTS_REQUEST_STATUSES = ['success', 'client_error', 'server_error'] as const;
+export type ContractsRequestStatus = (typeof CONTRACTS_REQUEST_STATUSES)[number];
+
+export const CONTRACTS_ERROR_CAUSES = [
+  'none',
+  'bad_request',
+  'authentication',
+  'authorization',
+  'not_found',
+  'conflict',
+  'validation',
+  'contract_bounds_error',
+  'rate_limit',
+  'client_error',
+  'internal_error',
+] as const;
+export type ContractsErrorCause = (typeof CONTRACTS_ERROR_CAUSES)[number];
+
+export const ContractsRequestStatusSchema = z.enum(CONTRACTS_REQUEST_STATUSES);
+export const ContractsErrorCauseSchema = z.enum(CONTRACTS_ERROR_CAUSES);
+
+export interface ContractsRequestMetric {
+  method: string;
+  route: string;
+  status: ContractsRequestStatus;
+  statusCode: number;
+  errorCause: ContractsErrorCause;
+  durationSeconds: number;
+}
+
+export function assertContractsRequestMetric(value: unknown): ContractsRequestMetric {
+  if (typeof value !== 'object' || value === null) {
+    throw new TypeError('Contracts request metric must be an object');
+  }
+
+  const metric = value as Record<string, unknown>;
+  const statusResult = ContractsRequestStatusSchema.safeParse(metric.status);
+  if (!statusResult.success) {
+    throw new TypeError(`Invalid contracts request status: ${JSON.stringify(metric.status)}`);
+  }
+
+  const causeResult = ContractsErrorCauseSchema.safeParse(metric.errorCause);
+  if (!causeResult.success) {
+    throw new TypeError(`Invalid contracts error cause: ${JSON.stringify(metric.errorCause)}`);
+  }
+
+  if (typeof metric.durationSeconds !== 'number' || !Number.isFinite(metric.durationSeconds) || metric.durationSeconds < 0) {
+    throw new TypeError(`Invalid durationSeconds: ${metric.durationSeconds}`);
+  }
+
+  return {
+    method: String(metric.method ?? 'UNKNOWN'),
+    route: String(metric.route ?? 'unmatched'),
+    status: statusResult.data,
+    statusCode: Number(metric.statusCode ?? 500),
+    errorCause: causeResult.data,
+    durationSeconds: metric.durationSeconds,
+  };
+}

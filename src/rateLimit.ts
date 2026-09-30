@@ -5,7 +5,9 @@
  */
 
 import { recordQueueOverflow, recordThrottled } from './webhookMetrics';
-import type { RateLimitStore, TokenBucketEntry } from './lib/rateLimitStore';
+import Redis from 'ioredis';
+import { RateLimitStore } from './lib/rateLimitStore';
+import type { TokenBucketEntry } from './lib/rateLimitStore';
 import { loadWebhookTokenBucketConfig } from './config/rateLimit';
 
 /**
@@ -336,7 +338,9 @@ export class TokenBucketLimiter {
   private readonly capacity: number;
   private readonly refillRatePerSec: number;
   private readonly maxQueueDepth: number;
-  private readonly store: RateLimitStore;
+  private readonly store: BucketStore;
+  private readonly rateLimitStore?: RateLimitStore;
+  private readonly queues = new Map<string, Array<() => void>>();
   /** Active drain timers keyed by provider id. */
   private readonly timers = new Map<string, ReturnType<typeof setTimeout>>();
 
@@ -344,7 +348,17 @@ export class TokenBucketLimiter {
     this.capacity = config.capacity;
     this.refillRatePerSec = config.refillRatePerSec;
     this.maxQueueDepth = config.maxQueueDepth;
-    this.store = store;
+    if (store instanceof RateLimitStore) {
+      this.rateLimitStore = store;
+      this.store = new InMemoryBucketStore(store);
+    } else {
+      const bucketStore = store ?? new InMemoryBucketStore();
+      this.store = bucketStore;
+      this.rateLimitStore =
+        bucketStore instanceof InMemoryBucketStore
+          ? bucketStore.underlyingStore
+          : undefined;
+    }
   }
 
   /**
@@ -396,7 +410,7 @@ export class TokenBucketLimiter {
       }
     }
 
-    if (bucket.queue.length >= this.maxQueueDepth) {
+    if (queue.length >= this.maxQueueDepth) {
       recordQueueOverflow();
       return Promise.reject(
         new RateLimitQueueFullError(providerId, this.maxQueueDepth),
@@ -431,8 +445,8 @@ export class TokenBucketLimiter {
   }
 
   private syncLegacyStoreQueue(providerId: string, queue: Array<() => void>): void {
-    if (!this.rateLimitStore) return;
-    let bucket = this.rateLimitStore.getTokenBucket(providerId);
+    if (!this.legacyStore) return;
+    let bucket = this.legacyStore.getTokenBucket(providerId);
     if (!bucket) {
       const tokens = this.store.getTokenCount(providerId) ?? this.capacity;
       const count = typeof tokens === 'number' ? tokens : this.capacity;
@@ -440,7 +454,7 @@ export class TokenBucketLimiter {
     } else {
       bucket.queue = queue;
     }
-    this.rateLimitStore.setTokenBucket(providerId, bucket);
+    this.legacyStore.setTokenBucket(providerId, bucket);
   }
 
   private scheduleDrain(providerId: string): void {
@@ -454,16 +468,31 @@ export class TokenBucketLimiter {
     this.timers.set(providerId, timer);
   }
 
-  private async drain(providerId: string): Promise<void> {
+  private drain(providerId: string): void {
     const queue = this.queues.get(providerId);
     if (!queue || queue.length === 0) return;
 
     while (queue.length > 0) {
-      const consumed = await this.store.consumeToken(
+      const consumed = this.store.consumeToken(
         providerId,
         this.capacity,
         this.refillRatePerSec,
       );
+      if (consumed instanceof Promise) {
+        void consumed
+          .then((didConsume) => {
+            if (didConsume) {
+              const resolve = queue.shift();
+              this.syncLegacyStoreQueue(providerId, queue);
+              resolve?.();
+            }
+            if (queue.length > 0) this.scheduleDrain(providerId);
+          })
+          .catch(() => {
+            if (queue.length > 0) this.scheduleDrain(providerId);
+          });
+        return;
+      }
       if (!consumed) break;
 
       const resolve = queue.shift();

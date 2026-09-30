@@ -9,6 +9,8 @@ coverage/
 .idea
 test_output.txt
 talenttrust.db
+talenttrust.db-shm
+talenttrust.db-wal
 *.tgz
 npm-debug.log*
 yarn-error.log*
@@ -21,3 +23,4 @@ data/*.db-shm
 .deployment-state.json
 *.db-shm
 *.db-wal
+.opencode

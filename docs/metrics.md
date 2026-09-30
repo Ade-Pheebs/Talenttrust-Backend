@@ -118,11 +118,16 @@ The `/metrics` endpoint exports the following metric families:
 |-------------|------|-------------|---------------|
 | `http_requests_total` | Counter | Total number of HTTP requests | `metrics-service.ts` |
 | `http_request_duration_seconds` | Histogram | Duration of HTTP requests in seconds | `metrics-service.ts` |
+| `reputation_requests_total` | Counter | Reputation requests by operation, status, HTTP status code, and bounded error cause | `metrics-service.ts` |
+| `reputation_request_duration_seconds` | Histogram | Reputation request duration by operation, status, HTTP status code, and bounded error cause | `metrics-service.ts` |
+| `reputation_errors_total` | Counter | Reputation errors by operation and bounded error cause | `metrics-service.ts` |
 | `service_health_status` | Gauge | Current service health status (2=up, 1=degraded, 0=down) | `metrics-service.ts` |
 | `webhook_deliveries_total` | Counter | Total webhook delivery attempts by outcome | `metrics-service.ts` |
 | `webhook_dlq_depth` | Gauge | Current number of entries in the webhook DLQ | `metrics-service.ts` |
 | `webhook_rate_limit_tokens` | Gauge | Current token count per provider in the rate-limiter | `metrics-service.ts` |
 | `webhook_rate_limit_queue_depth` | Gauge | Current queue depth per provider in the rate-limiter | `metrics-service.ts` |
+| `disputes_requests_total` | Counter | Total disputes API requests by method, route, status, and error cause | `metrics-service.ts` |
+| `disputes_request_duration_seconds` | Histogram | Duration of disputes API requests in seconds | `metrics-service.ts` |
 | `webhook_dlq_operations_total` | Counter | Total webhook DLQ operations | `utils/webhookMetrics.ts` |
 | `webhook_dlq_replays_total` | Counter | Total webhook DLQ replay attempts | `utils/webhookMetrics.ts` |
 | `webhook_delivery_attempts_total` | Counter | Total webhook delivery attempts | `webhookMetrics.ts` |
@@ -130,6 +135,19 @@ The `/metrics` endpoint exports the following metric families:
 | `webhook_delivery_retries_total` | Counter | Total webhook delivery retries | `webhookMetrics.ts` |
 | `webhook_breaker_state` | Gauge | Circuit breaker state per provider (0=CLOSED, 1=OPEN, 2=HALF_OPEN) | `webhookMetrics.ts` |
 | `talenttrust_backend_*` | Various | Node.js runtime metrics (heap, CPU, GC, etc.) | `prom-client` |
+
+### Reputation observability labels
+
+Reputation metrics use only bounded values:
+
+- `operation`: `get_profile` or `create_rating`
+- `status`: `success`, `client_error`, or `server_error`
+- `error_cause`: `none`, a known HTTP cause such as `validation` or `authorization`, or `client_error`/`internal_error`
+- `status_code`: the numeric HTTP response code
+
+Request IDs, user IDs, request bodies, comments, headers, and raw exception
+messages are excluded from reputation metric labels and structured completion
+logs.
 
 For detailed information about each metric including labels, cardinality controls, and usage examples, see [Observability Metrics Catalog](./observability.md).
 

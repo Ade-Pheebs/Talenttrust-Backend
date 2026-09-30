@@ -14,6 +14,12 @@
  *   - Each key has optional expiration and scoping
  *   - Keys can be rotated and deactivated
  *   - Last usage is tracked for audit purposes
+ *
+ * Validation boundaries:
+ *   - API key format: 64 hex characters (32 bytes)
+ *   - Name: 1-255 characters, alphanumeric, spaces, hyphens, underscores
+ *   - Scope: array of 1-50 strings, each 1-100 characters
+ *   - Expiration: must be in the future if provided
  */
 
 import * as crypto from 'crypto';
@@ -21,6 +27,56 @@ import { ApiKey } from '../database/schema';
 import { database } from '../database';
 import { AuthCache } from './authCache';
 import { validateEnv } from '../config/env.schema';
+
+/**
+ * Validation error class for API key operations.
+ */
+export class ApiKeyValidationError extends Error {
+  constructor(
+    message: string,
+    public readonly field: string,
+    public readonly code: string
+  ) {
+    super(message);
+    this.name = 'ApiKeyValidationError';
+  }
+}
+
+/**
+ * Validation constants defining boundaries for API key inputs.
+ */
+export const VALIDATION_RULES = {
+  API_KEY: {
+    LENGTH: 64, // 32 bytes in hex = 64 characters
+    PATTERN: /^[a-f0-9]{64}$/i,
+  },
+  NAME: {
+    MIN_LENGTH: 1,
+    MAX_LENGTH: 255,
+    PATTERN: /^[a-zA-Z0-9\s\-_]+$/,
+  },
+  SCOPE: {
+    MIN_ITEMS: 1,
+    MAX_ITEMS: 50,
+    ITEM_MIN_LENGTH: 1,
+    ITEM_MAX_LENGTH: 100,
+    ITEM_PATTERN: /^[a-zA-Z0-9:\-_\.]+$/,
+  },
+  USER_ID: {
+    MIN_LENGTH: 1,
+    MAX_LENGTH: 255,
+    PATTERN: /^[a-zA-Z0-9\-_]+$/,
+  },
+  KEY_SELECTOR: {
+    LENGTH: 64, // SHA-256 hex = 64 characters
+    PATTERN: /^[a-f0-9]{64}$/i,
+  },
+  SALT_HASH: {
+    SALT_LENGTH: 32, // 16 bytes in hex
+    HASH_LENGTH: 128, // 64 bytes in hex
+    PATTERN: /^[a-f0-9]{32}:[a-f0-9]{128}$/i,
+  },
+} as const;
 
 // Initialize cache with config-driven settings
 let authCache: AuthCache | null = null;
@@ -61,6 +117,283 @@ export interface ApiKeyRequest {
   scope: string[];
   createdBy: string;
   expiresAt?: Date;
+}
+
+/**
+ * Validates an API key format.
+ * 
+ * Validation boundaries:
+ *   - VALID: 64 hex characters (a-f, 0-9, case-insensitive)
+ *   - INVALID: Wrong length, non-hex characters, null, undefined, non-string
+ * 
+ * @param apiKey - The API key to validate
+ * @throws ApiKeyValidationError if invalid
+ */
+export function validateApiKeyFormat(apiKey: unknown): asserts apiKey is string {
+  if (typeof apiKey !== 'string') {
+    throw new ApiKeyValidationError(
+      'API key must be a string',
+      'apiKey',
+      'INVALID_TYPE'
+    );
+  }
+
+  if (apiKey.length !== VALIDATION_RULES.API_KEY.LENGTH) {
+    throw new ApiKeyValidationError(
+      `API key must be exactly ${VALIDATION_RULES.API_KEY.LENGTH} characters`,
+      'apiKey',
+      'INVALID_LENGTH'
+    );
+  }
+
+  if (!VALIDATION_RULES.API_KEY.PATTERN.test(apiKey)) {
+    throw new ApiKeyValidationError(
+      'API key must contain only hexadecimal characters',
+      'apiKey',
+      'INVALID_FORMAT'
+    );
+  }
+}
+
+/**
+ * Validates an API key name.
+ * 
+ * Validation boundaries:
+ *   - VALID: 1-255 characters, alphanumeric + spaces, hyphens, underscores
+ *   - INVALID: Empty, too long, contains special characters, null, non-string
+ * 
+ * @param name - The name to validate
+ * @throws ApiKeyValidationError if invalid
+ */
+export function validateApiKeyName(name: unknown): asserts name is string {
+  if (typeof name !== 'string') {
+    throw new ApiKeyValidationError(
+      'API key name must be a string',
+      'name',
+      'INVALID_TYPE'
+    );
+  }
+
+  const trimmed = name.trim();
+
+  if (trimmed.length < VALIDATION_RULES.NAME.MIN_LENGTH) {
+    throw new ApiKeyValidationError(
+      'API key name cannot be empty',
+      'name',
+      'EMPTY_NAME'
+    );
+  }
+
+  if (trimmed.length > VALIDATION_RULES.NAME.MAX_LENGTH) {
+    throw new ApiKeyValidationError(
+      `API key name must not exceed ${VALIDATION_RULES.NAME.MAX_LENGTH} characters`,
+      'name',
+      'NAME_TOO_LONG'
+    );
+  }
+
+  if (!VALIDATION_RULES.NAME.PATTERN.test(trimmed)) {
+    throw new ApiKeyValidationError(
+      'API key name can only contain alphanumeric characters, spaces, hyphens, and underscores',
+      'name',
+      'INVALID_CHARACTERS'
+    );
+  }
+}
+
+/**
+ * Validates an API key scope array.
+ * 
+ * Validation boundaries:
+ *   - VALID: Array of 1-50 strings, each 1-100 chars, matching pattern
+ *   - INVALID: Empty array, too many items, invalid item format, null, non-array
+ *   - DUPLICATE: Contains duplicate scope values
+ * 
+ * @param scope - The scope array to validate
+ * @throws ApiKeyValidationError if invalid
+ */
+export function validateApiKeyScope(scope: unknown): asserts scope is string[] {
+  if (!Array.isArray(scope)) {
+    throw new ApiKeyValidationError(
+      'API key scope must be an array',
+      'scope',
+      'INVALID_TYPE'
+    );
+  }
+
+  if (scope.length < VALIDATION_RULES.SCOPE.MIN_ITEMS) {
+    throw new ApiKeyValidationError(
+      'API key scope must contain at least one item',
+      'scope',
+      'EMPTY_SCOPE'
+    );
+  }
+
+  if (scope.length > VALIDATION_RULES.SCOPE.MAX_ITEMS) {
+    throw new ApiKeyValidationError(
+      `API key scope must not exceed ${VALIDATION_RULES.SCOPE.MAX_ITEMS} items`,
+      'scope',
+      'SCOPE_TOO_LARGE'
+    );
+  }
+
+  // Check for duplicates
+  const uniqueScopes = new Set(scope);
+  if (uniqueScopes.size !== scope.length) {
+    throw new ApiKeyValidationError(
+      'API key scope contains duplicate values',
+      'scope',
+      'DUPLICATE_SCOPE'
+    );
+  }
+
+  // Validate each scope item
+  scope.forEach((item, index) => {
+    if (typeof item !== 'string') {
+      throw new ApiKeyValidationError(
+        `Scope item at index ${index} must be a string`,
+        'scope',
+        'INVALID_SCOPE_ITEM_TYPE'
+      );
+    }
+
+    const trimmed = item.trim();
+
+    if (trimmed.length < VALIDATION_RULES.SCOPE.ITEM_MIN_LENGTH) {
+      throw new ApiKeyValidationError(
+        `Scope item at index ${index} cannot be empty`,
+        'scope',
+        'EMPTY_SCOPE_ITEM'
+      );
+    }
+
+    if (trimmed.length > VALIDATION_RULES.SCOPE.ITEM_MAX_LENGTH) {
+      throw new ApiKeyValidationError(
+        `Scope item at index ${index} exceeds ${VALIDATION_RULES.SCOPE.ITEM_MAX_LENGTH} characters`,
+        'scope',
+        'SCOPE_ITEM_TOO_LONG'
+      );
+    }
+
+    if (!VALIDATION_RULES.SCOPE.ITEM_PATTERN.test(trimmed)) {
+      throw new ApiKeyValidationError(
+        `Scope item at index ${index} contains invalid characters`,
+        'scope',
+        'INVALID_SCOPE_ITEM_FORMAT'
+      );
+    }
+  });
+}
+
+/**
+ * Validates a user ID.
+ * 
+ * Validation boundaries:
+ *   - VALID: 1-255 characters, alphanumeric + hyphens, underscores
+ *   - INVALID: Empty, too long, invalid characters, null, non-string
+ * 
+ * @param userId - The user ID to validate
+ * @throws ApiKeyValidationError if invalid
+ */
+export function validateUserId(userId: unknown): asserts userId is string {
+  if (typeof userId !== 'string') {
+    throw new ApiKeyValidationError(
+      'User ID must be a string',
+      'createdBy',
+      'INVALID_TYPE'
+    );
+  }
+
+  const trimmed = userId.trim();
+
+  if (trimmed.length < VALIDATION_RULES.USER_ID.MIN_LENGTH) {
+    throw new ApiKeyValidationError(
+      'User ID cannot be empty',
+      'createdBy',
+      'EMPTY_USER_ID'
+    );
+  }
+
+  if (trimmed.length > VALIDATION_RULES.USER_ID.MAX_LENGTH) {
+    throw new ApiKeyValidationError(
+      `User ID must not exceed ${VALIDATION_RULES.USER_ID.MAX_LENGTH} characters`,
+      'createdBy',
+      'USER_ID_TOO_LONG'
+    );
+  }
+
+  if (!VALIDATION_RULES.USER_ID.PATTERN.test(trimmed)) {
+    throw new ApiKeyValidationError(
+      'User ID can only contain alphanumeric characters, hyphens, and underscores',
+      'createdBy',
+      'INVALID_USER_ID_FORMAT'
+    );
+  }
+}
+
+/**
+ * Validates an expiration date.
+ * 
+ * Validation boundaries:
+ *   - VALID: Date object in the future, or undefined
+ *   - INVALID: Date in the past, invalid Date object, non-Date type
+ * 
+ * @param expiresAt - The expiration date to validate
+ * @throws ApiKeyValidationError if invalid
+ */
+export function validateExpirationDate(expiresAt: unknown): asserts expiresAt is Date | undefined {
+  if (expiresAt === undefined || expiresAt === null) {
+    return; // Optional field
+  }
+
+  if (!(expiresAt instanceof Date)) {
+    throw new ApiKeyValidationError(
+      'Expiration date must be a Date object',
+      'expiresAt',
+      'INVALID_TYPE'
+    );
+  }
+
+  if (isNaN(expiresAt.getTime())) {
+    throw new ApiKeyValidationError(
+      'Expiration date is invalid',
+      'expiresAt',
+      'INVALID_DATE'
+    );
+  }
+
+  if (expiresAt <= new Date()) {
+    throw new ApiKeyValidationError(
+      'Expiration date must be in the future',
+      'expiresAt',
+      'EXPIRED_DATE'
+    );
+  }
+}
+
+/**
+ * Validates a complete API key request.
+ * 
+ * Validates all fields according to defined boundaries.
+ * 
+ * @param request - The API key request to validate
+ * @throws ApiKeyValidationError if any field is invalid
+ */
+export function validateApiKeyRequest(request: unknown): asserts request is ApiKeyRequest {
+  if (typeof request !== 'object' || request === null) {
+    throw new ApiKeyValidationError(
+      'API key request must be an object',
+      'request',
+      'INVALID_TYPE'
+    );
+  }
+
+  const req = request as Record<string, unknown>;
+
+  validateApiKeyName(req.name);
+  validateApiKeyScope(req.scope);
+  validateUserId(req.createdBy);
+  validateExpirationDate(req.expiresAt);
 }
 
 /**
@@ -130,11 +463,17 @@ export function computeKeySelector(apiKey: string): string {
 
 /**
  * Creates a new API key with the given specifications.
+ * 
+ * Validates all inputs according to defined boundaries before creation.
  *
  * @param request - The API key creation request.
  * @returns The created API key info and the plain key (only returned once).
+ * @throws ApiKeyValidationError if request is invalid
  */
 export async function createApiKey(request: ApiKeyRequest): Promise<{ apiKey: string; info: ApiKeyInfo }> {
+  // Validate request inputs
+  validateApiKeyRequest(request);
+
   const apiKey = generateApiKey();
   const { salt, hash } = hashApiKey(apiKey);
 
@@ -143,11 +482,11 @@ export async function createApiKey(request: ApiKeyRequest): Promise<{ apiKey: st
   const keySelector = computeKeySelector(apiKey);
 
   const dbKey = await database.createApiKey({
-    name: request.name,
+    name: request.name.trim(),
     key_hash: keyHash,
     key_selector: keySelector,
-    scope: request.scope,
-    created_by: request.createdBy,
+    scope: request.scope.map(s => s.trim()),
+    created_by: request.createdBy.trim(),
     expires_at: request.expiresAt,
     is_active: true
   });
@@ -210,11 +549,23 @@ export function isValidSaltHashFormat(storedCredential: string): boolean {
 
 /**
  * Validates an API key and returns the associated key info if valid.
+ * 
+ * Validates input format before performing cryptographic operations.
  *
  * @param apiKey - The plain API key to validate.
  * @returns The API key info if valid, null otherwise.
+ * @throws ApiKeyValidationError if input format is invalid
  */
 export async function validateApiKey(apiKey: string): Promise<ApiKeyInfo | null> {
+  // Validate input format before any expensive operations
+  try {
+    validateApiKeyFormat(apiKey);
+  } catch (error) {
+    // Return null for invalid format instead of throwing
+    // This maintains backward compatibility with existing callers
+    return null;
+  }
+
   // Compute the deterministic selector for O(1) indexed lookup
   const selector = computeKeySelector(apiKey);
 

@@ -55,6 +55,135 @@
  *     default) would change that hash and break replay detection. This module
  *     publishes the parsed value on `res.locals` and leaves `req.body` alone.
  *
+ * ### Compatibility contract
+ *
+ * This module is a **public API boundary** — its behavior is observable by HTTP
+ * clients and programmatic callers. The following contracts MUST be preserved
+ * across versions to maintain backward compatibility:
+ *
+ * #### 1. Public constants (MUST NOT decrease without major version bump)
+ *
+ * These define the acceptance envelope and clients depend on them:
+ *
+ * - {@link MAX_ID_LENGTH}: Currently 128 chars
+ * - {@link MAX_IP_LENGTH}: Currently 45 chars  
+ * - {@link MAX_CORRELATION_ID_LENGTH}: Currently 128 chars
+ * - {@link MAX_METADATA_KEY_LENGTH}: Currently 64 chars
+ * - {@link MAX_METADATA_ENTRIES}: Currently 50 keys
+ * - {@link MAX_METADATA_ARRAY_ITEMS}: Currently 200 items
+ * - {@link MAX_METADATA_DEPTH}: Currently 5 levels
+ * - {@link MAX_METADATA_STRING_LENGTH}: Currently 4,096 chars
+ * - {@link MAX_METADATA_BYTES}: Currently 16,384 bytes (16 KiB)
+ * - {@link MAX_METADATA_NUMBER}: Currently Number.MAX_SAFE_INTEGER
+ * - {@link FORBIDDEN_METADATA_KEYS}: Currently ['__proto__', 'constructor', 'prototype']
+ *
+ * **Migration path if decreasing**: Deploy a read-time warning or rejection of
+ * oversized entries for one release cycle, then decrease the bound.
+ *
+ * **Safe changes**: Increasing limits is backward-compatible. Adding validation
+ * patterns is backward-compatible if all existing valid inputs remain valid.
+ *
+ * #### 2. Error codes (MUST NOT change meaning, append-only)
+ *
+ * Clients branch on {@link AUDIT_VALIDATION_CODES} values. Each code's semantic
+ * meaning is frozen once published:
+ *
+ * - `unknown_field`: A field not in the schema was supplied
+ * - `missing_field`: A required field was absent
+ * - `invalid_type`: Wrong JSON type
+ * - `invalid_enum`: Value not in accepted enumeration
+ * - `invalid_format`: Format validation failed (IP, correlation ID)
+ * - `too_small`: String/collection smaller than minimum
+ * - `too_big`: String/collection/number/payload exceeded maximum
+ * - `not_finite`: Number was NaN or ±Infinity
+ * - `blank`: String consisted only of whitespace
+ * - `control_characters`: String contained control characters
+ * - `metadata_too_deep`: Metadata nesting exceeded depth limit
+ * - `metadata_too_many_keys`: Metadata object exceeded key limit
+ * - `metadata_key_too_long`: Metadata key exceeded length limit
+ * - `metadata_forbidden_key`: Metadata key is in forbidden list
+ * - `metadata_too_large`: Serialized metadata exceeded byte limit
+ * - `metadata_not_serialisable`: Metadata contains non-JSON values
+ * - `invalid_value`: Fallback for unclassified constraint violations
+ *
+ * **Migration path if changing**: Introduce new codes with new names. Emit both
+ * old and new codes for one release cycle, then deprecate the old code.
+ *
+ * #### 3. Validation behavior (regression-test protected)
+ *
+ * These behaviors define what is accepted vs rejected:
+ *
+ * - **Required fields**: action, severity, actor, resource, resourceId
+ * - **Optional fields**: metadata (defaults to {}), ipAddress, correlationId
+ * - **Strict mode**: Unknown fields are rejected
+ * - **Metadata defaults to empty object**: Callers may omit it
+ * - **Control characters rejected**: In identifier fields (actor, resource, etc)
+ * - **Whitespace trimming**: NOT performed on identifiers (value is used as-is)
+ * - **IP validation**: Accepts both IPv4 and IPv6 addresses
+ * - **Correlation ID pattern**: [A-Za-z0-9._:-]+
+ * - **Circular reference detection**: Prevents infinite recursion in metadata
+ * - **Prototype pollution prevention**: __proto__, constructor, prototype rejected
+ *
+ * **Migration path if changing acceptance**: Add a `version` or `schemaVersion`
+ * field to the request, route to different validators, and document the
+ * transition period.
+ *
+ * #### 4. Response shape (MUST remain superset of current shape)
+ *
+ * The error response shape is:
+ *
+ * ```typescript
+ * {
+ *   error: {
+ *     code: "validation_error",          // Top-level code (stable)
+ *     message: string,                   // Human-readable (can change wording)
+ *     requestId: string,                 // Correlation
+ *     details: Array<{                   // Per-issue details
+ *       path: string[],                  // Segments to field
+ *       field: string,                   // Dotted path or "(root)"
+ *       code: string,                    // Stable code from AUDIT_VALIDATION_CODES
+ *       message: string                  // Human-readable (can change wording)
+ *     }>
+ *   }
+ * }
+ * ```
+ *
+ * **Safe changes**: Adding new fields to the envelope or detail objects. Changing
+ * message wording (since codes are the stable contract).
+ *
+ * **Breaking changes**: Removing fields, changing field types, changing code
+ * values or their meanings.
+ *
+ * #### 5. Public function contracts
+ *
+ * - {@link validateCreateAuditEntryInput}:
+ *   - Pure and total (never throws, never mutates)
+ *   - Returns discriminated union (ok: true | ok: false)
+ *   - MUST remain callable from non-HTTP contexts
+ *
+ * - {@link validateMetadata}:
+ *   - Returns array of issues (empty = valid)
+ *   - Exposed for programmatic callers
+ *   - MUST not throw on hostile input
+ *
+ * - {@link computeDepth}:
+ *   - Returns numeric depth (primitives = 0, flat object = 1)
+ *   - Handles circular references without throwing
+ *   - Public utility for external validators
+ *
+ * - {@link validateCreateAuditEntry}:
+ *   - Express middleware
+ *   - Places result in res.locals[VALIDATED_BODY_KEY]
+ *   - Does NOT mutate req.body (idempotency hash contract)
+ *   - Calls next() on success, responds 400 on failure
+ *
+ * - {@link readValidatedBody}:
+ *   - Throws if middleware didn't run (fail-fast for wiring bugs)
+ *   - Returns validated body from res.locals
+ *
+ * **Migration path if changing signatures**: Add new functions with new names,
+ * deprecate old ones, maintain both for one release cycle.
+ *
  * @remarks
  * {@link validateCreateAuditEntryInput} is a pure, total function — it never
  * throws, for any input. Non-HTTP producers that write to the audit log should

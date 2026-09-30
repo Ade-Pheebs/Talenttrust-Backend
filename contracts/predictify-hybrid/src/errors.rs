@@ -5,6 +5,16 @@ use soroban_sdk::contracterror;
 /// All variants map to a stable `u32` discriminant that clients can
 /// pattern-match on after invoking the contract.  **Do not renumber
 /// existing variants** — that would break on-chain consumers.
+///
+/// ## Compatibility contract
+///
+/// The discriminants below are part of the public ABI:
+///
+/// * `IdempotentBatchAlreadyApplied` is always `1`.
+/// * `EmptyBatch` is always `2`.
+///
+/// New variants must be appended with fresh, never-reused numbers.
+/// Removing or reordering existing variants is a breaking change.
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum Error {
@@ -15,5 +25,6 @@ pub enum Error {
     IdempotentBatchAlreadyApplied = 1,
 
     /// The `bets` vector was empty.  At least one bet is required.
+    /// The idempotency key is not consumed in this case.
     EmptyBatch = 2,
 }

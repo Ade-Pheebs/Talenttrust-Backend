@@ -175,39 +175,44 @@ export class AuditExportService {
     const exportDir = await fsp.mkdtemp(path.join(this.exportRoot, 'audit-export-'));
     this.assertPathWithinRoot(exportDir);
 
-    const fileName = `audit-log-${new Date().toISOString().replace(/[:.]/g, '-')}.ndjson`;
-    const filePath = path.join(exportDir, fileName);
-    this.assertPathWithinRoot(filePath);
-
-    const writer = createWriteStream(filePath, { encoding: 'utf8', flags: 'wx' });
-    let recordCount = 0;
-
-    const query: AuditQuery = { ...filters };
-    const cursor = this.service.stream(query);
-
-    async function* generateLines(): AsyncGenerator<string> {
-      for (const entry of cursor) {
-        const redacted = redactBody(entry as unknown as Record<string, unknown>) as AuditEntry;
-        recordCount += 1;
-        yield `${JSON.stringify(redacted)}\n`;
-      }
-    }
-
-    const source = Readable.from(generateLines());
-    await pipeline(source, writer);
-
     const cleanup = async (): Promise<void> => {
-      await fsp.rm(exportDir, { recursive: true, force: true });
+      await fsp.rm(exportDir, { recursive: true, force: true }).catch(() => {});
     };
 
-    return {
-      filePath,
-      fileName,
-      bytesWritten: writer.bytesWritten,
-      recordCount,
-      openReadStream: () => createReadStream(filePath),
-      cleanup,
-    };
+    try {
+      const fileName = `audit-log-${new Date().toISOString().replace(/[:.]/g, '-')}.ndjson`;
+      const filePath = path.join(exportDir, fileName);
+      this.assertPathWithinRoot(filePath);
+
+      const writer = createWriteStream(filePath, { encoding: 'utf8', flags: 'wx' });
+      let recordCount = 0;
+
+      const query: AuditQuery = { ...filters };
+      const cursor = this.service.stream(query);
+
+      async function* generateLines(): AsyncGenerator<string> {
+        for (const entry of cursor) {
+          const redacted = redactBody(entry as unknown as Record<string, unknown>) as AuditEntry;
+          recordCount += 1;
+          yield `${JSON.stringify(redacted)}\n`;
+        }
+      }
+
+      const source = Readable.from(generateLines());
+      await pipeline(source, writer);
+
+      return {
+        filePath,
+        fileName,
+        bytesWritten: writer.bytesWritten,
+        recordCount,
+        openReadStream: () => createReadStream(filePath),
+        cleanup,
+      };
+    } catch (error) {
+      await cleanup();
+      throw error;
+    }
   }
 
   // ─── CSV export ────────────────────────────────────────────────────────────
@@ -239,42 +244,47 @@ export class AuditExportService {
     const exportDir = await fsp.mkdtemp(path.join(this.exportRoot, 'audit-export-'));
     this.assertPathWithinRoot(exportDir);
 
-    const fileName = `audit-log-${new Date().toISOString().replace(/[:.]/g, '-')}.csv`;
-    const filePath = path.join(exportDir, fileName);
-    this.assertPathWithinRoot(filePath);
-
-    const writer = createWriteStream(filePath, { encoding: 'utf8', flags: 'wx' });
-    let recordCount = 0;
-
-    const query: AuditQuery = { ...filters };
-    const cursor = this.service.stream(query);
-
-    async function* generateLines(): AsyncGenerator<string> {
-      // Write the header row first.
-      yield `${CSV_HEADERS.join(',')}\n`;
-
-      for (const entry of cursor) {
-        const redacted = redactBody(entry as unknown as Record<string, unknown>) as AuditEntry;
-        recordCount += 1;
-        yield `${toCsvRow(redacted)}\n`;
-      }
-    }
-
-    const source = Readable.from(generateLines());
-    await pipeline(source, writer);
-
     const cleanup = async (): Promise<void> => {
-      await fsp.rm(exportDir, { recursive: true, force: true });
+      await fsp.rm(exportDir, { recursive: true, force: true }).catch(() => {});
     };
 
-    return {
-      filePath,
-      fileName,
-      bytesWritten: writer.bytesWritten,
-      recordCount,
-      openReadStream: () => createReadStream(filePath),
-      cleanup,
-    };
+    try {
+      const fileName = `audit-log-${new Date().toISOString().replace(/[:.]/g, '-')}.csv`;
+      const filePath = path.join(exportDir, fileName);
+      this.assertPathWithinRoot(filePath);
+
+      const writer = createWriteStream(filePath, { encoding: 'utf8', flags: 'wx' });
+      let recordCount = 0;
+
+      const query: AuditQuery = { ...filters };
+      const cursor = this.service.stream(query);
+
+      async function* generateLines(): AsyncGenerator<string> {
+        // Write the header row first.
+        yield `${CSV_HEADERS.join(',')}\n`;
+
+        for (const entry of cursor) {
+          const redacted = redactBody(entry as unknown as Record<string, unknown>) as AuditEntry;
+          recordCount += 1;
+          yield `${toCsvRow(redacted)}\n`;
+        }
+      }
+
+      const source = Readable.from(generateLines());
+      await pipeline(source, writer);
+
+      return {
+        filePath,
+        fileName,
+        bytesWritten: writer.bytesWritten,
+        recordCount,
+        openReadStream: () => createReadStream(filePath),
+        cleanup,
+      };
+    } catch (error) {
+      await cleanup();
+      throw error;
+    }
   }
 
   // ─── Streaming convenience helpers ─────────────────────────────────────────

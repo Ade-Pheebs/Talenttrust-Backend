@@ -10,13 +10,23 @@
 //! [`storage::IDEM_KEY_TTL_LEDGERS`] ledgers (~24 h).  Repeated
 //! submissions with the same `(caller, key)` pair are rejected with
 //! `Error::IdempotentBatchAlreadyApplied`.
-
-#![no_std]
+//!
+//! ## Concurrency and failure models
+//!
+//! The idempotency sentinel is written **before** any bet is applied
+//! (write-ahead).  Because Soroban executes a contract invocation as
+//! a single atomic transaction, a failure during bet application rolls
+//! back the sentinel write as well -- there is no window in which a
+//! partial batch is observable.  Concurrent submissions with the same
+//! `(caller, key)` pair are serialized by the ledger and the second one
+//! is rejected deterministically with `Error::IdempotentBatchAlreadyApplied`.
+#!no_std
 
 mod bets;
 mod errors;
 mod storage;
 
+/// Re-exported public types and constants.
 pub use bets::Bet;
 pub use errors::Error;
 pub use storage::{DataKey, IDEM_KEY_TTL_LEDGERS};

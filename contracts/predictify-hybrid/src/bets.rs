@@ -2,7 +2,7 @@ use soroban_sdk::{Address, BytesN, Env, Vec};
 
 use crate::{
     errors::Error,
-    storage::{DataKey, IDEM_KEY_TTL_LEDGERS},
+    storage::{DataKey, IDEM_KEY_TTL_LEDGERS, PENDING_IDEM_KEY_TTL_LEDGERS},
 };
 
 /// A single bet submitted inside a batch.
@@ -35,6 +35,8 @@ pub struct Bet {
 /// * [`Error::EmptyBatch`]                   – `bets` is empty.
 /// * [`Error::IdempotentBatchAlreadyApplied`] – the `(caller, idempotency_key)`
 ///                                              pair has already been consumed.
+/// * [`Error::BatchInProgress`]              – a concurrent invocation with the
+///                                              same key is currently applying.
 ///
 /// # Idempotency semantics
 ///
@@ -44,6 +46,15 @@ pub struct Bet {
 /// the batch.  Once written, the key expires after [`IDEM_KEY_TTL_LEDGERS`]
 /// ledgers; after expiry a new submission with the same token is accepted as
 /// a fresh batch.
+///
+/// A two-phase marker is used to make concurrent execution deterministic:
+/// the key is first written as *pending* (with a short TTL) and only promoted
+/// to *applied* after the batch has been fully processed.  A second call that
+/// observes a pending marker returns [`Error::BatchInProgress`] rather than
+/// racing the first caller, and a call that observes an applied marker returns
+/// [`Error::IdempotentBatchAlreadyApplied`].  If the first caller traps before
+/// promoting the marker, the pending entry expires after
+/// [`PENDING_IDEM_KEY_TTL_LEDGERS`] ledgers and the key becomes reusable.
 ///
 /// # Deprecation note — zero-key backward path
 ///
@@ -71,18 +82,43 @@ pub fn place_bets(
     // A zero key opts out of deduplication (deprecated backward compat).
     let zero_key: BytesN<32> = BytesN::from_array(env, &[0u8; 32]);
     if idempotency_key != zero_key {
-        let idem_key = DataKey::PlaceBetsIdem(caller.clone(), idempotency_key.clone());
+        let pending_key =
+            DataKey::PlaceBetsIdemPending(caller.clone(), idempotency_key.clone());
+        let applied_key =
+            DataKey::PlaceBetsIdem(caller.clone(), idempotency_key.clone());
 
-        if env.storage().instance().has(&idem_key) {
+        // Fast path: a previously completed batch with this key.
+        if env.storage().instance().has(&applied_key) {
             return Err(Error::IdempotentBatchAlreadyApplied);
         }
 
-        // Mark the key as consumed before applying the batch so that
-        // concurrent invocations on the same ledger also fail fast.
-        env.storage().instance().set(&idem_key, &true);
+        // Concurrent path: another invocation is mid-flight for this key.
+        // Fail fast instead of racing the first caller's state mutations.
+        if env.storage().instance().has(&pending_key) {
+            return Err(Error::BatchInProgress);
+        }
+
+        // Claim the key by writing a pending marker *before* applying the
+        // batch.  The short TTL bounds the window in which a trapped caller
+        // can leave the key unusable.
+        env.storage().instance().set(&pending_key, &true);
+        env.storage()
+            .instance()
+            .extend_ttl(PENDING_IDEM_KEY_TTL_LEDGERS, PENDING_IDEM_KEY_TTL_LEDGERS);
+
+        // Apply the batch.  Any error returned here leaves the pending
+        // marker in place; it will expire naturally, allowing a retry.
+        apply_batch(env, &caller, &bets)?;
+
+        // Promote the pending marker to an applied marker so subsequent
+        // calls with the same key are rejected as duplicates.
+        env.storage().instance().remove(&pending_key);
+        env.storage().instance().set(&applied_key, &true);
         env.storage()
             .instance()
             .extend_ttl(IDEM_KEY_TTL_LEDGERS, IDEM_KEY_TTL_LEDGERS);
+
+        return Ok(());
     }
 
     // ------------------------------------------------------------------
@@ -91,9 +127,23 @@ pub fn place_bets(
     // TODO: replace with real market-state mutations once the market
     //       storage module is added.  For now we emit a diagnostic event
     //       so the batch is observable on-chain.
-    env.events()
-        .publish((Symbol::new(env, "place_bets"), caller), bets.len());
+    apply_batch(env, &caller, &bets)
+}
 
+/// Apply the batch of bets to market state.
+///
+/// Kept separate from [`place_bets`] so the idempotency bookkeeping and the
+/// state mutation can be reasoned about independently.  The caller is
+/// responsible for having authenticated `caller` and for having claimed the
+/// idempotency key before invoking this function.
+fn apply_batch(env: &Env, caller: &Address, bets: &Vec<Bet>) -> Result<(), Error> {
+    // TODO: replace with real market-state mutations once the market
+    //       storage module is added.  For now we emit a diagnostic event
+    //       so the batch is observable on-chain.
+    env.events().publish(
+        (Symbol::new(env, "place_bets"), caller.clone()),
+        bets.len(),
+    );
     Ok(())
 }
 

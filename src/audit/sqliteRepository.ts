@@ -1,6 +1,6 @@
 import { randomUUID } from 'crypto';
 import Database from "../db/betterSqlite3";
-import { computeEntryHash, GENESIS_HASH } from './store';
+import { computeEntryHash, GENESIS_HASH, CURSOR_FILTER_MISMATCH_MESSAGE } from './store';
 import type { AuditEntry, AuditQuery, CreateAuditEntryInput, IntegrityReport, AuditQueryResult, CursorData } from './types';
 import { encodeCursor, decodeCursor } from './types';
 import type { AuditLogRepository } from './repository';
@@ -145,11 +145,11 @@ export class SqliteAuditRepository implements AuditLogRepository {
             cursorData.filters.resourceId !== query.resourceId ||
             cursorData.filters.from !== query.from ||
             cursorData.filters.to !== query.to) {
-          throw new Error('Cursor filters do not match query filters');
+          throw new Error(CURSOR_FILTER_MISMATCH_MESSAGE);
         }
       } catch (error) {
         // Re-throw filter mismatch errors, but handle invalid cursor format gracefully
-        if (error instanceof Error && error.message === 'Cursor filters do not match query filters') {
+        if (error instanceof Error && error.message === CURSOR_FILTER_MISMATCH_MESSAGE) {
           throw error;
         }
         // If cursor is invalid (format error), start from beginning

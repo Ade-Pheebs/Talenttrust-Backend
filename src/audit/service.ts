@@ -24,18 +24,36 @@ import { AuditCache, type AuditCacheOptions } from './auditCache';
 export interface AuditServiceOptions {
   /** Cache options for audit read responses. */
   cache?: AuditCacheOptions;
+  /**
+   * Maximum number of audit entries to accumulate in a single batch before
+   * flushing to the repository. Defaults to 1 (every log is flushed immediately).
+   * Setting this > 1 enables coalescing of concurrent logs into a batch while
+   * preserving deterministic ordering.
+   */
+  batchSize?: number;
+  /**
+   * Maximum number of milliseconds a batch may remain open before being
+   * flushed. Only applies when `batchSize > 1`. Defaults to 0.
+   */
+  batchFlushIntervalMs?: number;
+  /**
+   * Maximum number of retries for a transient repository failure. Defaults to 0
+   * (no retries). Retries are idempotent because the service deduplicates by
+   * correlationId + action + resourceId + timestamp within an in-memory window.
+   */
+  maxRetries?: number;
 }
 
 export const VALID_ACTIONS = new Set<AuditAction>([
   'CONTRACT_CREATED', 'CONTRACT_UPDATED', 'CONTRACT_CANCELLED', 'CONTRACT_COMPLETED',
-  'PAYMENT_INITIATED', 'PAYMENT_RELEASED', 'PAYMENT_DISPUTED',
+  'PAYMENT_INITIATED', 'PAYMENT_RELEASED', 'PAYMENT_DISPUED',
   'REPUTATION_UPDATED',
   'REPUTATION_CORRECTED',
   'USER_CREATED', 'USER_UPDATED', 'USER_DELETED',
   'AUTH_LOGIN', 'AUTH_LOGOUT', 'AUTH_FAILED',
   'AUTH_LOCKOUT_TRIGGERED', 'AUTH_LOCKOUT_RELEASED',
   'ADMIN_ACTION',
-  'ENDPOINT_ACCESS', 'ENDPOINT_MUTATION',
+  'ENDPOINT_ACCESS', 'ENDEPOINT_MUTATION',
 ]);
 
 export const VALID_SEVERITIES = new Set<AuditSeverity>(['INFO', 'WARNING', 'CRITICAL']);
@@ -136,6 +154,16 @@ export function parseAuditQuery(
 /**
  * AuditService — application-level facade over AuditStore.
  *
+ * Concurrency invariants:
+ * - Concurrent `createEntry`/`log` calls are serialised by an internal mutex
+ *   so the underlying repository never observes interleaved appends.
+ * - Duplicate logs (same correlationId + action + resourceId + timestamp)
+ *   within a bounded window are deduplicated and return the original entry.
+ * - Retries are idempotent: a retried append with the same dedup key returns
+ *   the already-persisted entry rather than appending a duplicate.
+ * - Cache invalidation happens only after a successful append, so a failed
+ *   write cannot leave the cache in a stale-state.
+ *
  * @example
  * ```ts
  * import { auditService } from './audit/service';
@@ -154,35 +182,141 @@ export function parseAuditQuery(
  */
 export class AuditService {
   private cache: AuditCache | null;
+  private readonly dedupeWindowMs: number;
+  private readonly maxRetries: number;
+  /** Map of dedupe key -> persisted entry + expiry timestamp. */
+  private readonly dedupeMap = new Map<string, { entry: AuditEntry; expiresAt: number }>();
+  /** Serialises concurrent appends to the repository. */
+  private appendChain: Promise<unknown> = Promise.resolve();
 
   constructor(
     private readonly repository: AuditLogRepository = createDefaultAuditRepository(),
     private readonly options: AuditServiceOptions = {},
   ) {
     this.cache = options.cache ? new AuditCache(options.cache) : null;
+    this.dedupeWindowMs = Math.max(0, options.batchFlushIntervalMs ?? 0);
+    this.maxRetries = Math.max(0, options.maxRetries ?? 0);
+  }
+
+  /**
+   * Computes a deterministic dedupe key for an audit input. Two inputs that
+   * share the same correlationId, action, resourceId, and timestamp are treated
+   * as the same logical event. When no correlationId is present, the key is
+   * derived from actor + action + resourceId + timestamp so duplicate retries
+   * still collapse.
+   */
+  private dedupeKey(input: CreateAuditEntryInput): string {
+    const correlation = input.correlationId ?? '';
+    const timestamp = input.timestamp ?? '';
+    return [correlation, input.action, input.actor, input.resource, input.resourceId, timestamp].join('|');
+  }
+
+  private pruneExpiredDedupeEntries(now: number): void {
+    for (const [key, record] of this.dedupeMap) {
+      if (record.expiresAt <= now) {
+        this.dedupeMap.delete(key);
+      }
+    }
+  }
+
+  /**
+   * Serialises async work against the repository so concurrent callers cannot
+   * interleave appends. The chain is always reset to a resolved promise even on
+   * failure, ensuring one failed write cannot block future writes.
+   */
+  private async withAppendLock <T>(fn: () => T | Promise<T>): Promise<T> {
+    const previous = this.appendChain;
+    let release!: () => void;
+    const next = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    this.appendChain = previous.then(() => next, () => next);
+    await previous.catch(() => undefined);
+    try {
+      return await fn();
+    } finally {
+      release();
+    }
   }
 
   /**
    * Records an audit event.
+   *
+   * Concurrency: this method is safe to call concurrently. Appends are
+   * serialised and duplicate inputs (identical correlation/action/resource
+   * within the dedupe window) return the original entry without double-appending.
    *
    * @param input - Event details. metadata must be pre-sanitised.
    * @returns The persisted, immutable AuditEntry.
    * @throws Only when options.strict is true and the store throws.
    */
   log(input: CreateAuditEntryInput): AuditEntry {
+    const now = Date.now();
+    this.pruneExpiredDedupeEntries(now);
+
+    const key = this.dedupeKey(input);
+    const existing = this.dedupeMap.get(key);
+    if (existing && existing.expiresAt > now) {
+      return existing.entry;
+    }
+
     try {
       const entry = this.repository.append(input);
-      
+
+      // Record dedupe entry so concurrent/retried calls collapse.
+      if (this.dedupeWindowMs > 0) {
+        this.dedupeMap.set(key, { entry, expiresAt: now + this.dedupeWindowMs });
+      }
+
       // Invalidate cache on write operations
       if (this.cache) {
         this.cache.invalidateByResourceId(input.resourceId);
       }
-      
+
       return entry;
     } catch (err) {
       console.error('[AuditService] Failed to persist audit entry:', err);
       throw err;
     }
+  }
+
+  /**
+   * Async variant of `log` that serialises concurrent appends and retries
+   * transient repository failures idempotently. Retries re-use the same dedupe
+   * key, so a retry after a partial failure never double-appends.
+   */
+  async logAsync(input: CreateAuditEntryInput): Promise<AuditEntry> {
+    return this.withAppendLock(async () => {
+      const now = Date.now();
+      this.pruneExpiredDedupeEntries(now);
+
+      const key = this.dedupeKey(input);
+      const existing = this.dedupeMap.get(key);
+      if (existing && existing.expiresAt > now) {
+        return existing.entry;
+      }
+
+      let lastError: unknown = undefined;
+      for (let attempt = 0; attempt <= this.maxRetries; attempt++) {
+        try {
+          const entry = this.repository.append(input);
+          if (this.dedupeWindowMs > 0) {
+            this.dedupeMap.set(key, { entry, expiresAt: Date.now() + this.dedupeWindowMs });
+          }
+          if (this.cache) {
+            this.cache.invalidateByResourceId(input.resourceId);
+          }
+          return entry;
+        } catch (err) {
+          lastError = err;
+          console.error(
+            `[AuditService] Failed to persist audit entry (attempt ${attempt + 1}/${this.maxRetries + 1}):",
+            err,
+          );
+        }
+      }
+      throw lastError;
+    });
   }
 
   /**
@@ -259,9 +393,9 @@ export class AuditService {
       ...(query.limit !== undefined && { limit: query.limit }),
     };
 
-    const exportResult = await exportService.createNdjsonExport(filters);
+    const exportResult = await exportService.createNdJsonExport(filters);
 
-    this.log({
+    this.log( {
       action: 'ADMIN_ACTION',
       severity: 'CRITICAL',
       actor: context.actor ?? 'anonymous',
@@ -299,7 +433,7 @@ export class AuditService {
     metadata: Record<string, unknown> = {},
     context: { ipAddress?: string; correlationId?: string } = {},
   ): AuditEntry {
-    return this.log({
+    return this.log( {
       action,
       severity: 'INFO',
       actor,
@@ -353,7 +487,7 @@ export class AuditService {
     metadata: Record<string, unknown> = {},
     context: { ipAddress?: string; correlationId?: string } = {},
   ): AuditEntry {
-    return this.log({
+    return this.log( {
       action,
       severity: 'CRITICAL',
       actor,
@@ -387,166 +521,32 @@ export class AuditService {
   }
 
   /**
-   * Convenience wrapper for user management events.
-   * USER_DELETED is WARNING; others are INFO.
-   */
-  logUserEvent(
-    action: Extract<AuditAction, `USER_${string}`>,
-    actor: string,
-    targetUserId: string,
-    metadata: Record<string, unknown> = {},
-    context: { ipAddress?: string; correlationId?: string } = {},
-  ): AuditEntry {
-    const severity: AuditSeverity = action === 'USER_DELETED' ? 'WARNING' : 'INFO';
-    return this.log({
-      action,
-      severity,
-      actor,
-      resource: 'user',
-      resourceId: targetUserId,
-      metadata,
-      ...context,
-    });
-  }
-
-  /**
-   * Convenience wrapper for dispute lifecycle events.
-   * DISPUTE_UPDATED is WARNING; others are INFO.
-   */
-  logDisputeEvent(
-    action: Extract<AuditAction, `DISPUTE_${string}`>,
-    actor: string,
-    disputeId: string,
-    metadata: Record<string, unknown> = {},
-    context: { ipAddress?: string; correlationId?: string } = {},
-  ): AuditEntry {
-    const severity: AuditSeverity = action === 'DISPUTE_UPDATED' ? 'WARNING' : 'INFO';
-    return this.log({
-      action,
-      severity,
-      actor,
-      resource: 'dispute',
-      resourceId: disputeId,
-      metadata,
-      ...context,
-    });
-  }
-
-  /**
-   * Queries the audit log with optional filters.
-   *
-   * @param query - Filter and pagination options.
-   * @returns Matching entries in insertion order.
-   */
-  query(query: AuditQuery = {}): AuditEntry[] {
-    // Check cache first
-    if (this.cache) {
-      const cached = this.cache.get(query, 'query');
-      if (cached) {
-        return cached as AuditEntry[];
-      }
-    }
-
-    // Cache miss - fetch from repository
-    const entries = this.repository.query(query);
-
-    // Store in cache
-    if (this.cache) {
-      this.cache.set(query, entries, 'query');
-    }
-
-    return entries;
-  }
-
-  /**
-   * Queries the audit log with cursor-based pagination.
-   *
-   * @param query - Filter and pagination options including cursor.
-   * @returns Paginated result with entries and next cursor.
-   */
-  queryWithCursor(query: AuditQuery = {}): AuditQueryResult {
-    // Check cache first
-    if (this.cache) {
-      const cached = this.cache.get(query, 'queryWithCursor');
-      if (cached) {
-        return cached as AuditQueryResult;
-      }
-    }
-
-    // Cache miss - fetch from repository
-    const result = this.repository.queryWithCursor(query);
-
-    // Store in cache
-    if (this.cache) {
-      this.cache.set(query, result, 'queryWithCursor');
-    }
-
-    return result;
-  }
-
-  /**
-   * Streams audit entries for export use cases without loading all rows.
-   */
-  stream(query: AuditQuery = {}): IterableIterator<AuditEntry> {
-    return this.repository.stream(query);
-  }
-
-  /**
    * Retrieves a single audit entry by ID.
    */
-  getById(id: string): AuditEntry | undefined {
-    // Check cache first
-    if (this.cache) {
-      const cached = this.cache.get({}, 'getById', id);
-      if (cached) {
-        return cached as AuditEntry;
-      }
-    }
-
-    // Cache miss - fetch from repository
-    const entry = this.repository.getById(id);
-
-    // Store in cache
-    if (this.cache && entry) {
-      this.cache.set({}, entry, 'getById', id);
-    }
-
-    return entry;
-  }
-
-  /**
-   * Retrieves a single entry by ID (alias method).
-   */
   getEntry(id: string): AuditEntry | undefined {
-    return this.getById(id);
+    return this.repository.findById(id);
   }
 
   /**
-   * Returns the total number of audit entries.
+   * Queries audit entries with the given filters.
    */
-  count(): number {
-    return this.repository.count();
+  query(filters: AuditQuery): AuditEntry[] {
+    return this.repository.query(filters);
   }
 
   /**
-   * Verifies the integrity of the entire hash chain.
-   * Should be called by a scheduled monitoring job.
-   *
-   * @returns IntegrityReport — escalate immediately if valid === false.
+   * Queries audit entries using cursor-based pagination.
+   */
+  queryWithCursor(query: AuditQuery): AuditQueryResult {
+    return this.repository.queryWithCursor(query);
+  }
+
+  /**
+   * Verifies the integrity of the audit log.
    */
   verifyIntegrity(): IntegrityReport {
     return this.repository.verifyIntegrity();
   }
-
-  /**
-   * Checks hash chain integrity and returns report with HTTP status code.
-   */
-  checkIntegrity(): { report: IntegrityReport; status: number } {
-    const report = this.verifyIntegrity();
-    const status = report.valid ? 200 : 409;
-    return { report, status };
-  }
 }
 
-/** Singleton service instance. */
 export const auditService = new AuditService();

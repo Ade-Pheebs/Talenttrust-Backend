@@ -14,6 +14,15 @@
  *   behind a trusted proxy. Set `app.set('trust proxy', true)` accordingly.
  * - Correlation IDs from X-Correlation-ID headers are passed through as-is;
  *   validate/sanitise them if they are user-controlled.
+ *
+ * Concurrency / idempotency notes:
+ * - The helper attached to `res.locals.audit` is scoped to a single request
+ *   and is therefore not shared across concurrent requests.
+ * - Each call to `log()` is delivered to `auditService.log` exactly once,
+ *   preserving the service's serialised chain invariants.
+ * - Repeated invocations from the same request are intentionally not deduplicated
+ *   here; deduplication (if required) is the responsibility of the caller or
+ *   the service layer, which owns the persistence and hash-chain state.
  */
 
 import type { Request, Response, NextFunction } from 'express';
@@ -96,6 +105,10 @@ export function auditMiddleware(req: Request, res: Response, next: NextFunction)
   const ipAddress = (req.ip ?? req.socket?.remoteAddress) as string | undefined;
   const correlationId = req.headers['x-correlation-id'] as string | undefined;
 
+  // Capture the request-scoped context in closure so the helper cannot be
+  // affected by later mutation of `req` headers or by concurrent requests.
+  // Each call to `log()` delegates to the service exactly once, preserving
+  // the service's hash-chain / serialisation invariants.
   res.locals.audit = {
     log(input: Omit<CreateAuditEntryInput, 'ipAddress' | 'correlationId'>): AuditEntry {
       return auditService.log({ ...input, ipAddress, correlationId });

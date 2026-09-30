@@ -16,4 +16,13 @@ pub enum Error {
 
     /// The `bets` vector was empty.  At least one bet is required.
     EmptyBatch = 2,
+
+    /// A bet amount was zero or negative.
+    InvalidBetAmount = 3,
+
+    /// A market ID was invalid (e.g. 0).
+    InvalidMarketId = 4,
+
+    /// The `bets` vector exceeded the maximum allowed batch size.
+    BatchTooLarge = 5,
 }

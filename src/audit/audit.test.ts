@@ -859,6 +859,19 @@ describe('redactBody', () => {
     redactBody(body);
     expect(body.password).toBe('original');
   });
+
+  it('handles repeated and cyclic references without throwing', () => {
+    const secret = { password: 'hunter2' };
+    const body: Record<string, unknown> = { primary: secret, duplicate: secret };
+    (body as Record<string, unknown>).self = body;
+
+    expect(() => redactBody(body)).not.toThrow();
+
+    const result = redactBody(body) as Record<string, unknown>;
+    expect(result.primary).toEqual({ password: REDACTED });
+    expect(result.duplicate).toEqual({ password: REDACTED });
+    expect(result.self).toEqual(result);
+  });
 });
 
 describe('buildAuditMetadata', () => {
@@ -927,6 +940,15 @@ describe('buildAuditMetadata', () => {
     const query = result['query'] as Record<string, unknown>;
     expect(query['status']).toBe('active');
     expect(query['token']).toBe(REDACTED);
+  });
+
+  it('handles undefined headers and query without throwing', () => {
+    expect(() => buildAuditMetadata('POST', '/api/v1/users', undefined, { password: 'x' }, undefined, 200, undefined)).not.toThrow();
+
+    const result = buildAuditMetadata('POST', '/api/v1/users', undefined, { password: 'x' }, undefined, 200, undefined);
+    expect(result.headers).toEqual({});
+    expect(result.body).toEqual({ password: REDACTED });
+    expect(result.query).toBeNull();
   });
 });
 

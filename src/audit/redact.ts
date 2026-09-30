@@ -67,6 +67,10 @@ const SENSITIVE_KEY_FRAGMENTS = [
   'apikey',
   'api_key',
   'private',
+  'authorization',
+  'cookie',
+  'session',
+  'stack',
 ];
 
 /** Matches a simple `local@domain` email pattern. */
@@ -124,9 +128,14 @@ export function maskEmail(value: string): string {
  * @returns A flat object safe for audit storage.
  */
 export function redactHeaders(
-  headers: Record<string, string | string[] | undefined>,
+  headers: Record<string, string | string[] | undefined> | undefined | null,
 ): Record<string, unknown> {
   const result: Record<string, unknown> = {};
+
+  if (!headers || typeof headers !== 'object') {
+    return result;
+  }
+
   for (const [name, value] of Object.entries(headers)) {
     result[name] = isSensitiveHeader(name) ? REDACTED : value;
   }
@@ -145,26 +154,86 @@ export function redactHeaders(
  * @param value - The value to sanitise (may be any JSON-serialisable type).
  * @returns A deep copy with sensitive data replaced.
  */
-export function redactBody(value: unknown): unknown {
+export function redactBody(value: unknown, seen = new WeakMap<object, unknown>()): unknown {
   if (value === null || value === undefined) return value;
-
-  if (Array.isArray(value)) {
-    return value.map(redactBody);
-  }
-
-  if (typeof value === 'object') {
-    const result: Record<string, unknown> = {};
-    for (const [key, val] of Object.entries(value as Record<string, unknown>)) {
-      result[key] = isSensitiveKey(key) ? REDACTED : redactBody(val);
-    }
-    return result;
-  }
 
   if (typeof value === 'string') {
     return maskEmail(value);
   }
 
-  // Numbers, booleans — safe to log verbatim.
+  if (value instanceof Date) {
+    return new Date(value.getTime());
+  }
+
+  if (value instanceof Set) {
+    if (seen.has(value)) {
+      return seen.get(value);
+    }
+
+    const result: unknown[] = [];
+    seen.set(value, result);
+    for (const item of value) {
+      result.push(redactBody(item, seen));
+    }
+    return result;
+  }
+
+  if (value instanceof Map) {
+    if (seen.has(value)) {
+      return seen.get(value);
+    }
+
+    const result: Record<string, unknown> = {};
+    seen.set(value, result);
+    for (const [key, item] of value.entries()) {
+      result[String(key)] = redactBody(item, seen);
+    }
+    return result;
+  }
+
+  if (Array.isArray(value)) {
+    if (seen.has(value)) {
+      return seen.get(value);
+    }
+
+    const result: unknown[] = [];
+    seen.set(value, result);
+    for (const item of value) {
+      result.push(redactBody(item, seen));
+    }
+    return result;
+  }
+
+  if (typeof value === 'object') {
+    if (seen.has(value)) {
+      return seen.get(value);
+    }
+
+    const result: Record<string, unknown> = {};
+    seen.set(value, result);
+
+    if (value instanceof Error) {
+      result.name = value.name;
+      result.message = REDACTED;
+      if (typeof value.stack === 'string' && value.stack.length > 0) {
+        result.stack = REDACTED;
+      }
+      for (const [key, val] of Object.entries(value as Record<string, unknown>)) {
+        if (key !== 'name' && key !== 'message' && key !== 'stack') {
+          result[key] = redactBody(val, seen);
+        }
+      }
+      return result;
+    }
+
+    for (const [key, val] of Object.entries(value as Record<string, unknown>)) {
+      result[key] = isSensitiveKey(key) ? REDACTED : redactBody(val, seen);
+    }
+    return result;
+  }
+
+  // Numbers, booleans, symbols, bigint, and functions — safe to log verbatim
+  // when they are present in ad hoc payloads, but they are not traversed.
   return value;
 }
 
@@ -184,12 +253,14 @@ export function redactBody(value: unknown): unknown {
 export function buildAuditMetadata(
   method: string,
   path: string,
-  headers: Record<string, string | string[] | undefined>,
+  headers: Record<string, string | string[] | undefined> | undefined | null,
   body: unknown,
-  query: Record<string, unknown>,
+  query: Record<string, unknown> | undefined | null,
   statusCode: number,
   requestId: string | undefined,
 ): Record<string, unknown> {
+  const safeQuery = query && typeof query === 'object' ? query : {};
+
   return {
     method,
     path,
@@ -197,6 +268,6 @@ export function buildAuditMetadata(
     requestId: requestId ?? null,
     headers: redactHeaders(headers),
     body: body !== undefined && body !== null ? redactBody(body) : null,
-    query: Object.keys(query).length > 0 ? redactBody(query) : null,
+    query: Object.keys(safeQuery).length > 0 ? redactBody(safeQuery) : null,
   };
 }

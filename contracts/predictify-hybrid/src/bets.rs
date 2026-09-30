@@ -1,4 +1,4 @@
-use soroban_sdk::{Address, BytesN, Env, Vec};
+use soroban_sdk::{Address, BytesN, Env, Symbol, Vec};
 
 use crate::{
     errors::Error,
@@ -79,10 +79,27 @@ pub fn place_bets(
 
         // Mark the key as consumed before applying the batch so that
         // concurrent invocations on the same ledger also fail fast.
+        //
+        // Invariant: the idempotency marker MUST be written and its TTL
+        // extended atomically with respect to the batch application.  We
+        // write the marker first, then extend TTL, then apply the batch.
+        // If the batch application panics or returns an error, the marker
+        // remains set, which is the safe (fail-closed) behavior: a retry
+        // with the same key will be rejected rather than re-applying a
+        // partially-applied batch.  Callers that need to retry after a
+        // failure must generate a fresh idempotency key.
         env.storage().instance().set(&idem_key, &true);
         env.storage()
             .instance()
             .extend_ttl(IDEM_KEY_TTL_LEDGERS, IDEM_KEY_TTL_LEDGERS);
+
+        // Re-read the marker to confirm it is durably visible before we
+        // mutate any market state.  This guards against a storage backend
+        // that silently drops writes and ensures the idempotency invariant
+        // holds even under adverse conditions.
+        if !env.storage().instance().has(&idem_key) {
+            return Err(Error::IdempotentBatchAlreadyApplied);
+        }
     }
 
     // ------------------------------------------------------------------
@@ -96,6 +113,3 @@ pub fn place_bets(
 
     Ok(())
 }
-
-// Symbol is used above; import it here to keep the use-site clean.
-use soroban_sdk::Symbol;

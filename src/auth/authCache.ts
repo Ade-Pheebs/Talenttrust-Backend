@@ -36,12 +36,20 @@ export class AuthCache {
   private cache: Map<string, CacheEntry>;
   private readonly ttlMs: number;
   private readonly maxEntries: number;
+  private generation = 0;
   private hits: Counter<string>;
   private misses: Counter<string>;
   private hitCount: number;
   private missCount: number;
 
   constructor(options: AuthCacheOptions, register?: any) {
+    if (!Number.isFinite(options.ttlMs) || options.ttlMs <= 0) {
+      throw new RangeError('ttlMs must be a finite number greater than 0');
+    }
+    if (!Number.isInteger(options.maxEntries) || options.maxEntries < 1) {
+      throw new RangeError('maxEntries must be a positive integer');
+    }
+
     this.ttlMs = options.ttlMs;
     this.maxEntries = options.maxEntries;
     this.cache = new Map();
@@ -82,7 +90,7 @@ export class AuthCache {
     }
 
     // Check if entry has expired
-    if (now > entry.expiresAt) {
+    if (now >= entry.expiresAt) {
       this.cache.delete(selector);
       this.misses.inc();
       this.missCount++;
@@ -97,16 +105,33 @@ export class AuthCache {
   }
 
   /**
+   * Returns a snapshot used to prevent stale in-flight reads from refilling
+   * the cache after an invalidation.
+   */
+  getGeneration(): number {
+    return this.generation;
+  }
+
+  /**
    * Set a cache entry for a key selector.
    *
    * @param selector - The key selector (SHA-256 hash of the API key)
    * @param info - The API key info to cache
    */
-  set(selector: string, info: ApiKeyInfo): void {
+  set(selector: string, info: ApiKeyInfo, expectedGeneration?: number): void {
+    if (expectedGeneration !== undefined && expectedGeneration !== this.generation) {
+      return;
+    }
+
     const now = Date.now();
+    const cacheExpiresAt = now + this.ttlMs;
+    const keyExpiresAt = info.expiresAt?.getTime();
     const entry: CacheEntry = {
       info,
-      expiresAt: now + this.ttlMs,
+      expiresAt:
+        keyExpiresAt !== undefined && Number.isFinite(keyExpiresAt)
+          ? Math.min(cacheExpiresAt, keyExpiresAt)
+          : cacheExpiresAt,
       lastAccessed: now,
     };
 
@@ -124,6 +149,7 @@ export class AuthCache {
    * @param selector - The key selector to invalidate
    */
   invalidate(selector: string): void {
+    this.generation += 1;
     this.cache.delete(selector);
   }
 
@@ -133,6 +159,7 @@ export class AuthCache {
    * @param userId - The user ID whose cache entries should be invalidated
    */
   invalidateByUserId(userId: string): void {
+    this.generation += 1;
     const selectorsToDelete: string[] = [];
     this.cache.forEach((entry, selector) => {
       if (entry.info.createdBy === userId) {
@@ -146,6 +173,7 @@ export class AuthCache {
    * Clear all cache entries.
    */
   clear(): void {
+    this.generation += 1;
     this.cache.clear();
   }
 
@@ -174,7 +202,7 @@ export class AuthCache {
       }
     });
 
-    if (oldestSelector) {
+    if (oldestSelector !== null) {
       this.cache.delete(oldestSelector);
     }
   }
@@ -188,7 +216,7 @@ export class AuthCache {
     const selectorsToDelete: string[] = [];
 
     this.cache.forEach((entry, selector) => {
-      if (now > entry.expiresAt) {
+      if (now >= entry.expiresAt) {
         selectorsToDelete.push(selector);
       }
     });

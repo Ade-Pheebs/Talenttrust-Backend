@@ -224,6 +224,7 @@ export async function validateApiKey(apiKey: string): Promise<ApiKeyInfo | null>
   if (cached) {
     return cached;
   }
+  const cacheGeneration = cache.getGeneration();
 
   // Try indexed lookup first (fast path, O(1) via key_selector)
   let dbKey = await database.getApiKeyBySelector(selector);
@@ -299,8 +300,14 @@ export async function validateApiKey(apiKey: string): Promise<ApiKeyInfo | null>
     isActive: dbKey.is_active
   };
 
+  // A credential may have been rotated or deactivated while this read was in
+  // flight. Do not authorize from a result older than the latest invalidation.
+  if (cache.getGeneration() !== cacheGeneration) {
+    return null;
+  }
+
   // Cache the successful validation result
-  cache.set(selector, result);
+  cache.set(selector, result, cacheGeneration);
 
   return result;
 }

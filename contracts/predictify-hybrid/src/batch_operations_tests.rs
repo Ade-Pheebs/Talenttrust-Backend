@@ -182,6 +182,41 @@ mod batch_operations_tests {
         );
     }
 
+    /// A bet with zero or negative amount is rejected.
+    #[test]
+    fn invalid_bet_amount_rejected() {
+        let env = fresh_env();
+        let (_id, client) = register(&env);
+        let user = caller(&env);
+        let idem = key(&env, 0x09);
+
+        let mut bets = Vec::new(&env);
+        bets.push_back(Bet {
+            market_id: 1,
+            amount: 0,
+        });
+
+        env.mock_all_auths();
+        let result = client.try_place_bets(&user, &bets, &idem);
+        assert_eq!(
+            result,
+            Err(Ok(Error::InvalidBetAmount)),
+            "zero amount must return InvalidBetAmount error"
+        );
+        
+        let mut bets = Vec::new(&env);
+        bets.push_back(Bet {
+            market_id: 1,
+            amount: -100,
+        });
+        let result = client.try_place_bets(&user, &bets, &idem);
+        assert_eq!(
+            result,
+            Err(Ok(Error::InvalidBetAmount)),
+            "negative amount must return InvalidBetAmount error"
+        );
+    }
+
     /// The zero key (`[0u8; 32]`) disables idempotency checking; repeated
     /// calls with the zero key all succeed (deprecated backward-compat path).
     #[test]

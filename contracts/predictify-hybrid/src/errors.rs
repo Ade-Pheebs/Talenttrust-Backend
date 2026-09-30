@@ -16,4 +16,7 @@ pub enum Error {
 
     /// The `bets` vector was empty.  At least one bet is required.
     EmptyBatch = 2,
+
+    /// A bet amount was invalid (e.g. zero or negative).
+    InvalidBetAmount = 3,
 }

@@ -8,11 +8,31 @@
 import {
   createAuditEntryBodySchema,
   buildAuditQuerySchema,
+  auditActionSchema,
+  auditSeveritySchema,
   auditEntryResponseSchema,
   auditQueryResultResponseSchema,
+  auditLegacyQueryResponseSchema,
   integrityReportResponseSchema,
+  AUDIT_ACTIONS as SCHEMA_ACTIONS,
 } from './schemas';
-import { encodeCursor } from './types';
+import {
+  encodeCursor,
+  AUDIT_ACTIONS as DOMAIN_ACTIONS,
+  AUDIT_SEVERITIES as DOMAIN_SEVERITIES,
+} from './types';
+import {
+  CreateAuditEntrySchema,
+  MAX_ID_LENGTH,
+  MAX_IP_LENGTH,
+  MAX_CORRELATION_ID_LENGTH,
+  MAX_METADATA_ARRAY_ITEMS,
+  MAX_METADATA_BYTES,
+  MAX_METADATA_DEPTH,
+  MAX_METADATA_ENTRIES,
+  MAX_METADATA_STRING_LENGTH,
+  FORBIDDEN_METADATA_KEYS,
+} from './inputValidation';
 
 describe('createAuditEntryBodySchema', () => {
   const valid = {
@@ -201,5 +221,309 @@ describe('response schemas', () => {
   it('integrityReportResponseSchema rejects a report missing checkedAt', () => {
     const report = { valid: true, totalEntries: 3 };
     expect(integrityReportResponseSchema.safeParse(report).success).toBe(false);
+  });
+});
+
+// ─── Invariant coverage (issue #1362) ───────────────────────────────────────
+
+/** Minimal valid write payload; overrides are applied last. */
+function makeBody(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+  return {
+    action: 'CONTRACT_CREATED',
+    severity: 'INFO',
+    actor: 'user-1',
+    resource: 'contract',
+    resourceId: 'contract-1',
+    metadata: {},
+    ...overrides,
+  };
+}
+
+/** Builds `depth` nested plain objects (depth 1 is a flat `{}`). */
+function nest(depth: number): Record<string, unknown> {
+  let node: Record<string, unknown> = {};
+  for (let i = 1; i < depth; i += 1) {
+    node = { child: node };
+  }
+  return node;
+}
+
+describe('enum parity with the domain (drift regression)', () => {
+  it('re-exports exactly the domain action list', () => {
+    expect(SCHEMA_ACTIONS).toEqual(DOMAIN_ACTIONS);
+  });
+
+  it('exposes exactly the domain values through the zod enums', () => {
+    expect(auditActionSchema.options).toEqual([...DOMAIN_ACTIONS]);
+    expect(auditSeveritySchema.options).toEqual([...DOMAIN_SEVERITIES]);
+  });
+
+  it('accepts every domain action on the write path', () => {
+    for (const action of DOMAIN_ACTIONS) {
+      expect(createAuditEntryBodySchema.safeParse(makeBody({ action })).success).toBe(true);
+    }
+  });
+
+  it('accepts every domain severity on the write path', () => {
+    for (const severity of DOMAIN_SEVERITIES) {
+      expect(createAuditEntryBodySchema.safeParse(makeBody({ severity })).success).toBe(true);
+    }
+  });
+
+  it('accepts REPUTATION_CORRECTED (previously rejected by the drifted local list)', () => {
+    expect(SCHEMA_ACTIONS).toContain('REPUTATION_CORRECTED');
+    expect(
+      createAuditEntryBodySchema.safeParse(makeBody({ action: 'REPUTATION_CORRECTED' })).success,
+    ).toBe(true);
+  });
+});
+
+describe('createAuditEntryBodySchema — field boundaries', () => {
+  it('accepts an identifier at the maximum length and rejects one over it', () => {
+    const atMax = 'a'.repeat(MAX_ID_LENGTH);
+    expect(createAuditEntryBodySchema.safeParse(makeBody({ actor: atMax })).success).toBe(true);
+    expect(
+      createAuditEntryBodySchema.safeParse(makeBody({ actor: `${atMax}a` })).success,
+    ).toBe(false);
+  });
+
+  it('rejects blank and control-character identifiers', () => {
+    expect(createAuditEntryBodySchema.safeParse(makeBody({ actor: '   ' })).success).toBe(false);
+    expect(
+      createAuditEntryBodySchema.safeParse(makeBody({ actor: 'user\u0000' })).success,
+    ).toBe(false);
+    expect(
+      createAuditEntryBodySchema.safeParse(makeBody({ resourceId: 'id\u001F' })).success,
+    ).toBe(false);
+  });
+
+  it('accepts valid IPv4/IPv6 addresses and rejects invalid or oversized ones', () => {
+    expect(
+      createAuditEntryBodySchema.safeParse(makeBody({ ipAddress: '203.0.113.7' })).success,
+    ).toBe(true);
+    expect(createAuditEntryBodySchema.safeParse(makeBody({ ipAddress: '::1' })).success).toBe(true);
+    expect(
+      createAuditEntryBodySchema.safeParse(makeBody({ ipAddress: 'not-an-ip' })).success,
+    ).toBe(false);
+    expect(
+      createAuditEntryBodySchema.safeParse(makeBody({ ipAddress: '9'.repeat(MAX_IP_LENGTH + 1) }))
+        .success,
+    ).toBe(false);
+  });
+
+  it('enforces the correlationId charset and length bounds', () => {
+    expect(
+      createAuditEntryBodySchema.safeParse(makeBody({ correlationId: 'corr-abc:1.2_x' })).success,
+    ).toBe(true);
+    expect(
+      createAuditEntryBodySchema.safeParse(makeBody({ correlationId: 'corr abc' })).success,
+    ).toBe(false);
+    expect(
+      createAuditEntryBodySchema.safeParse(makeBody({ correlationId: 'corr\nabc' })).success,
+    ).toBe(false);
+    expect(createAuditEntryBodySchema.safeParse(makeBody({ correlationId: '' })).success).toBe(false);
+    const atMax = 'a'.repeat(MAX_CORRELATION_ID_LENGTH);
+    expect(createAuditEntryBodySchema.safeParse(makeBody({ correlationId: atMax })).success).toBe(true);
+    expect(
+      createAuditEntryBodySchema.safeParse(makeBody({ correlationId: `${atMax}a` })).success,
+    ).toBe(false);
+  });
+});
+
+describe('createAuditEntryBodySchema — metadata data-integrity invariants', () => {
+  it('denies prototype-pollution keys at the top level', () => {
+    const pollutedProto = JSON.parse('{"__proto__":"x"}') as Record<string, unknown>;
+    expect(
+      createAuditEntryBodySchema.safeParse(makeBody({ metadata: pollutedProto })).success,
+    ).toBe(false);
+    expect(
+      createAuditEntryBodySchema.safeParse(makeBody({ metadata: { constructor: 'x' } })).success,
+    ).toBe(false);
+  });
+
+  it('denies prototype-pollution keys at any nesting level', () => {
+    const nested = { safe: JSON.parse('{"prototype":"x"}') };
+    const result = createAuditEntryBodySchema.safeParse(makeBody({ metadata: nested }));
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      expect(result.error.issues.some((issue) => issue.message.includes('reserved key'))).toBe(true);
+    }
+  });
+
+  it('accepts nesting up to MAX_METADATA_DEPTH and rejects one level deeper', () => {
+    expect(
+      createAuditEntryBodySchema.safeParse(makeBody({ metadata: nest(MAX_METADATA_DEPTH) })).success,
+    ).toBe(true);
+    expect(
+      createAuditEntryBodySchema.safeParse(makeBody({ metadata: nest(MAX_METADATA_DEPTH + 1) }))
+        .success,
+    ).toBe(false);
+  });
+
+  it('accepts MAX_METADATA_ENTRIES keys and rejects one more', () => {
+    const atMax = Object.fromEntries(
+      Array.from({ length: MAX_METADATA_ENTRIES }, (_, i) => [`k${i}`, i]),
+    );
+    const over = { ...atMax, extra: 1 };
+    expect(createAuditEntryBodySchema.safeParse(makeBody({ metadata: atMax })).success).toBe(true);
+    expect(createAuditEntryBodySchema.safeParse(makeBody({ metadata: over })).success).toBe(false);
+  });
+
+  it('accepts MAX_METADATA_ARRAY_ITEMS and rejects one more', () => {
+    const atMax = Array.from({ length: MAX_METADATA_ARRAY_ITEMS }, () => 1);
+    const over = [...atMax, 1];
+    expect(createAuditEntryBodySchema.safeParse(makeBody({ metadata: { list: atMax } })).success).toBe(
+      true,
+    );
+    expect(createAuditEntryBodySchema.safeParse(makeBody({ metadata: { list: over } })).success).toBe(
+      false,
+    );
+  });
+
+  it('enforces the per-string length bound', () => {
+    expect(
+      createAuditEntryBodySchema.safeParse(
+        makeBody({ metadata: { s: 'a'.repeat(MAX_METADATA_STRING_LENGTH) } }),
+      ).success,
+    ).toBe(true);
+    expect(
+      createAuditEntryBodySchema.safeParse(
+        makeBody({ metadata: { s: 'a'.repeat(MAX_METADATA_STRING_LENGTH + 1) } }),
+      ).success,
+    ).toBe(false);
+  });
+
+  it('rejects non-finite numbers and circular references', () => {
+    expect(
+      createAuditEntryBodySchema.safeParse(makeBody({ metadata: { n: Infinity } })).success,
+    ).toBe(false);
+    const circular: Record<string, unknown> = {};
+    circular['self'] = circular;
+    expect(createAuditEntryBodySchema.safeParse(makeBody({ metadata: circular })).success).toBe(false);
+  });
+
+  it('rejects metadata whose serialised size exceeds MAX_METADATA_BYTES', () => {
+    const giant: Record<string, string> = {};
+    for (let i = 0; i < MAX_METADATA_ENTRIES; i += 1) {
+      giant[`k${i}`] = 'a'.repeat(MAX_METADATA_STRING_LENGTH);
+    }
+    expect(Buffer.byteLength(JSON.stringify(giant), 'utf-8')).toBeGreaterThan(MAX_METADATA_BYTES);
+    expect(createAuditEntryBodySchema.safeParse(makeBody({ metadata: giant })).success).toBe(false);
+  });
+
+  it('documents the shared metadata source of truth with the strict write-path schema', () => {
+    const polluted = JSON.parse('{"__proto__":"x"}');
+    const clean = { nested: { ok: true } };
+
+    expect(createAuditEntryBodySchema.safeParse(makeBody({ metadata: polluted })).success).toBe(false);
+    expect(CreateAuditEntrySchema.safeParse(makeBody({ metadata: polluted })).success).toBe(false);
+    expect(createAuditEntryBodySchema.safeParse(makeBody({ metadata: clean })).success).toBe(true);
+    expect(CreateAuditEntrySchema.safeParse(makeBody({ metadata: clean })).success).toBe(true);
+  });
+
+  it('forbidden-key constant is non-empty and includes the classic pollution keys', () => {
+    expect(FORBIDDEN_METADATA_KEYS).toEqual(expect.arrayContaining(['__proto__', 'constructor', 'prototype']));
+  });
+});
+
+describe('buildAuditQuerySchema — invariants and legacy quirk', () => {
+  const schema = buildAuditQuerySchema({ defaultLimit: 50, maxLimit: 100 });
+
+  it('accepts every domain action as a filter (enum parity)', () => {
+    for (const action of DOMAIN_ACTIONS) {
+      expect(schema.safeParse({ action }).success).toBe(true);
+    }
+  });
+
+  it('keeps a limit exactly at maxLimit and clamps one above it', () => {
+    const exact = schema.safeParse({ limit: '100' });
+    expect(exact.success).toBe(true);
+    if (exact.success) expect(exact.data.limit).toBe(100);
+
+    const over = schema.safeParse({ limit: '101' });
+    expect(over.success).toBe(true);
+    if (over.success) expect(over.data.limit).toBe(100);
+  });
+
+  it('treats an empty cursor as absent (legacy truthy-check quirk preserved)', () => {
+    const result = schema.safeParse({ cursor: '' });
+    expect(result.success).toBe(true);
+    if (result.success) expect(result.data.cursor).toBeUndefined();
+  });
+
+  it('still rejects an empty limit (legacy explicit-undefined quirk preserved)', () => {
+    expect(schema.safeParse({ limit: '' }).success).toBe(false);
+  });
+
+  it('applies no default limit when defaultLimit is omitted (export schema)', () => {
+    const exportSchema = buildAuditQuerySchema({ maxLimit: 50_000 });
+    const result = exportSchema.safeParse({});
+    expect(result.success).toBe(true);
+    if (result.success) expect(result.data.limit).toBeUndefined();
+  });
+});
+
+describe('response schemas — tightened data-integrity contract', () => {
+  const baseEntry = {
+    id: 'entry-1',
+    timestamp: new Date().toISOString(),
+    action: 'CONTRACT_CREATED',
+    severity: 'INFO',
+    actor: 'user-1',
+    resource: 'contract',
+    resourceId: 'contract-1',
+    metadata: {},
+    hash: 'a'.repeat(64),
+    previousHash: 'GENESIS',
+  };
+
+  it('accepts GENESIS and 64-char hex previous hashes, rejects anything else', () => {
+    expect(auditEntryResponseSchema.safeParse(baseEntry).success).toBe(true);
+    expect(
+      auditEntryResponseSchema.safeParse({ ...baseEntry, previousHash: 'b'.repeat(64) }).success,
+    ).toBe(true);
+    expect(
+      auditEntryResponseSchema.safeParse({ ...baseEntry, previousHash: 'not-a-hash' }).success,
+    ).toBe(false);
+  });
+
+  it('rejects a malformed hash digest', () => {
+    expect(
+      auditEntryResponseSchema.safeParse({ ...baseEntry, hash: 'A'.repeat(64) }).success,
+    ).toBe(false);
+    expect(auditEntryResponseSchema.safeParse({ ...baseEntry, hash: 'abc' }).success).toBe(false);
+  });
+
+  it('rejects a non-ISO timestamp', () => {
+    expect(
+      auditEntryResponseSchema.safeParse({ ...baseEntry, timestamp: 'not-a-date' }).success,
+    ).toBe(false);
+  });
+
+  it('rejects negative and non-integer counters', () => {
+    expect(
+      auditQueryResultResponseSchema.safeParse({ entries: [], count: -1, limit: 50 }).success,
+    ).toBe(false);
+    expect(
+      auditQueryResultResponseSchema.safeParse({ entries: [], count: 1.5, limit: 50 }).success,
+    ).toBe(false);
+    expect(
+      auditQueryResultResponseSchema.safeParse({ entries: [], count: 0, limit: 0 }).success,
+    ).toBe(false);
+  });
+
+  it('rejects a negative legacy offset and a negative corruption index', () => {
+    expect(
+      auditLegacyQueryResponseSchema.safeParse({ entries: [], count: 0, limit: 10, offset: -1 })
+        .success,
+    ).toBe(false);
+    expect(
+      integrityReportResponseSchema.safeParse({
+        valid: false,
+        totalEntries: 3,
+        firstCorruptedIndex: -1,
+        checkedAt: new Date().toISOString(),
+      }).success,
+    ).toBe(false);
   });
 });

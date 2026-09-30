@@ -183,7 +183,7 @@ export const AUDIT_VALIDATION_ERROR_CODE = 'validation_error';
  * `superRefine` (rather than chained `.refine`) is used so that a value can
  * report every problem it has instead of only the first.
  */
-function identifierSchema(fieldName: string, maxLength: number): z.ZodType<string> {
+export function identifierSchema(fieldName: string, maxLength: number): z.ZodType<string> {
   return z
     .string({
       required_error: `${fieldName} is required`,
@@ -482,6 +482,64 @@ export function computeDepth(value: unknown, seen: WeakSet<object> = new WeakSet
   return 1 + deepestChild;
 }
 
+// ── Reusable field schemas ────────────────────────────────────────────────────
+//
+// These are the single source of truth for the shape of each audit content
+// field. Both the strict write-path schema below (`CreateAuditEntrySchema`) and
+// the declarative API schemas in `./schemas.ts` compose them, so a field rule
+// can never be silently weakened in one surface and not the other.
+
+/**
+ * IPv4/IPv6 address, bounded by {@link MAX_IP_LENGTH} and optional.
+ *
+ * An unparseable address is rejected rather than stored: audit records are
+ * permanent, and a bogus origin makes incident reconstruction impossible.
+ */
+export const ipAddressSchema = z
+  .string({ invalid_type_error: 'ipAddress must be a string' })
+  .max(MAX_IP_LENGTH, `ipAddress must be at most ${MAX_IP_LENGTH} characters`)
+  .ip({ message: 'ipAddress must be a valid IPv4 or IPv6 address' })
+  .optional();
+
+/**
+ * Opaque correlation ID, bounded and restricted to a safe transport charset.
+ *
+ * The charset guard prevents CR/LF and other control characters (which could
+ * forge log lines) from entering the audit chain.
+ */
+export const correlationIdSchema = z
+  .string({ invalid_type_error: 'correlationId must be a string' })
+  .min(1, 'correlationId must not be empty')
+  .max(
+    MAX_CORRELATION_ID_LENGTH,
+    `correlationId must be at most ${MAX_CORRELATION_ID_LENGTH} characters`,
+  )
+  .regex(
+    CORRELATION_ID_PATTERN,
+    'correlationId must contain only letters, digits, dot, colon, underscore or hyphen',
+  )
+  .optional();
+
+/**
+ * Structured, JSON-serialisable metadata, defaulting to `{}` when omitted.
+ *
+ * Every structural rule from {@link validateMetadata} is enforced here —
+ * forbidden prototype-pollution keys, depth, key count, array length, string
+ * length, finite numbers and serialised byte size — so the declarative API
+ * schema and the strict write-path schema enforce the same data-integrity
+ * invariants.
+ */
+export const auditMetadataSchema = z
+  .unknown()
+  .superRefine((value, ctx) => {
+    for (const issue of validateMetadata(value)) {
+      addIssue(ctx, issue.code, issue.message, issue.path);
+    }
+  })
+  .transform((value) => value as Record<string, unknown>)
+  .optional()
+  .default({});
+
 // ── Body schema ───────────────────────────────────────────────────────────────
 
 /**
@@ -497,33 +555,9 @@ export const CreateAuditEntrySchema = z
     actor: identifierSchema('actor', MAX_ID_LENGTH),
     resource: identifierSchema('resource', MAX_ID_LENGTH),
     resourceId: identifierSchema('resourceId', MAX_ID_LENGTH),
-    metadata: z
-      .unknown()
-      .superRefine((value, ctx) => {
-        for (const issue of validateMetadata(value)) {
-          addIssue(ctx, issue.code, issue.message, issue.path);
-        }
-      })
-      .transform((value) => value as Record<string, unknown>)
-      .optional()
-      .default({}),
-    ipAddress: z
-      .string({ invalid_type_error: 'ipAddress must be a string' })
-      .max(MAX_IP_LENGTH, `ipAddress must be at most ${MAX_IP_LENGTH} characters`)
-      .ip({ message: 'ipAddress must be a valid IPv4 or IPv6 address' })
-      .optional(),
-    correlationId: z
-      .string({ invalid_type_error: 'correlationId must be a string' })
-      .min(1, 'correlationId must not be empty')
-      .max(
-        MAX_CORRELATION_ID_LENGTH,
-        `correlationId must be at most ${MAX_CORRELATION_ID_LENGTH} characters`,
-      )
-      .regex(
-        CORRELATION_ID_PATTERN,
-        'correlationId must contain only letters, digits, dot, colon, underscore or hyphen',
-      )
-      .optional(),
+    metadata: auditMetadataSchema,
+    ipAddress: ipAddressSchema,
+    correlationId: correlationIdSchema,
   })
   .strict();
 

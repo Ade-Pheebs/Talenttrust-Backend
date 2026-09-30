@@ -16,4 +16,16 @@ pub enum Error {
 
     /// The `bets` vector was empty.  At least one bet is required.
     EmptyBatch = 2,
+
+    /// The `bets` vector exceeded [`storage::MAX_BATCH_SIZE`].
+    /// Split the work into smaller batches with fresh idempotency keys.
+    BatchTooLarge = 3,
+
+    /// A bet in the batch failed validation (e.g. zero amount,
+    /// duplicate market identifier, or malformed payload).
+    InvalidBet = 4,
+
+    /// The same market identifier appears more than once within a
+    /// single batch.  Duplicates would make the applied state ambiguous.
+    DuplicateBet = 5,
 }

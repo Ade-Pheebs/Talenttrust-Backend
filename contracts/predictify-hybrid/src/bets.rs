@@ -2,7 +2,9 @@ use soroban_sdk::{Address, BytesN, Env, Vec};
 
 use crate::{
     errors::Error,
-    storage::{DataKey, IDEM_KEY_TTL_LEDGERS},
+    storage::{
+        DataKey, IDEM_KEY_TTL_LEDGERS, MAX_BATCH_SIZE, MAX_BET_AMOUNT, MIN_BET_AMOUNT,
+    },
 };
 
 /// A single bet submitted inside a batch.
@@ -15,6 +17,51 @@ pub struct Bet {
     pub market_id: u64,
     /// Amount of the base asset staked, in stroops.
     pub amount: i128,
+}
+
+/// Validate a single [`Bet`] entry against the storage-layer boundaries.
+///
+/// # Invariants
+///
+/// * `market_id` must be non-zero (zero is reserved as an invalid sentinel).
+/// * `amount` must satisfy `MIN_BET_AMOUNT <= amount <= MAX_BET_AMOUNT`.
+///
+/// The function is pure and deterministic: identical inputs always yield
+/// identical results, and it performs no storage reads or writes.
+fn validate_bet(bet: &Bet) -> Result<(), Error> {
+    if bet.market_id == 0 {
+        return Err(Error::InvalidMarketId);
+    }
+    if bet.amount < MIN_BET_AMOUNT {
+        return Err(Error::BetAmountTooSmall);
+    }
+    if bet.amount > MAX_BET_AMOUNT {
+        return Err(Error::BetAmountTooLarge);
+    }
+    Ok(())
+}
+
+/// Validate the whole batch before any state mutation occurs.
+///
+/// # Invariants
+///
+/// * The batch is non-empty.
+/// * The batch size does not exceed [`MAX_BATCH_SIZE`].
+/// * Every entry passes [`validate_bet`].
+///
+/// Validation is performed in a single pass up-front so that a rejected
+/// batch never partially mutates storage (all-or-nothing semantics).
+fn validate_batch(bets: &Vec<Bet>) -> Result<(), Error> {
+    if bets.is_empty() {
+        return Err(Error::EmptyBatch);
+    }
+    if bets.len() > MAX_BATCH_SIZE {
+        return Err(Error::BatchTooLarge);
+    }
+    for bet in bets.iter() {
+        validate_bet(&bet)?;
+    }
+    Ok(())
 }
 
 /// Process a batch of bets atomically with an idempotency guarantee.
@@ -33,6 +80,10 @@ pub struct Bet {
 /// # Errors
 ///
 /// * [`Error::EmptyBatch`]                   – `bets` is empty.
+/// * [`Error::BatchTooLarge`]                – `bets` exceeds [`MAX_BATCH_SIZE`].
+/// * [`Error::InvalidMarketId`]              – a bet has `market_id == 0`.
+/// * [`Error::BetAmountTooSmall`]            – a bet amount is below [`MIN_BET_AMOUNT`].
+/// * [`Error::BetAmountTooLarge`]            – a bet amount is above [`MAX_BET_AMOUNT`].
 /// * [`Error::IdempotentBatchAlreadyApplied`] – the `(caller, idempotency_key)`
 ///                                              pair has already been consumed.
 ///
@@ -60,10 +111,10 @@ pub fn place_bets(
     // Authenticate the caller.
     caller.require_auth();
 
-    // Reject empty batches early.
-    if bets.is_empty() {
-        return Err(Error::EmptyBatch);
-    }
+    // Validate the entire batch up-front.  This rejects empty batches,
+    // oversized batches, and any individual bet that violates the
+    // storage-layer boundaries before any state is mutated.
+    validate_batch(&bets)?;
 
     // ------------------------------------------------------------------
     // Idempotency check

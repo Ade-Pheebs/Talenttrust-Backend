@@ -1,17 +1,26 @@
 //! # predictify-hybrid
 //!
-//! Soroban smart contract for prediction markets.
-//!
-//! ## Idempotency
-//!
-//! `place_bets` accepts a caller-supplied `BytesN<32>` idempotency key.
-//! The key is stored in instance storage under
-//! `DataKey::PlaceBetsIdem(caller, key)` with a TTL of
-//! [`storage::IDEM_KEY_TTL_LEDGERS`] ledgers (~24 h).  Repeated
-//! submissions with the same `(caller, key)` pair are rejected with
-//! `Error::IdempotentBatchAlreadyApplied`.
+/// Soroban smart contract for prediction markets.
+///
+/// ## Idempotency
+///
+/// `place_bets` accepts a caller-supplied `BytesN<32>`
+/// idempotency key. The key is stored in instance storage under
+/// `DataKey::PlaceBetsIdem(caller, key)` with a TTL of
+/// [`storage::IDEM_KEY_TTL_LEDGERS`] ledgers (~24 h).  Repeated
+/// submissions with the same `(caller, key)` pair are rejected with
+/// `Error::IdempotentBatchAlreadyApplied`.
+///
+/// ## Validation boundaries
++///
+/// See [`bets::place_bets`] for the full ordered list of checks.
+/// In short: empty batches, batches larger than
+-/// [`storage::MAX_BATCH_SIZE`], duplicate market identifiers within a
+/// batch, and per-bet field failures are rejected before any state
+/// mutation.  Only a fully validated batch consumes the idempotency
+/// key, so a rejected call can be retried with the same token.
 
-#![no_std]
+#no_stdj
 
 mod bets;
 mod errors;
@@ -19,7 +28,7 @@ mod storage;
 
 pub use bets::Bet;
 pub use errors::Error;
-pub use storage::{DataKey, IDEM_KEY_TTL_LEDGERS};
+pub use storage::{DataKey, IDEM_KEY_TTL_LEDGERS, MAX_BATCH_SIZE};
 
 use soroban_sdk::{contract, contractimpl, Address, BytesN, Env, Vec};
 
@@ -30,7 +39,8 @@ pub struct PredictifyHybrid;
 impl PredictifyHybrid {
     /// Submit a batch of bets atomically.
     ///
-    /// See [`bets::place_bets`] for full documentation.
+    /// See [`bets::place_bets`] for full documentation of the
+    /// validation boundaries and failure modes.
     pub fn place_bets(
         env: Env,
         caller: Address,

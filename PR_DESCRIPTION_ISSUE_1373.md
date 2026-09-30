@@ -1,6 +1,6 @@
 # Make failure recovery deterministic in `src/audit/sqliteRepository.ts`
 
-**Closes #1373**
+Closes #1373
 
 ## Summary
 

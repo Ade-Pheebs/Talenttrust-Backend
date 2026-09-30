@@ -2,6 +2,12 @@
  * @module audit/inputValidation
  * @description Strict input validation for audit write endpoints (POST /api/v1/audit).
  *
+ * This module defines the validation boundaries for the audit write path: the
+ * exact set of accepted inputs, the rejection contract for invalid inputs, the
+ * handling of duplicate submissions, and the numeric/structural boundary values
+ * that separate the two. Every bound below is a named constant so that callers
+ * and tests can reference the boundary rather than duplicating magic numbers.
+ *
  * The audit log is append-only and tamper-evident: every accepted entry is
  * hashed into a chain that can never be rewritten. A malformed or oversized
  * entry is therefore permanent. This module is the boundary that keeps such
@@ -59,6 +65,20 @@
  * {@link validateCreateAuditEntryInput} is a pure, total function — it never
  * throws, for any input. Non-HTTP producers that write to the audit log should
  * call it directly rather than re-implementing these bounds.
+ *
+ * ### Boundary semantics
+ *
+ * Bounds are inclusive maxima: a value exactly equal to a `MAX_*` constant is
+ * accepted, and the next representable value is rejected. This is asserted by
+ * the boundary tests so the contract cannot drift silently.
+ *
+ * ### Duplicate submissions
+ *
+ * Validation is stateless and idempotent: the same input always yields the same
+ * verdict, and a duplicate submission is validated exactly like the original.
+ * Deduplication is deliberately *not* performed here — it belongs to
+ * `idempotencyMiddleware`, which hashes the untouched `req.body`. This module
+ * must therefore never mutate `req.body`, or replay detection would break.
  */
 
 import type { Request, Response, NextFunction } from 'express';
@@ -172,6 +192,16 @@ export const AUDIT_VALIDATION_CODES = {
   INVALID_VALUE: 'invalid_value',
 } as const;
 
+/**
+ * The complete set of codes this module can emit, as a runtime-checkable list.
+ *
+ * Kept in sync with {@link AUDIT_VALIDATION_CODES} by a test, so a new code
+ * cannot be added without also being documented in the error contract.
+ */
+export const AUDIT_VALIDATION_CODE_VALUES: readonly string[] = Object.values(
+  AUDIT_VALIDATION_CODES,
+);
+
 /** The top-level envelope code for every validation failure. */
 export const AUDIT_VALIDATION_ERROR_CODE = 'validation_error';
 
@@ -191,6 +221,8 @@ function identifierSchema(fieldName: string, maxLength: number): z.ZodType<strin
     })
     .min(1, `${fieldName} must not be empty`)
     .max(maxLength, `${fieldName} must be at most ${maxLength} characters`)
+    // `maxLength` is the inclusive boundary: exactly this many characters is
+    // valid, one more is not. Asserted by the boundary tests.
     .superRefine((value, ctx) => {
       if (value.trim().length === 0) {
         addIssue(ctx, AUDIT_VALIDATION_CODES.BLANK, `${fieldName} must not be blank`);
@@ -282,6 +314,7 @@ function walkMetadataValue(
 
   switch (typeof value) {
     case 'string':
+      // Inclusive boundary: length === MAX_METADATA_STRING_LENGTH is accepted.
       if (value.length > MAX_METADATA_STRING_LENGTH) {
         issues.push({
           path,
@@ -299,6 +332,7 @@ function walkMetadataValue(
           message: `${label} must be a finite number`,
         });
       } else if (Math.abs(value) > MAX_METADATA_NUMBER) {
+        // Inclusive boundary: |value| === MAX_METADATA_NUMBER is accepted.
         issues.push({
           path,
           code: AUDIT_VALIDATION_CODES.TOO_BIG,

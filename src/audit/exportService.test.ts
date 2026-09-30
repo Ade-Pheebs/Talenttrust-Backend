@@ -24,6 +24,201 @@ import { AuditService } from './service';
 import { AuditExportService, neutraliseCsvInjection } from './exportService';
 import type { CreateAuditEntryInput } from './types';
 
+// ─── Validation boundary helpers ─────────────────────────────────────────────
+
+/**
+ * Validation boundaries for export inputs.
+ *
+ * These constants define the accepted domain for every caller-supplied
+ * value that reaches AuditExportService.  They are intentionally exported
+ * so that callers and tests can assert against the same source of truth
+ * rather than duplicating magic numbers.
+ */
+export const EXPORT_VALIDATION = {
+  /** Maximum number of records a single export may contain. */
+  MAX_RECORDS: 100_000,
+  /** Maximum length of a filter string (action, actor, resource, etc.). */
+  MAX_FILTER_LENGTH: 256,
+  /** Maximum length of a correlationId filter. */
+  MAX_CORRELATION_ID_LENGTH: 128,
+  /** Maximum batch size for streaming reads. */
+  MAX_BATCH_SIZE: 5_000,
+  /** Minimum batch size for streaming reads. */
+  MIN_BATCH_SIZE: 1,
+  /** Allowed export formats. */
+  FORMATS: ['ndjson', 'csv'] as const,
+} as const;
+
+export type ExportFormat = (typeof EXPORT_VALIDATION.FORMATS)[number];
+
+/**
+ * Structured error thrown when an export request violates a validation
+ * boundary.  Carries a stable `code` so callers can branch on the failure
+ * without parsing human-readable messages.
+ */
+export class ExportValidationError extends Error {
+  public readonly code: string;
+  public readonly field: string;
+
+  constructor(code: string, field: string, message: string) {
+    super(message);
+    this.name = 'ExportValidationError';
+    this.code = code;
+    this.field = field;
+  }
+}
+
+/**
+ * Validates a caller-supplied filter object against the export boundaries.
+ *
+ * Rejects:
+ * - non-string / non-undefined filter values
+ * - empty or whitespace-only strings
+ * - strings exceeding MAX_FILTER_LENGTH
+ * - control characters (which would corrupt CSV/NDJSON output)
+ *
+ * Returns a normalised copy of the filter so downstream code never sees
+ * the raw caller object.
+ */
+export function validateExportFilters(
+  filters: Record<string, unknown> | undefined,
+): Record<string, string> {
+  if (filters === undefined) return {};
+  if (filters === null || typeof filters !== 'object' || Array.isArray(filters)) {
+    throw new ExportValidationError(
+      'INVALID_FILTERS',
+      'filters',
+      'filters must be a plain object',
+    );
+  }
+
+  const normalised: Record<string, string> = {};
+  for (const [key, value] of Object.entries(filters)) {
+    if (value === undefined) continue;
+    if (typeof value !== 'string') {
+      throw new ExportValidationError(
+        'INVALID_FILTER_TYPE',
+        key,
+        `filter "${key}" must be a string`,
+      );
+    }
+    const trimmed = value.trim();
+    if (trimmed.length === 0) {
+      throw new ExportValidationError(
+        'EMPTY_FILTER',
+        key,
+        `filter "${key}" must not be empty`,
+      );
+    }
+    const maxLen =
+      key === 'correlationId'
+        ? EXPORT_VALIDATION.MAX_CORRELATION_ID_LENGTH
+        : EXPORT_VALIDATION.MAX_FILTER_LENGTH;
+    if (trimmed.length > maxLen) {
+      throw new ExportValidationError(
+        'FILTER_TOO_LONG',
+        key,
+        `filter "${key}" exceeds maximum length of ${maxLen}`,
+      );
+    }
+    // Reject control characters that would break CSV/NDJSON framing.
+    // eslint-disable-next-line no-control-regex
+    if (/[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/.test(trimmed)) {
+      throw new ExportValidationError(
+        'FILTER_CONTROL_CHARS',
+        key,
+        `filter "${key}" contains control characters`,
+      );
+    }
+    normalised[key] = trimmed;
+  }
+  return normalised;
+}
+
+/**
+ * Validates a batch size against the export boundaries.
+ *
+ * Rejects non-integers, values below MIN_BATCH_SIZE, and values above
+ * MAX_BATCH_SIZE.  Returns the validated integer.
+ */
+export function validateBatchSize(batchSize: unknown): number {
+  if (typeof batchSize !== 'number' || !Number.isInteger(batchSize)) {
+    throw new ExportValidationError(
+      'INVALID_BATCH_SIZE',
+      'batchSize',
+      'batchSize must be an integer',
+    );
+  }
+  if (batchSize < EXPORT_VALIDATION.MIN_BATCH_SIZE) {
+    throw new ExportValidationError(
+      'BATCH_SIZE_TOO_SMALL',
+      'batchSize',
+      `batchSize must be at least ${EXPORT_VALIDATION.MIN_BATCH_SIZE}`,
+    );
+  }
+  if (batchSize > EXPORT_VALIDATION.MAX_BATCH_SIZE) {
+    throw new ExportValidationError(
+      'BATCH_SIZE_TOO_LARGE',
+      'batchSize',
+      `batchSize must not exceed ${EXPORT_VALIDATION.MAX_BATCH_SIZE}`,
+    );
+  }
+  return batchSize;
+}
+
+/**
+ * Validates an export format string against the allowed set.
+ */
+export function validateExportFormat(format: unknown): ExportFormat {
+  if (typeof format !== 'string') {
+    throw new ExportValidationError(
+      'INVALID_FORMAT',
+      'format',
+      'format must be a string',
+    );
+  }
+  if (!(EXPORT_VALIDATION.FORMATS as readonly string[]).includes(format)) {
+    throw new ExportValidationError(
+      'UNSUPPORTED_FORMAT',
+      'format',
+      `format must be one of: ${EXPORT_VALIDATION.FORMATS.join(', ')}`,
+    );
+  }
+  return format as ExportFormat;
+}
+
+/**
+ * Validates the record count against the export boundary.
+ *
+ * A count of 0 is valid (empty export).  Negative or non-integer counts
+ * are rejected.  Counts above MAX_RECORDS are rejected to prevent
+ * unbounded memory/disk usage.
+ */
+export function validateRecordCount(count: unknown): number {
+  if (typeof count !== 'number' || !Number.isInteger(count)) {
+    throw new ExportValidationError(
+      'INVALID_RECORD_COUNT',
+      'recordCount',
+      'recordCount must be an integer',
+    );
+  }
+  if (count < 0) {
+    throw new ExportValidationError(
+      'NEGATIVE_RECORD_COUNT',
+      'recordCount',
+      'recordCount must not be negative',
+    );
+  }
+  if (count > EXPORT_VALIDATION.MAX_RECORDS) {
+    throw new ExportValidationError(
+      'RECORD_COUNT_TOO_LARGE',
+      'recordCount',
+      `recordCount must not exceed ${EXPORT_VALIDATION.MAX_RECORDS}`,
+    );
+  }
+  return count;
+}
+
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
 /** Returns a minimal valid CreateAuditEntryInput with optional overrides. */

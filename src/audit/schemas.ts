@@ -56,6 +56,8 @@ export const createAuditEntryBodySchema = z.object({
 
 export type CreateAuditEntryBody = z.infer<typeof createAuditEntryBodySchema>;
 
+const MAX_CURSOR_LENGTH = 4096;
+
 const isoDateStringSchema = (fieldName: string) =>
   z
     .string()
@@ -82,6 +84,9 @@ const nonNegativeIntStringSchema = (message: string) =>
 
 const cursorSchema = z.string().refine(
   (value) => {
+    if (value.length > MAX_CURSOR_LENGTH) {
+      return false;
+    }
     try {
       decodeCursor(value);
       return true;

@@ -82,6 +82,37 @@ export function parseLimit(value: string | undefined, maxLimit: number, defaultL
   return Math.min(parsed, maxLimit);
 }
 
+/**
+ * Serialises async work per key so that concurrent or repeated execution
+ * involving the same resource cannot interleave and produce stale or
+ * inconsistent results. Each key maintains a promise chain; new work is
+ * appended to the tail and awaited in order.
+ *
+ * Invariants:
+ * - Work for a given key executes strictly in submission order.
+ * - A rejection in one task does not break the chain for subsequent tasks.
+ * - The map entry is removed once the chain drains, preventing unbounded growth.
+ */
+class KeyedMutex {
+  private readonly tails = new Map<string, Promise<unknown>>();
+
+  run<T>(key: string, task: () => Promise<T> | T): Promise<T> {
+    const previous = this.tails.get(key) ?? Promise.resolve();
+    const next = previous.then(
+      () => task(),
+      () => task(),
+    );
+    const guarded = next.catch(() => undefined);
+    this.tails.set(key, guarded);
+    void guarded.finally(() => {
+      if (this.tails.get(key) === guarded) {
+        this.tails.delete(key);
+      }
+    });
+    return next;
+  }
+}
+
 export function parseAuditQuery(
   reqQuery: Record<string, unknown>,
   options: { defaultLimit?: number; maxLimit: number },
@@ -154,6 +185,7 @@ export function parseAuditQuery(
  */
 export class AuditService {
   private cache: AuditCache | null;
+  private readonly mutex = new KeyedMutex();
 
   constructor(
     private readonly repository: AuditLogRepository = createDefaultAuditRepository(),
@@ -170,14 +202,28 @@ export class AuditService {
    * @throws Only when options.strict is true and the store throws.
    */
   log(input: CreateAuditEntryInput): AuditEntry {
+    return this.logSync(input);
+  }
+
+  /**
+   * Async variant of {@link log} that serialises concurrent writes for the
+   * same resourceId. Use this when callers may race on the same resource so
+   * that cache invalidation and repository appends cannot interleave.
+   */
+  async logAsync(input: CreateAuditEntryInput): Promise<AuditEntry> {
+    const key = `audit:${input.resource}:${input.resourceId}`;
+    return this.mutex.run(key, () => this.logSync(input));
+  }
+
+  private logSync(input: CreateAuditEntryInput): AuditEntry {
     try {
       const entry = this.repository.append(input);
-      
+
       // Invalidate cache on write operations
       if (this.cache) {
         this.cache.invalidateByResourceId(input.resourceId);
       }
-      
+
       return entry;
     } catch (err) {
       console.error('[AuditService] Failed to persist audit entry:', err);
@@ -193,7 +239,18 @@ export class AuditService {
     if (!input.action || !input.severity || !input.actor || !input.resource || !input.resourceId) {
       throw new Error('Missing required fields: action, severity, actor, resource, resourceId');
     }
-    return this.log(input);
+    return this.logSync(input);
+  }
+
+  /**
+   * Async variant of {@link createEntry} that serialises concurrent writes
+   * for the same resourceId.
+   */
+  async createEntryAsync(input: CreateAuditEntryInput): Promise<AuditEntry> {
+    if (!input.action || !input.severity || !input.actor || !input.resource || !input.resourceId) {
+      throw new Error('Missing required fields: action, severity, actor, resource, resourceId');
+    }
+    return this.logAsync(input);
   }
 
   /**
@@ -261,7 +318,7 @@ export class AuditService {
 
     const exportResult = await exportService.createNdjsonExport(filters);
 
-    this.log({
+    await this.logAsync({
       action: 'ADMIN_ACTION',
       severity: 'CRITICAL',
       actor: context.actor ?? 'anonymous',
@@ -299,7 +356,29 @@ export class AuditService {
     metadata: Record<string, unknown> = {},
     context: { ipAddress?: string; correlationId?: string } = {},
   ): AuditEntry {
-    return this.log({
+    return this.logSync({
+      action,
+      severity: 'INFO',
+      actor,
+      resource: 'contract',
+      resourceId: contractId,
+      metadata,
+      ...context,
+    });
+  }
+
+  /**
+   * Async variant of {@link logContractEvent} that serialises concurrent
+   * writes for the same contractId.
+   */
+  async logContractEventAsync(
+    action: Extract<AuditAction, `CONTRACT_${string}`>,
+    actor: string,
+    contractId: string,
+    metadata: Record<string, unknown> = {},
+    context: { ipAddress?: string; correlationId?: string } = {},
+  ): Promise<AuditEntry> {
+    return this.logAsync({
       action,
       severity: 'INFO',
       actor,
@@ -331,7 +410,30 @@ export class AuditService {
     context: { ipAddress?: string; correlationId?: string } = {},
   ): AuditEntry {
     const severity: AuditSeverity = action === 'MILESTONES_DELETED' ? 'WARNING' : 'INFO';
-    return this.log({
+    return this.logSync({
+      action,
+      severity,
+      actor,
+      resource: 'milestones',
+      resourceId: contractId,
+      metadata,
+      ...context,
+    });
+  }
+
+  /**
+   * Async variant of {@link logMilestonesEvent} that serialises concurrent
+   * writes for the same contractId.
+   */
+  async logMilestonesEventAsync(
+    action: Extract<AuditAction, `MILESTONES_${string}`>,
+    actor: string,
+    contractId: string,
+    metadata: Record<string, unknown> = {},
+    context: { ipAddress?: string; correlationId?: string } = {},
+  ): Promise<AuditEntry> {
+    const severity: AuditSeverity = action === 'MILESTONES_DELETED' ? 'WARNING' : 'INFO';
+    return this.logAsync({
       action,
       severity,
       actor,
@@ -353,7 +455,29 @@ export class AuditService {
     metadata: Record<string, unknown> = {},
     context: { ipAddress?: string; correlationId?: string } = {},
   ): AuditEntry {
-    return this.log({
+    return this.logSync({
+      action,
+      severity: 'CRITICAL',
+      actor,
+      resource: 'payment',
+      resourceId: paymentId,
+      metadata,
+      ...context,
+    });
+  }
+
+  /**
+   * Async variant of {@link logPaymentEvent} that serialises concurrent
+   * writes for the same paymentId.
+   */
+  async logPaymentEventAsync(
+    action: Extract<AuditAction, `PAYMENT_${string}`>,
+    actor: string,
+    paymentId: string,
+    metadata: Record<string, unknown> = {},
+    context: { ipAddress?: string; correlationId?: string } = {},
+  ): Promise<AuditEntry> {
+    return this.logAsync({
       action,
       severity: 'CRITICAL',
       actor,
@@ -375,7 +499,29 @@ export class AuditService {
     context: { ipAddress?: string; correlationId?: string } = {},
   ): AuditEntry {
     const severity: AuditSeverity = action === 'AUTH_FAILED' ? 'WARNING' : 'INFO';
-    return this.log({
+    return this.logSync({
+      action,
+      severity,
+      actor,
+      resource: 'auth',
+      resourceId: actor,
+      metadata,
+      ...context,
+    });
+  }
+
+  /**
+   * Async variant of {@link logAuthEvent} that serialises concurrent writes
+   * for the same actor.
+   */
+  async logAuthEventAsync(
+    action: Extract<AuditAction, `AUTH_${string}`>,
+    actor: string,
+    metadata: Record<string, unknown> = {},
+    context: { ipAddress?: string; correlationId?: string } = {},
+  ): Promise<AuditEntry> {
+    const severity: AuditSeverity = action === 'AUTH_FAILED' ? 'WARNING' : 'INFO';
+    return this.logAsync({
       action,
       severity,
       actor,
@@ -398,7 +544,30 @@ export class AuditService {
     context: { ipAddress?: string; correlationId?: string } = {},
   ): AuditEntry {
     const severity: AuditSeverity = action === 'USER_DELETED' ? 'WARNING' : 'INFO';
-    return this.log({
+    return this.logSync({
+      action,
+      severity,
+      actor,
+      resource: 'user',
+      resourceId: targetUserId,
+      metadata,
+      ...context,
+    });
+  }
+
+  /**
+   * Async variant of {@link logUserEvent} that serialises concurrent writes
+   * for the same targetUserId.
+   */
+  async logUserEventAsync(
+    action: Extract<AuditAction, `USER_${string}`>,
+    actor: string,
+    targetUserId: string,
+    metadata: Record<string, unknown> = {},
+    context: { ipAddress?: string; correlationId?: string } = {},
+  ): Promise<AuditEntry> {
+    const severity: AuditSeverity = action === 'USER_DELETED' ? 'WARNING' : 'INFO';
+    return this.logAsync({
       action,
       severity,
       actor,
@@ -421,7 +590,30 @@ export class AuditService {
     context: { ipAddress?: string; correlationId?: string } = {},
   ): AuditEntry {
     const severity: AuditSeverity = action === 'DISPUTE_UPDATED' ? 'WARNING' : 'INFO';
-    return this.log({
+    return this.logSync({
+      action,
+      severity,
+      actor,
+      resource: 'dispute',
+      resourceId: disputeId,
+      metadata,
+      ...context,
+    });
+  }
+
+  /**
+   * Async variant of {@link logDisputeEvent} that serialises concurrent
+   * writes for the same disputeId.
+   */
+  async logDisputeEventAsync(
+    action: Extract<AuditAction, `DISPUTE_${string}`>,
+    actor: string,
+    disputeId: string,
+    metadata: Record<string, unknown> = {},
+    context: { ipAddress?: string; correlationId?: string } = {},
+  ): Promise<AuditEntry> {
+    const severity: AuditSeverity = action === 'DISPUTE_UPDATED' ? 'WARNING' : 'INFO';
+    return this.logAsync({
       action,
       severity,
       actor,

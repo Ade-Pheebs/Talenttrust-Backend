@@ -3,6 +3,11 @@
  * @description Direct unit coverage for the declarative zod schemas in
  * `./schemas.ts`, independent of the HTTP layer (see router.validation.test.ts
  * for the end-to-end request/response coverage). Issue #939.
+ *
+ * This suite also hardens the concurrent / repeated-execution contract of the
+ * schemas: parsing must be pure and deterministic, so that racing or retried
+ * requests cannot observe stale or mutated schema state. See `describe('parsing
+ * is pure and deterministic under concurrency')` below.
  */
 
 import {
@@ -92,6 +97,49 @@ describe('createAuditEntryBodySchema', () => {
       expect((result.data as Record<string, unknown>)['somethingUnexpected']).toBeUndefined();
     }
   });
+
+  // Concurrency / idempotency invariants: the schema is a pure declaration
+  // with no mutable state, so any number of interleaved or repeated parses
+  // must yield identical results. This guards against accidental introduction
+  // of memoization / last-value caching that could leak stale data across
+  // racing requests.
+  it('parsing is pure and deterministic under concurrency', () => {
+    const inputs = [
+      valid,
+      { ...valid, actor: '' },
+      { ...valid, action: 'NOT_REAL' },
+      { ...valid, metadata: undefined },
+    ];
+
+    const baseline = inputs.map((input) => createAuditEntryBodySchema.safeParse(input));
+
+    // Interleave many parses across the same inputs and compare to the
+    // sequential baseline. Any shared mutable state would surface as a
+    // divergence here.
+    for (let round = 0; round < 50; round++) {
+      const observed = inputs.map((input) => createAuditEntryBodySchema.safeParse(input));
+      expect(observed.map((r) => r.success)).toEqual(baseline.map((r) => r.success));
+    }
+
+    // Repeated identical parses of the same input must produce deeply equal
+    // data (not just equal accept/reject decisions).
+    const first = createAuditEntryBodySchema.safeParse(valid);
+    const second = createAuditEntryBodySchema.safeParse(valid);
+    expect(first.success && second.success).toBe(true);
+    if (first.success && second.success) {
+      expect(second.data).toEqual(first.data);
+      // The parsed output must not alias the caller's input object.
+      expect(second.data).not.toBe(valid);
+      expect(second.data.metadata).not.toBe(valid.metadata);
+    }
+  });
+
+  it('does not mutate the caller's input object', () => {
+    const input = { ...valid, metadata: { foo: 'bar' } };
+    const snapshot = JSON.parse(JSON.stringify(input));
+    createAuditEntryBodySchema.safeParse(input);
+    expect(input).toEqual(snapshot);
+  });
 });
 
 describe('buildAuditQuerySchema', () => {
@@ -154,6 +202,70 @@ describe('buildAuditQuerySchema', () => {
     const result = schema.safeParse(payload);
     expect(result.success).toBe(false);
   });
+
+  // Boundary: limit exactly at maxLimit is accepted without clamping.
+  it('accepts a limit exactly at maxLimit', () => {
+    const result = schema.safeParse({ limit: '100' });
+    expect(result.success).toBe(true);
+    if (result.success) {
+      expect(result.data.limit).toBe(100);
+    }
+  });
+
+  // Boundary: limit of 1 is the smallest accepted value.
+  it('accepts a limit of 1', () => {
+    const result = schema.safeParse({ limit: '1' });
+    expect(result.success).toBe(true);
+    if (result.success) {
+      expect(result.data.limit).toBe(1);
+    }
+  });
+
+  // Boundary: offset of 0 is accepted.
+  it('accepts an offset of 0', () => {
+    const result = schema.safeParse({ offset: '0' });
+    expect(result.success).toBe(true);
+    if (result.success) {
+      expect(result.data.offset).toBe(0);
+    }
+  });
+
+  // Idempotency / concurrency: building the schema repeatedly with the same
+  // config must yield schemas that agree on every input, and the same schema
+  // instance must produce identical results across interleaved calls.
+  it('building and parsing is deterministic across repeated / concurrent calls', () => {
+    const config = { defaultLimit: 50, maxLimit: 100 };
+    const inputs = [
+      {},
+      { limit: '25', offset: '5' },
+      { limit: '999999' },
+      { limit: '0' },
+      { offset: '-1' },
+    ];
+
+    const reference = inputs.map((p) => buildAuditQuerySchema(config).safeParse(p));
+
+    for (let round = 0; round < 50; round++) {
+      const rebuilt = buildAuditQuerySchema(config);
+      const observed = inputs.map((p) => rebuilt.safeParse(p));
+      expect(observed.map((r) => r.success)).toEqual(reference.map((r) => r.success));
+    }
+
+    // The same instance must not carry state between parses.
+    const a = schema.safeParse({});
+    const b = schema.safeParse({});
+    expect(a.success && b.success).toBe(true);
+    if (a.success && b.success) {
+      expect(b.data).toEqual(a.data);
+    }
+  });
+
+  it('does not mutate the caller's query object', () => {
+    const query = { limit: '25', offset: '5' };
+    const snapshot = { ...query };
+    schema.safeParse(query);
+    expect(query).toEqual(snapshot);
+  });
 });
 
 describe('response schemas', () => {
@@ -201,5 +313,32 @@ describe('response schemas', () => {
   it('integrityReportResponseSchema rejects a report missing checkedAt', () => {
     const report = { valid: true, totalEntries: 3 };
     expect(integrityReportResponseSchema.safeParse(report).success).toBe(false);
+  });
+
+  // Response schemas are also pure: repeated and interleaved parses of the
+  // same payload must not diverge, and the caller's input must remain
+  // unmodified.
+  it('response schema parsing is pure and non-mutating', () => {
+    const entry = {
+      id: 'entry-1',
+      timestamp: new Date().toISOString(),
+      action: 'CONTRACT_CREATED',
+      severity: 'INFO',
+      actor: 'user-1',
+      resource: 'contract',
+      resourceId: 'contract-1',
+      metadata: { foo: 'bar' },
+      hash: 'a'.repeat(64),
+      previousHash: 'GENESIS',
+    };
+    const snapshot = JSON.parse(JSON.stringify(entry));
+
+    const first = auditEntryResponseSchema.safeParse(entry);
+    for (let round = 0; round < 50; round++) {
+      const next = auditEntryResponseSchema.safeParse(entry);
+      expect(next.success).toBe(first.success);
+    }
+
+    expect(entry).toEqual(snapshot);
   });
 });

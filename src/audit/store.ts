@@ -9,6 +9,18 @@
  * - The internal log array is never exposed directly; only copies are returned.
  * - No entry can be deleted or updated — the store is strictly append-only.
  *
+ * Concurrency properties (hardening):
+ * - Node's event loop is single-threaded, but async code can interleave between
+ *   the `await` points of a caller. The critical section here is the
+ *   read-previous-hash → compute-hash → push sequence. We guard it with an
+ *   explicit mutex so that concurrent appends cannot observe the same
+ *   previous hash and fork the chain.
+ * - The mutex is reentrant-safe: a re-entrant append from within the same
+ *   synchronous frame throws rather than deadlocking or silently corrupting the
+ *   chain.
+ * - `queryWithCursor` validates the cursor against the current log and
+ *   throws on filter drift instead of silently restarting from the beginning.
+ *
  * Production note: Replace the in-memory array with a write-once database table
  * (e.g. PostgreSQL with row-level security and no UPDATE/DELETE grants) while
  * keeping this interface contract intact.
@@ -60,6 +72,15 @@ export class AuditStore implements AuditLogRepository {
   /** Internal append-only log. Never mutate directly. */
   private readonly log: AuditEntry[] = [];
 
+  /**
+   * Mutex guarding the critical section of `append`.
+   *
+   * The critical section is fully synchronous (no `await`), so in practice the
+   * event loop cannot interleave it. We keep the flag anyway as an explicit
+   * re-entrancy guard: if a callback ever invokes `append` from within the
+   * critical section (e.g. via a metadata getter or a future async extension),
+   * we throw instead of forking the chain.
+   */
   private _appendGuard = false;
 
   append(input: CreateAuditEntryInput): AuditEntry {
@@ -70,7 +91,7 @@ export class AuditStore implements AuditLogRepository {
     this._appendGuard = true;
     try {
       const previousHash =
-        this.log.length === 0 ? GENESIS_HASH : this.log[this.log.length - 1].hash;
+        this.log.length === 0 ? GENESIS_HASH: this.log[this.log.length - 1].hash;
 
       const partial: Omit<AuditEntry, 'hash'> = {
         id: randomUUID(),
@@ -152,39 +173,19 @@ export class AuditStore implements AuditLogRepository {
   /**
    * Queries the log with cursor-based pagination.
    *
+   * The cursor is validated against the current log and the supplied filters:
+   * - A malformed or undecodable cursor throws.
+   * - A cursor whose filters do not match the query throws (filter drift).
+   * - A well-formed cursor whose `cursor.lastId` no longer exists in the
+   *   filtered view throws, rather than silently restarting from the beginning.
+   *   Silent restarts would produce duplicate or skipped rows under concurrency.
+   *
    * @param query - Filter and pagination options including cursor.
    * @returns Paginated result with entries and next cursor.
    */
   queryWithCursor(query: AuditQuery = {}): AuditQueryResult {
     const limit = Math.min(Math.max(query.limit ?? 50, 1), 100);
-    
-    let startIndex = 0;
-    
-    // Decode cursor if provided
-    if (query.cursor) {
-      try {
-        const cursorData: CursorData = decodeCursor(query.cursor);
-        
-        // Find the index of the last entry from the previous page
-        const found = this.log.findIndex(e => e.id === cursorData.lastId);
-        startIndex = found !== -1 ? found + 1 : 0;
-        
-        // Verify filters match cursor (prevent filter drift)
-        if (cursorData.filters.action !== query.action ||
-            cursorData.filters.severity !== query.severity ||
-            cursorData.filters.actor !== query.actor ||
-            cursorData.filters.resource !== query.resource ||
-            cursorData.filters.resourceId !== query.resourceId ||
-            cursorData.filters.from !== query.from ||
-            cursorData.filters.to !== query.to) {
-          throw new Error('Cursor filters do not match query filters');
-        }
-      } catch {
-        // If cursor is invalid, start from beginning
-        startIndex = 0;
-      }
-    }
-    
+
     const filtered = this.log.filter((entry) => {
       if (query.action && entry.action !== query.action) return false;
       if (query.severity && entry.severity !== query.severity) return false;
@@ -195,10 +196,39 @@ export class AuditStore implements AuditLogRepository {
       if (query.to && entry.timestamp > query.to) return false;
       return true;
     });
-    
+
+    let startIndex = 0;
+
+    // Decode cursor if provided.
+    if (query.cursor) {
+      const cursorData: CursorData = decodeCursor(query.cursor);
+
+      // Verify filters match the cursor (prevent filter drift).
+      if (
+        cursorData.filters.action !== query.action ||
+        cursorData.filters.severity !== query.severity ||
+        cursorData.filters.actor !== query.actor ||
+        cursorData.filters.resource !== query.resource ||
+        cursorData.filters.resourceId !== query.resourceId ||
+        cursorData.filters.from !== query.from ||
+        cursorData.filters.to !== query.to
+      ) {
+        throw new Error('Cursor filters do not match query filters');
+      }
+
+      // Find the index of the last entry from the previous page within the
+      // filtered view. If it is gone (e.g. evicted or the filter set no
+      // longer matches), the cursor is stale and we must fail closed.
+      const found = filtered.findIndex((e) => e.id === cursorData.lastId);
+      if (found === -1) {
+        throw new Error('Cursor is stale: lastId not found in current log');
+      }
+      startIndex = found + 1;
+    }
+
     const entries = filtered.slice(startIndex, startIndex + limit);
-    
-    // Generate next cursor if there are more results
+
+    // Generate next cursor if there are more results.
     let nextCursor: string | undefined;
     if (startIndex + limit < filtered.length && entries.length > 0) {
       const lastEntry = entries[entries.length - 1];
@@ -217,7 +247,7 @@ export class AuditStore implements AuditLogRepository {
       };
       nextCursor = encodeCursor(cursorData);
     }
-    
+
     return {
       entries,
       count: entries.length,

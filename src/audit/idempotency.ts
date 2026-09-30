@@ -27,6 +27,20 @@ function hashBody(input: CreateAuditEntryInput): string {
   return createHash('sha256').update(payload, 'utf8').digest('hex');
 }
 
+/**
+ * In-memory idempotency store.
+ *
+ * Concurrency / idempotency invariants:
+ * - `set` is monotonic for a given key: once a key is bound to a response, a
+ *   subsequent `set` with the same key must not overwrite it. This prevents a
+ *   concurrent retry from claiming the key with a different body and returning
+ *   an inconsistent response to the original caller.
+ * - `setIfAbsent` returns the existing record when the key is already bound,
+ *   allowing callers to detect and surface body mismatches (409-style conflict)
+ *   without losing the original response.
+ * - Eviction is bounded and deterministic: expired entries are removed first,
+ *   then the oldest insertion order entry is evicted when atthe capacity limit.
+ */
 export class IdempotencyStore {
   private readonly store = new Map<string, IdempotencyRecord>();
   private readonly maxSize: number;
@@ -51,7 +65,16 @@ export class IdempotencyStore {
     return record;
   }
 
-  set(key: string, input: CreateAuditEntryInput, response: AuditEntry): void {
+  /**
+   * Binds a key to a response. If the key is already bound to a live record,
+   * the existing record is returned and nothing is overwritten.
+   */
+  set(key: string, input: CreateAuditEntryInput, response: AuditEntry): IdempotencyRecord {
+    const existing = this.get(key);
+    if (existing) {
+      return existing;
+    }
+
     this.evictExpired();
 
     if (this.store.size >= this.maxSize) {
@@ -61,11 +84,22 @@ export class IdempotencyStore {
       }
     }
 
-    this.store.set(key, {
+    const record: IdempotencyRecord = {
       bodyHash: hashBody(input),
       response,
       createdAt: Date.now(),
-    });
+    };
+    this.store.set(key, record);
+    return record;
+  }
+
+  /**
+   * Atomic alias for `set` that makes the idempotent semantics explicit at
+   * call sites: if the key is already bound, the existing record is returned
+   * and the caller must not persist the new response.
+   */
+  setIfAbsent(key: string, input: CreateAuditEntryInput, response: AuditEntry): IdempotencyRecord {
+    return this.set(key, input, response);
   }
 
   delete(key: string): void {

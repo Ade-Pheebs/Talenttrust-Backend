@@ -48,6 +48,9 @@ import Database, { Database as DbInstance } from '../db/betterSqlite3';
 import { SqliteAuditRepository } from './sqliteRepository';
 import type { CreateAuditEntryInput } from './types';
 import { encodeCursor, decodeCursor, type CursorData } from './types';
+import { mkdtempSync, rmSync } from 'fs';
+import { tmpdir } from 'os';
+import path from 'path';
 
 // ─── Fixtures ───────────────────────────────────────────────────────────────
 
@@ -268,6 +271,62 @@ describe('SqliteAuditRepository — append() surfaces write failures (transactio
     }
     expect(caughtMessage).not.toBeNull();
     expect(requestContinued).toBe(true);
+  });
+});
+
+describe('SqliteAuditRepository — shared database concurrency', () => {
+  it('extends one hash chain across repository connections to the same file', () => {
+    const directory = mkdtempSync(path.join(tmpdir(), 'audit-concurrency-'));
+    const dbPath = path.join(directory, 'audit.sqlite');
+    const firstDb = new Database(dbPath);
+    const secondDb = new Database(dbPath);
+    try {
+      const firstRepository = new SqliteAuditRepository(firstDb);
+      const secondRepository = new SqliteAuditRepository(secondDb);
+
+      firstRepository.append(makeInput({ actor: 'connection-1' }));
+      secondRepository.append(makeInput({ actor: 'connection-2' }));
+      firstRepository.append(makeInput({ actor: 'connection-1' }));
+
+      expect(firstRepository.count()).toBe(3);
+      expect(firstRepository.verifyIntegrity()).toMatchObject({ valid: true, totalEntries: 3 });
+    } finally {
+      firstDb.close();
+      secondDb.close();
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  it('surfaces writer-lock contention without a partial row, then allows a retry', () => {
+    const directory = mkdtempSync(path.join(tmpdir(), 'audit-lock-'));
+    const dbPath = path.join(directory, 'audit.sqlite');
+    const lockDb = new Database(dbPath);
+    const appendDb = new Database(dbPath);
+    try {
+      const repository = new SqliteAuditRepository(appendDb);
+      const lockTransaction = lockDb.transaction(() => undefined);
+      const immediate = (lockTransaction as unknown as { immediate?: () => void }).immediate;
+
+      // The fallback test database has no transaction lock semantics.
+      if (typeof immediate !== 'function') return;
+
+      appendDb.pragma('busy_timeout = 0');
+      lockDb.exec('BEGIN IMMEDIATE');
+      try {
+        expect(() => repository.append(makeInput({ actor: 'blocked' }))).toThrow();
+      } finally {
+        lockDb.exec('ROLLBACK');
+      }
+
+      expect(repository.count()).toBe(0);
+      const retried = repository.append(makeInput({ actor: 'retry' }));
+      expect(repository.getById(retried.id)?.actor).toBe('retry');
+      expect(repository.verifyIntegrity()).toMatchObject({ valid: true, totalEntries: 1 });
+    } finally {
+      lockDb.close();
+      appendDb.close();
+      rmSync(directory, { recursive: true, force: true });
+    }
   });
 });
 

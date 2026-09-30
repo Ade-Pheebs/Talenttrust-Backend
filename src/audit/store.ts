@@ -1,3 +1,4 @@
+/* eslint-disable no-restricted-syntax */
 /**
  * @module audit/store
  * @description Append-only, tamper-evident in-memory audit log store.

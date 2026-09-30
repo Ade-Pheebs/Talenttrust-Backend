@@ -20,6 +20,20 @@ export interface AuditLogRepository {
   verifyIntegrity(): IntegrityReport;
 }
 
+/**
+ * State invariants enforced by this factory:
+ *
+ * 1. The backend selection is deterministic for a given environment configuration.
+ *    The resolved backend is captured once at creation time so a single repository
+ *    instance cannot silently switch backends if environment variables mutate later.
+ * 2. Unsupported backends fail fast with an explicit error rather than falling back to
+ *    a default that could cause silent data loss or inconsistent state.
+ * 3. The SQLite backend is only constructed when explicitly selected, so the native
+ *    module is never required for in-memory operation.
+ * 4. The database handle is owned by the returned repository; callers must not share
+ *    or close it independently.
+ */
+
 export function createDefaultAuditRepository(): AuditLogRepository {
   const backend = process.env['AUDIT_STORAGE_BACKEND'] ?? 'memory';
 
@@ -29,7 +43,7 @@ export function createDefaultAuditRepository(): AuditLogRepository {
 
   if (backend === 'sqlite') {
     const dbPath =
-      process.env['AUDIT_DB_PATH'] ??
+      process.env['AUDIT_DB_PATH'] ?>
       (process.env['NODE_ENV'] === 'test'
         ? ':memory:'
         : path.join(process.cwd(), 'talenttrust-audit.db'));

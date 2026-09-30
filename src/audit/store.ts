@@ -47,6 +47,43 @@ export function computeEntryHash(
 }
 
 /**
+ * Validates a CreateAuditEntryInput before it is accepted into the log.
+ *
+ * Invariants enforced here (all must hold for every appended entry):
+ * - `action`, `severity`, `actor`, `resource`, `resourceId` are non-empty strings.
+ * - `metadata` is a plain object (not null/array) so it can be safely frozen.
+ * - Optional `ipAddress` / `correlationId`, when present, are non-empty strings.
+ *
+ * Throwing here keeps the store append-only and prevents partially-formed
+ * entries from ever entering the hash chain (which would otherwise make
+ * verifyIntegrity() report a false positive on a valid chain).
+ */
+function assertValidInput(input: CreateAuditEntryInput): void {
+  const required: Array<keyof CreateAuditEntryInput> = [
+    'action',
+    'severity',
+    'actor',
+    'resource',
+    'resourceId',
+  ];
+  for (const key of required) {
+    const value = input[key];
+    if (typeof value !== 'string' || value.length === 0) {
+      throw new Error(`AuditStore.append: "${key}" must be a non-empty string`);
+    }
+  }
+  if (input.metadata === null || typeof input.metadata !== 'object' || Array.isArray(input.metadata)) {
+    throw new Error('AuditStore.append: "metadata" must be a plain object');
+  }
+  if (input.ipAddress !== undefined && (typeof input.ipAddress !== 'string' || input.ipAddress.length === 0)) {
+    throw new Error('AuditStore.append: "ipAddress" must be a non-empty string when provided');
+  }
+  if (input.correlationId !== undefined && (typeof input.correlationId !== 'string' || input.correlationId.length === 0)) {
+    throw new Error('AuditStore.append: "correlationId" must be a non-empty string when provided');
+  }
+}
+
+/**
  * AuditStore — append-only, hash-chained audit log.
  *
  * @example
@@ -69,6 +106,8 @@ export class AuditStore implements AuditLogRepository {
 
     this._appendGuard = true;
     try {
+      assertValidInput(input);
+
       const previousHash =
         this.log.length === 0 ? GENESIS_HASH : this.log[this.log.length - 1].hash;
 
@@ -92,6 +131,7 @@ export class AuditStore implements AuditLogRepository {
       });
 
       this.log.push(entry);
+      Object.freeze(this.log);
       return entry;
     } finally {
       this._appendGuard = false;
@@ -180,8 +220,9 @@ export class AuditStore implements AuditLogRepository {
           throw new Error('Cursor filters do not match query filters');
         }
       } catch {
-        // If cursor is invalid, start from beginning
-        startIndex = 0;
+        // If cursor is invalid or filters mismatch, reject rather than silently
+        // returning a different page (prevents silent data loss / pagination drift).
+        throw new Error('AuditStore.queryWithCursor: invalid or mismatched cursor');
       }
     }
     

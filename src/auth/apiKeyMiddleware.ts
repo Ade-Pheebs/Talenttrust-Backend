@@ -14,6 +14,17 @@
  *   - Checks for expired keys
  *   - Responds with 401 for missing/invalid keys
  *   - Responds with 403 for insufficient scope
+ *
+ * State invariants owned by this module:
+ *   1. A request is either unauthenticated or authenticated with exactly
+ *      one credential type (`$req.user` or `$req.apiKey`), never both.
+ *   2. `$req.apiKey` is only ever set after a successful validation
+ *      and is never left stale from a prior middleware in the same chain.
+ *   3. Scope enforcement is fail-closed: any non-match results in
+ *      403 and never invokes ``$next()``.
+ *   4. Authentication failures are not observable to callers (401 for all
+ *      invalid-unknown-expired-deactivated cases) to prevent key enumeration.
+ *   5. `$next()`` is invoked at most once per middleware invocation.
  */
 
 import { Request, Response, NextFunction } from 'express';
@@ -25,6 +36,32 @@ export interface ApiKeyAuthenticatedRequest extends Request {
   apiKey?: ApiKeyInfo;
 }
 
+/** Maximum accepted length of an `X-API-Key` header value. */
+const MAX_API_KEY_LENGTH = 512;
+
+/** Regex describing a single scope token accepted by this module. */
+const SCOPE_TOKEN_RE = /^[A-Za-z0-9_.*-]+$/;
+
+/**
+ * Normalize the raw `x-api-key` header value into a single trimmed
+ * string, or ``null`` when no usable credential is present.
+ *
+ * Express may give us `string`, `string[]`, or `undefined`. A multi-value
+ * header is ambiguous and must not be silently collapsed into one of its
+ * values, so we reject it as missing. This is deterministic and avoids a
+ * class of header-smuggling bugs.
+ */
+function extractApiKeyHeader(value: unknown): string | null {
+  if (typeof value !== 'string') {
+    return null;
+  }
+  const trimmed = value.trim();
+  if (trimmed.length === 0 || trimmed.length > MAX_API_KEY_LENGTH) {
+    return null;
+  }
+  return trimmed;
+}
+
 /**
  * Express middleware that extracts and validates the API key from the
  * `X-API-Key` request header.
@@ -33,12 +70,17 @@ export interface ApiKeyAuthenticatedRequest extends Request {
  * delegates to `next()`.
  *
  * Error paths (never leak internal detail):
- * - **401** — `X-API-Key` header is absent.
+ * - **401** — `X-API-Key` header is absent, empty, multi-valued, or overly
+ *   long.
  * - **401** — Header is present but `validateApiKey` returns `null`
  *   (unknown key, wrong hash, expired, or deactivated).
  * - **500** — `validateApiKey` rejects unexpectedly (e.g. database error).
  *   The raw error is written to `console.error` only; the response body
  *   contains only `{ error: 'Internal server error' }`.
+ *
+ * Invariants:
+ * - `req.apiKey` is never mutated on a failure path.
+ * - `next()` is invoked exactly once on success and never on failure.
  *
  * @param req  - Express request (extended with optional `apiKey` field).
  * @param res  - Express response.
@@ -49,7 +91,12 @@ export function authenticateApiKey(
   res: Response,
   next: NextFunction,
 ): void {
-  const apiKey = req.headers['x-api-key'] as string;
+  // Invariant 2: clear any stale credential from a prior middleware run.
+  // This guarantees a failure cannot leave a previously-authenticated
+  // request looking authenticated.
+  req.apiKey = undefined;
+
+  const apiKey = extractApiKeyHeader(req.headers['x-api-key']);
 
   if (!apiKey) {
     res.status(401).json({ error: 'Missing X-API-Key header' });
@@ -63,18 +110,21 @@ export function authenticateApiKey(
         return;
       }
 
+      // Invariant 1 & 2: attach the validated key only after success.
       req.apiKey = keyInfo;
       next();
     })
     .catch(err => {
       // eslint-disable-next-line no-console
       console.error('API key validation error:', err);
+      // Invariant 2: failure must not leave a credential attached.
+      req.apiKey = undefined;
       res.status(500).json({ error: 'Internal server error' });
     });
 }
 
 /**
- * Factory that returns Express middleware enforcing a specific API key scope.
+ * Returns `true` if `scope` satisfies the `resource:action` requirement.
  *
  * Scope matching rules (evaluated in order):
  * 1. **Exact match** — e.g. `contracts:read` satisfies `contracts:read`.
@@ -82,45 +132,72 @@ export function authenticateApiKey(
  * 3. **Wildcard resource** — e.g. `*:read` satisfies `contracts:read`.
  * 4. **Full wildcard** — `*` satisfies any scope.
  *
+ * The match is strict and deterministic: the comparison is byte-exact and
+ * the components are never interpreted as regex or path globs. A scope token
+ * that does not match the allowed character set is rejected rather than
+ * being treated as a wildcard.
+ */
+export function scopeSatisfies(
+  scope: string,
+  resource: string,
+  action: string,
+): boolean {
+  if (typeof scope !== 'string' || !SCOPE_TOKEN_RE.test(scope)) {
+    return false;
+  }
+
+  const requiredScope = `${resource}:${action}`;
+
+  // Exact match
+  if (scope === requiredScope) return true;
+
+  // Full wildcard
+  if (scope === '*') return true;
+
+  // Wildcard action (e.g. "contracts:*")
+  if (scope.endsWith(':*') && scope.slice(0, -2) === resource) return true;
+
+  // Wildcard resource (e.g. "*:read")
+  if (scope.startsWith('*:') && scope.slice(2) === action) return true;
+
+  return false;
+}
+
+/**
+ * Factory that returns Express middleware enforcing a specific API key scope.
+ *
  * Error paths:
  * - **401** — `req.apiKey` is not set (caller skipped `authenticateApiKey`).
  * - **403** — Key is present but none of its scopes match the requirement.
  *   The response includes `required` and `provided` for debugging by the
  *   key owner; no internal implementation detail is exposed.
  *
+ * Invariants:
+ * - Fail-closed: any non-match results in 403 and never calls `next()`.
+ * - The required scope is computed once at factory creation time and is
+ *   not influenced by request data.
+ *
  * @param resource - The resource being accessed (e.g. `'contracts'`).
  * @param action   - The action being performed (e.g. `'read'`).
  * @returns Express middleware function.
  */
 export function requireApiKeyScope(resource: string, action: string) {
+  const requiredScope = `${resource}:${action}`;
+
   return (req: ApiKeyAuthenticatedRequest, res: Response, next: NextFunction): void => {
     if (!req.apiKey) {
       res.status(401).json({ error: 'Not authenticated with API key' });
       return;
     }
 
-    const requiredScope = `${resource}:${action}`;
-    const hasScope = req.apiKey.scope.some(scope => {
-      // Exact match
-      if (scope === requiredScope) return true;
-      
-      // Wildcard action (e.g., "contracts:*")
-      if (scope.endsWith(':*') && scope.startsWith(`${resource}:`)) return true;
-      
-      // Wildcard resource (e.g., "*:read")
-      if (scope.startsWith('*:') && scope.endsWith(`:${action}`)) return true;
-      
-      // Full wildcard
-      if (scope === '*') return true;
-      
-      return false;
-    });
+    const scopes = Array.isArray(req.apiKey.scope) ? req.apiKey.scope : [];
+    const hasScope = scopes.some(scope => scopeSatisfies(scope, resource, action));
 
     if (!hasScope) {
-      res.status(403).json({ 
+      res.status(403).json({
         error: 'Forbidden: insufficient API key scope',
         required: requiredScope,
-        provided: req.apiKey.scope
+        provided: scopes,
       });
       return;
     }
@@ -143,6 +220,13 @@ export function requireApiKeyScope(resource: string, action: string) {
  * Use this on endpoints that must be accessible by both human users (JWT) and
  * automated internal services (API key).
  *
+ * Invariants:
+ * - At most one credential type is attached to the request as a result of
+ *   this middleware. When the JWT path is taken, `req.apiKey` is cleared so a
+ *   stale API key from an earlier middleware cannot bypass scope checks.
+ * - A malformed `Authorization` header (e.g. `Bearer` with no token) is
+ *   treated as absent and falls through to the API key path or 401.
+ *
  * @param req  - Express request supporting both `user` and `apiKey` fields.
  * @param res  - Express response.
  * @param next - Called by the delegated middleware on success.
@@ -154,19 +238,24 @@ export function authenticateEither(
 ): void {
   // Check for JWT token first
   const authHeader = req.headers.authorization;
-  if (authHeader && authHeader.startsWith('Bearer ')) {
-    // Let the existing JWT middleware handle this
-    return authenticateMiddleware(req, res, next);
+  if (typeof authHeader === 'string' && authHeader.startsWith('Bearer ')) {
+    const token = authHeader.slice('Bearer '.length).trim();
+    if (token.length > 0) {
+      // Invariant 1: the JWT path must not carry an API key credential.
+      req.apiKey = undefined;
+      // Let the existing JWT middleware handle this
+      return authenticateMiddleware(req, res, next);
+    }
   }
 
   // Check for API key
-  const apiKey = req.headers['x-api-key'] as string;
+  const apiKey = extractApiKeyHeader(req.headers['x-api-key']);
   if (apiKey) {
     return authenticateApiKey(req as ApiKeyAuthenticatedRequest, res, next);
   }
 
   // Neither authentication method found
-  res.status(401).json({ 
-    error: 'Authentication required. Provide either Authorization: Bearer <token> or X-API-Key header' 
+  res.status(401).json({
+    error: 'Authentication required. Provide either Authorization: Bearer <token> or X-API-Key header',
   });
 }

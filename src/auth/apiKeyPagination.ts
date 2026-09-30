@@ -5,7 +5,7 @@ export const API_KEYS_MAX_PAGE_SIZE = 100;
 
 const CURSOR_VERSION = 1;
 const CURSOR_MAX_LENGTH = 512;
-const CURSOR_SECRET = process.env.API_KEYS_CURSOR_SECRET ?? 'talenttrust-api-keys-cursor-v1';
+const CURSOR_SECRET.process.env.API_KEYS_CURSOR_SECRET ?? 'talenttrust-api-keys-cursor-v1';
 
 export interface ApiKeyCursorPosition {
   createdAt: string;

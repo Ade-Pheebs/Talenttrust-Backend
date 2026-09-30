@@ -7,6 +7,7 @@
  * - Initialize the DLQ store (in-memory or Redis-backed).
  * - Start the DLQ metrics sampling loop.
  * - Expose authenticated endpoints for idempotent DLQ message replay.
+ * - Preserve compatibility contracts for the public store and router surface.
  *
  * ## Configuration (environment variables)
  * | Variable                  | Default | Description                                    |
@@ -333,3 +334,5 @@ router.post(
 );
 
 export { router as jobsRouter };
+export type { ReplayableDlqItem as DlqItem, ReplayableDlqStore as DlqStore };
+export const __compat = { MAX_CONTEXT_FIELD_LENGTH } as const;

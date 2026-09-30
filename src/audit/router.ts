@@ -33,11 +33,14 @@ import { mapZodErrorToDetails, type ValidationErrorResponse } from '../middlewar
 import { idempotencyMiddleware } from '../middleware/idempotency';
 import { validateRequest } from '../middleware/validate.middleware';
 
+export const MAX_BULK_AUDIT_ITEMS = 100;
+
 export interface AuditRouterOptions {
   service?: AuditService;
   exportService?: AuditExportService;
   accessMiddleware?: RequestHandler[];
   exportMiddleware?: RequestHandler[];
+  bulkMiddleware?: RequestHandler[];
   /**
    * Middleware applied only to `GET /integrity`, in addition to
    * `accessMiddleware`. Verifying the hash chain walks the entire audit
@@ -60,6 +63,34 @@ function buildValidationErrorResponse(requestId: string, error: ZodError): Valid
 
 function getRequestId(res: Response): string {
   return typeof res.locals['requestId'] === 'string' ? res.locals['requestId'] : 'unknown';
+}
+
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+function summarizeAuditItemValidationError(error: ZodError): string {
+  const issues = error.issues;
+  const missingFields = issues
+    .filter((issue) => issue.code === 'invalid_type' && issue.received === 'undefined')
+    .map((issue) => String(issue.path[0] ?? 'field'));
+
+  if (missingFields.length > 0) {
+    return `Missing required fields: ${[...new Set(missingFields)].join(', ')}`;
+  }
+
+  const firstIssue = issues[0];
+  const field = typeof firstIssue?.path[0] === 'string' ? firstIssue.path[0] : undefined;
+
+  if (firstIssue?.code === 'invalid_enum_value' && field) {
+    return `Invalid ${field}`;
+  }
+
+  if (firstIssue?.message) {
+    return firstIssue.message;
+  }
+
+  return 'Invalid audit entry payload';
 }
 
 /**
@@ -137,6 +168,68 @@ export function createAuditRouter(options: AuditRouterOptions = {}): Router {
         const status = message.startsWith('Missing required fields:') ? 400 : 500;
         res.status(status).json({ error: message });
       }
+    },
+  );
+
+  /**
+   * POST /api/v1/audit/bulk
+   *
+   * State invariant: the request body is validated as a whole before any write,
+   * and each item is processed independently. A failed item never corrupts the
+   * append-only hash chain or discards valid siblings from the same batch.
+   */
+  router.post(
+    '/bulk',
+    idempotencyMiddleware,
+    ...accessMiddleware,
+    ...bulkMiddleware,
+    (req: Request, res: Response): void => {
+      const envelope = z.object({
+        entries: z.array(z.unknown()).min(1).max(MAX_BULK_AUDIT_ITEMS),
+      }).safeParse(req.body);
+
+      if (!envelope.success) {
+        res.status(400).json(buildValidationErrorResponse(getRequestId(res), envelope.error));
+        return;
+      }
+
+      const results: Array<{ index: number; success: boolean; entry?: unknown; error?: string }> = [];
+
+      for (let index = 0; index < envelope.data.entries.length; index += 1) {
+        const item = envelope.data.entries[index];
+
+        if (!isPlainObject(item)) {
+          results.push({ index, success: false, error: 'Item must be an object' });
+          continue;
+        }
+
+        const parseResult = createAuditEntryBodySchema.safeParse(item);
+        if (!parseResult.success) {
+          results.push({
+            index,
+            success: false,
+            error: summarizeAuditItemValidationError(parseResult.error),
+          });
+          continue;
+        }
+
+        try {
+          const entry = service.log(parseResult.data);
+          results.push({ index, success: true, entry });
+        } catch (error) {
+          results.push({ index, success: false, error: (error as Error).message });
+        }
+      }
+
+      const succeeded = results.filter((result) => result.success).length;
+      const failed = results.length - succeeded;
+
+      if (failed === 0) {
+        res.status(201).json({ results, succeeded, failed });
+        return;
+      }
+
+      res.status(207).json({ results, succeeded, failed });
     },
   );
 

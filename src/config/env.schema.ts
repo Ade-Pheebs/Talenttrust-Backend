@@ -1,5 +1,6 @@
 import { z } from 'zod';
 import { isSafeUrl } from '../utils/ssrf';
+import { parseFinalityDepths } from '../finality/policy';
 
 
 /**
@@ -23,12 +24,25 @@ export const envSchema = z.object({
     .default('development'),
 
   // API Configuration
-  API_BASE_URL: z.string().url().refine(val => {
-    if (process.env.SSRF_ALLOW_PRIVATE_HOSTS === 'true') return true;
-    return isSafeUrl(val);
-  }, {
+  API_BASE_URL: z.string().url().refine(val => isSafeUrl(val), {
     message: "API_BASE_URL must be a public URL and cannot point to internal resources (SSRF protection)"
   }).optional(),
+
+  /**
+   * Explicit SSRF private-host bypass. Default off.
+   * Rejected outright when NODE_ENV==='production' (see superRefine below).
+   * Only honoured by isSafeUrl when NODE_ENV is development|test|staging.
+   */
+  SSRF_ALLOW_PRIVATE_HOSTS: z.string()
+    .optional()
+    .transform((val) => {
+      if (val === undefined || val.trim() === '') return false;
+      const lower = val.trim().toLowerCase();
+      if (lower === 'true' || lower === '1') return true;
+      if (lower === 'false' || lower === '0') return false;
+      return false;
+    })
+    .pipe(z.boolean()),
 
 
   DEBUG: z.string()
@@ -76,10 +90,7 @@ export const envSchema = z.object({
 
   // Stellar/Soroban Configuration
   STELLAR_HORIZON_URL: z.string().url()
-    .refine(val => {
-      if (process.env.SSRF_ALLOW_PRIVATE_HOSTS === 'true') return true;
-      return isSafeUrl(val);
-    }, {
+    .refine(val => isSafeUrl(val), {
       message: "STELLAR_HORIZON_URL must be a public URL and cannot point to internal resources (SSRF protection)"
     })
     .default('https://horizon-testnet.stellar.org'),
@@ -89,10 +100,7 @@ export const envSchema = z.object({
     .default('Test SDF Network ; September 2015'),
 
   SOROBAN_RPC_URL: z.string().url()
-    .refine(val => {
-      if (process.env.SSRF_ALLOW_PRIVATE_HOSTS === 'true') return true;
-      return isSafeUrl(val);
-    }, {
+    .refine(val => isSafeUrl(val), {
       message: "SOROBAN_RPC_URL must be a public URL and cannot point to internal resources (SSRF protection)"
     })
     .default('https://soroban-testnet.stellar.org'),
@@ -101,10 +109,7 @@ export const envSchema = z.object({
   SOROBAN_CONTRACT_ID: z.string().optional(),
 
   STELLAR_RPC_URL: z.string().url()
-    .refine(val => {
-      if (process.env.SSRF_ALLOW_PRIVATE_HOSTS === 'true') return true;
-      return isSafeUrl(val);
-    }, {
+    .refine(val => isSafeUrl(val), {
       message: "STELLAR_RPC_URL must be a public URL and cannot point to internal resources (SSRF protection)"
     })
     .default('https://rpc-testnet.stellar.org'),
@@ -178,6 +183,11 @@ export const envSchema = z.object({
     .default('10000')
     .transform((val) => parseInt(val, 10))
     .pipe(z.number().int().min(100).max(120_000)),
+
+  WEBHOOK_MAX_PAYLOAD_SIZE_BYTES: z.string()
+    .default('1048576')
+    .transform((val) => parseInt(val, 10))
+    .pipe(z.number().int().min(1024).max(10485760)),
 
   IDEMPOTENCY_TTL_MS: z.string()
     .optional()
@@ -323,6 +333,22 @@ export const envSchema = z.object({
 
   SENDGRID_API_KEY: z.string().optional(),
 
+  // ── Webhooks Feature Flag ───────────────────────────────────────────────────
+  /**
+   * WEBHOOKS_ENABLED — master switch for the webhooks subsystem.
+   *
+   * When `false`:
+   *  - `WebhookService.trigger()` is a no-op and returns immediately without
+   *    delivering any events or touching subscriptions.
+   *  - The `/api/v1/webhook-subscriptions` router is not mounted on the
+   *    Express app and all subscription endpoints return `404`.
+   *
+   * Default: `true` (webhooks are on unless explicitly disabled).
+   */
+  WEBHOOKS_ENABLED: z.string()
+    .optional()
+    .transform((val) => val !== 'false'),
+
   // ── Audit Feature Flag ──────────────────────────────────────────────────────
   /**
    * AUDIT_ENABLED — master switch for the audit subsystem.
@@ -339,6 +365,50 @@ export const envSchema = z.object({
   AUDIT_ENABLED: z.string()
     .optional()
     .transform((val) => val !== 'false'),
+
+  // ── Blockchain Finality Configuration ───────────────────────────────────────
+  /**
+   * FINALITY_DEPTHS — per-network confirmation depth, comma-separated
+   * `network=depth` pairs (e.g. `stellar=1,soroban=2`). Depth is the
+   * number of confirmations an event must accumulate before it is
+   * exposed through public reads. A depth of `0` enables
+   * zero-confirmation for that network (only honoured outside
+   * production unless FINALITY_ALLOW_ZERO_CONFIRMATION is explicit).
+   *
+   * Default: `stellar=1,soroban=1`.
+   */
+  FINALITY_DEPTHS: z.string()
+    .default('stellar=1,soroban=1')
+    .transform((val) => parseFinalityDepths(val)),
+
+  /**
+   * FINALITY_DEFAULT_DEPTH — confirmation depth applied to networks
+   * without an explicit FINALITY_DEPTHS entry. Conservative (fail-closed)
+   * so an unconfigured network is never exposed early.
+   *
+   * Default: `6`.
+   */
+  FINALITY_DEFAULT_DEPTH: z.string()
+    .default('6')
+    .transform((val) => parseInt(val, 10))
+    .pipe(z.number().int().nonnegative('FINALITY_DEFAULT_DEPTH must be a non-negative integer').max(1000)),
+
+  /**
+   * FINALITY_ALLOW_ZERO_CONFIRMATION — when `true`, a configured depth
+   * of `0` is honoured (zero-confirmation). When `false`, depth `0` is
+   * clamped to `1`. When unset, zero-confirmation is permitted in
+   * development/test/staging and forbidden in production.
+   */
+  FINALITY_ALLOW_ZERO_CONFIRMATION: z.string()
+    .optional()
+    .transform((val) => {
+      if (val === undefined || val.trim() === '') return undefined;
+      const lower = val.trim().toLowerCase();
+      if (lower === 'true' || lower === '1') return true;
+      if (lower === 'false' || lower === '0') return false;
+      return undefined;
+    })
+    .pipe(z.boolean().optional()),
 
 }).superRefine((obj, ctx) => {
   const requireForEmailProvider = (field: keyof typeof obj, message: string): void => {
@@ -362,6 +432,14 @@ export const envSchema = z.object({
   }
 
   if (obj.NODE_ENV === 'production') {
+    if (obj.SSRF_ALLOW_PRIVATE_HOSTS === true) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['SSRF_ALLOW_PRIVATE_HOSTS'],
+        message:
+          'SSRF_ALLOW_PRIVATE_HOSTS must not be enabled in production; private hosts are always blocked',
+      });
+    }
     if (!obj.JWT_SECRET) {
       ctx.addIssue({
         code: z.ZodIssueCode.custom,

@@ -10,6 +10,9 @@ import type { NextFunction, Request, Response } from 'express';
 import { createApp, attachTerminalHandlers } from './app';
 import { AppError } from './errors/appError';
 import { JobType, JobPayload, QueueManager } from './queue';
+import { createJobQuarantineRouter } from './queue/job-quarantine.routes';
+import { createMilestoneDivergenceRouter } from './milestones/divergence/routes';
+import { milestoneDivergenceSchedulerService } from './milestones/divergence/scheduler';
 import { auditService } from './audit/service';
 import { createAuditRouter } from './audit/router';
 import { createRateLimiter } from './middleware/rateLimiter';
@@ -336,6 +339,25 @@ app.post(
   },
 );
 
+const QUARANTINE_DEFAULT_LIMIT = 50;
+const QUARANTINE_MAX_LIMIT = 100;
+
+// Quarantine inspection and replay (admin-only). Routed through its own
+// factory so the endpoints are integration-testable in isolation.
+app.use(
+  '/api/v1/jobs',
+  createJobQuarantineRouter({
+    queueManager,
+    defaultLimit: QUARANTINE_DEFAULT_LIMIT,
+    maxLimit: QUARANTINE_MAX_LIMIT,
+  }),
+);
+
+// Milestone divergence detection (issue #1213): admin-only reporting surface
+// for the bounded comparison job. Both routes require auth + admin role
+// (enforced inside the router factory).
+app.use('/api/v1/milestones/divergence', createMilestoneDivergenceRouter());
+
 app.get('/api/v1/jobs/:type/:jobId', async (req: Request, res: Response, next: NextFunction) => {
   try {
     const { type, jobId } = req.params;
@@ -362,6 +384,9 @@ attachTerminalHandlers(app);
 export { app };
 export default app;
 
+import { verifySchemaState } from './db/migrations';
+import { getDb } from './db/database';
+
 const isMainModule = false;
 const isJest = Boolean(process.env.JEST_WORKER_ID);
 const shouldBootstrapServer = (isMainModule && !isJest) || process.env.FORCE_START_INDEX === '1';
@@ -378,10 +403,17 @@ async function initializeQueues(): Promise<void> {
 async function startServer(): Promise<void> {
   const PORT = Number(process.env.PORT) || 3001;
   if (!isJest) {
+    verifySchemaState(getDb());
     await initializeQueues();
   }
 
   if (!isJest) {
+    // Optional periodic divergence scans; opt in via env var. The scan job is
+    // bounded, so a scheduled run never compares more than maxContracts.
+    if (process.env['MILESTONE_DIVERGENCE_SCAN_ENABLED'] === 'true') {
+      await milestoneDivergenceSchedulerService.start();
+    }
+
     const server = app.listen(PORT, () => {
       console.log(`TalentTrust API listening on http://localhost:${PORT}`);
     });

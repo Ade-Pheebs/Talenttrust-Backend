@@ -19,6 +19,7 @@ import type { AuditAction } from './types';
 import { decodeCursor } from './types';
 import { createDefaultAuditRepository, type AuditLogRepository } from './repository';
 import { auditExportService, AuditExportService, type AuditExportFilters, type AuditExportResult } from './exportService';
+import { AuditCache, type AuditCacheOptions } from './auditCache';
 
 export interface AuditServiceOptions {
   /** Cache options for audit read responses. */
@@ -29,8 +30,10 @@ export const VALID_ACTIONS = new Set<AuditAction>([
   'CONTRACT_CREATED', 'CONTRACT_UPDATED', 'CONTRACT_CANCELLED', 'CONTRACT_COMPLETED',
   'PAYMENT_INITIATED', 'PAYMENT_RELEASED', 'PAYMENT_DISPUTED',
   'REPUTATION_UPDATED',
+  'REPUTATION_CORRECTED',
   'USER_CREATED', 'USER_UPDATED', 'USER_DELETED',
   'AUTH_LOGIN', 'AUTH_LOGOUT', 'AUTH_FAILED',
+  'AUTH_LOCKOUT_TRIGGERED', 'AUTH_LOCKOUT_RELEASED',
   'ADMIN_ACTION',
   'ENDPOINT_ACCESS', 'ENDPOINT_MUTATION',
 ]);

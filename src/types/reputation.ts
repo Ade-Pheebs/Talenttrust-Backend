@@ -39,6 +39,7 @@ export interface UpdateReputationPayload {
   rating: number;
   comment?: string;
   jobCompleted?: boolean;
+  contextId?: string;
 }
 
 // ── Request DTOs ────────────────────────────────────────────────────────────
@@ -52,6 +53,29 @@ export interface CreateRatingBodyDTO {
   contextId: string;
   rating: number;
   comment?: string;
+}
+
+export interface CorrectReputationBodyDTO {
+  reason: string;
+  reference: string;
+  contextId: string;
+}
+
+export interface ReputationCorrectionEntry {
+  id: string;
+  targetId: string;
+  contextId: string;
+  reason: string;
+  reference: string;
+  beforeScore: number;
+  afterScore: number;
+  beforeWeighted: number;
+  afterWeighted: number;
+  beforeTotal: number;
+  afterTotal: number;
+  operatorId: string;
+  operatorRole: string;
+  createdAt: string;
 }
 
 // ── Response DTOs ────────────────────────────────────────────────────────────
@@ -118,5 +142,6 @@ export function createRatingBodyToPayload(dto: CreateRatingBodyDTO): UpdateReput
     reviewerId: dto.reviewerId,
     rating: dto.rating,
     comment: dto.comment,
+    contextId: dto.contextId,
   };
 }

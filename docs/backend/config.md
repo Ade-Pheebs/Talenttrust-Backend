@@ -32,6 +32,7 @@ Feature flags are boolean environment variables that toggle product behaviour at
 | Variable | Default | Description |
 |---|---|---|
 | `MILESTONES_ENABLED` | `true` | Enable or disable the milestones feature. When `false`, any `milestones` field in a request body is silently stripped before the service layer — no validation errors are raised and contracts are processed as if no milestones were provided. Set to `false` to disable the feature during a rollout pause. |
+| `WEBHOOKS_ENABLED` | `true` | Enable or disable the webhooks subsystem. When `false`, `WebhookService.trigger()` is a no-op (no subscriptions queried, no deliveries attempted, no DLQ writes) and the `/api/v1/webhook-subscriptions` router is not mounted (all endpoints return `404`). Omit the variable to keep webhooks enabled (safe default). |
 
 ### Toggling `MILESTONES_ENABLED`
 

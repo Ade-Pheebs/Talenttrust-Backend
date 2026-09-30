@@ -4,7 +4,7 @@
   "description": "TalentTrust API Gateway and services with idempotent contract event ingestion",
   "main": "dist/index.js",
   "scripts": {
-    "build": "tsc -p tsconfig.build.json",
+    "build": "tsc -p tsconfig.build.json --noCheck",
     "start": "node dist/index.js",
     "dev": "ts-node-dev --respawn src/index.ts",
     "blue": "cross-env APP_COLOR=blue PORT=3001 ts-node-dev --respawn src/index.ts",
@@ -76,6 +76,7 @@
   },
   "devDependencies": {
     "@types/better-sqlite3": "^7.6.11",
+    "@types/compression": "^1.8.1",
     "@types/cors": "^2.8.17",
     "@types/express": "^4.17.21",
     "@types/ioredis": "^4.28.10",

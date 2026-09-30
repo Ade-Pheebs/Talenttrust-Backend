@@ -560,7 +560,7 @@ export async function validateApiKey(apiKey: string): Promise<ApiKeyInfo | null>
   // Validate input format before any expensive operations
   try {
     validateApiKeyFormat(apiKey);
-  } catch (error) {
+  } catch {
     // Return null for invalid format instead of throwing
     // This maintains backward compatibility with existing callers
     return null;

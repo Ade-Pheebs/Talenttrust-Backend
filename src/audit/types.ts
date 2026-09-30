@@ -31,8 +31,34 @@ export type AuditAction =
   | 'DEPLOYMENT_PROMOTED'
   | 'DEPLOYMENT_ROLLED_BACK';
 
+/** Array of all valid AuditAction values for validation. */
+export const AUDIT_ACTIONS: readonly AuditAction[] = [
+  'CONTRACT_CREATED',
+  'CONTRACT_UPDATED',
+  'CONTRACT_CANCELLED',
+  'CONTRACT_COMPLETED',
+  'PAYMENT_INITIATED',
+  'PAYMENT_RELEASED',
+  'PAYMENT_DISPUTED',
+  'REPUTATION_UPDATED',
+  'USER_CREATED',
+  'USER_UPDATED',
+  'USER_DELETED',
+  'AUTH_LOGIN',
+  'AUTH_LOGOUT',
+  'AUTH_FAILED',
+  'ADMIN_ACTION',
+  'ENDPOINT_ACCESS',
+  'ENDPOINT_MUTATION',
+  'DEPLOYMENT_PROMOTED',
+  'DEPLOYMENT_ROLLED_BACK',
+] as const;
+
 /** Severity level of the audit event. */
 export type AuditSeverity = 'INFO' | 'WARNING' | 'CRITICAL';
+
+/** Array of all valid AuditSeverity values for validation. */
+export const AUDIT_SEVERITIES: readonly AuditSeverity[] = ['INFO', 'WARNING', 'CRITICAL'] as const;
 
 /**
  * An immutable audit log entry.
@@ -148,4 +174,330 @@ export function decodeCursor(cursor: string): CursorData {
   } catch (_error) {
     throw new Error('Invalid cursor format');
   }
+}
+
+// ─── Validation error types ───────────────────────────────────────────────────
+
+/**
+ * Validation error for audit repository operations.
+ * Provides structured error information for diagnostic purposes without exposing sensitive data.
+ */
+export class AuditValidationError extends Error {
+  constructor(
+    message: string,
+    public readonly field: string,
+    public readonly value: unknown,
+    public readonly constraint: string,
+  ) {
+    super(message);
+    this.name = 'AuditValidationError';
+  }
+}
+
+/**
+ * Result of a validation operation.
+ */
+export interface ValidationResult<T> {
+  valid: boolean;
+  data?: T;
+  error?: AuditValidationError;
+}
+
+// ─── Validation constants ─────────────────────────────────────────────────────
+
+/**
+ * Maximum length for string fields in audit entries.
+ * This prevents database errors and abuse while accommodating legitimate long values.
+ */
+export const MAX_STRING_LENGTH = 1000;
+
+/**
+ * Maximum length for metadata JSON string when serialized.
+ * This prevents excessively large metadata from causing performance issues.
+ */
+export const MAX_METADATA_LENGTH = 10000;
+
+/**
+ * Maximum limit for query results to prevent resource exhaustion.
+ */
+export const MAX_QUERY_LIMIT = 1000;
+
+/**
+ * Minimum limit for query results to prevent accidental zero-limit queries.
+ */
+export const MIN_QUERY_LIMIT = 1;
+
+// ─── Validation helpers ───────────────────────────────────────────────────────
+
+/**
+ * Validates that a string field is not empty and within length limits.
+ */
+export function validateStringField(
+  value: unknown,
+  fieldName: string,
+  maxLength: number = MAX_STRING_LENGTH,
+): ValidationResult<string> {
+  if (typeof value !== 'string') {
+    return {
+      valid: false,
+      error: new AuditValidationError(
+        `${fieldName} must be a string`,
+        fieldName,
+        value,
+        'type: string',
+      ),
+    };
+  }
+
+  if (value.length === 0) {
+    return {
+      valid: false,
+      error: new AuditValidationError(
+        `${fieldName} cannot be empty`,
+        fieldName,
+        value,
+        'minLength: 1',
+      ),
+    };
+  }
+
+  if (value.length > maxLength) {
+    return {
+      valid: false,
+      error: new AuditValidationError(
+        `${fieldName} exceeds maximum length of ${maxLength}`,
+        fieldName,
+        value.length,
+        `maxLength: ${maxLength}`,
+      ),
+    };
+  }
+
+  return { valid: true, data: value };
+}
+
+/**
+ * Validates that a value is a valid ISO-8601 timestamp.
+ */
+export function validateTimestamp(value: unknown, fieldName: string): ValidationResult<string> {
+  if (typeof value !== 'string') {
+    return {
+      valid: false,
+      error: new AuditValidationError(
+        `${fieldName} must be a string`,
+        fieldName,
+        value,
+        'type: string',
+      ),
+    };
+  }
+
+  // ISO-8601 regex (simplified but covers most common formats)
+  const iso8601Regex = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?(Z|[+-]\d{2}:\d{2})?$/;
+  if (!iso8601Regex.test(value)) {
+    return {
+      valid: false,
+      error: new AuditValidationError(
+        `${fieldName} must be a valid ISO-8601 timestamp`,
+        fieldName,
+        value,
+        'format: ISO-8601',
+      ),
+    };
+  }
+
+  // Verify it's a valid date
+  const date = new Date(value);
+  if (isNaN(date.getTime())) {
+    return {
+      valid: false,
+      error: new AuditValidationError(
+        `${fieldName} is not a valid date`,
+        fieldName,
+        value,
+        'valid date',
+      ),
+    };
+  }
+
+  return { valid: true, data: value };
+}
+
+/**
+ * Validates that a value is one of the allowed enum values.
+ */
+export function validateEnum<T extends string>(
+  value: unknown,
+  fieldName: string,
+  allowedValues: readonly T[],
+): ValidationResult<T> {
+  if (typeof value !== 'string') {
+    return {
+      valid: false,
+      error: new AuditValidationError(
+        `${fieldName} must be a string`,
+        fieldName,
+        value,
+        'type: string',
+      ),
+    };
+  }
+
+  if (!allowedValues.includes(value as T)) {
+    return {
+      valid: false,
+      error: new AuditValidationError(
+        `${fieldName} must be one of: ${allowedValues.join(', ')}`,
+        fieldName,
+        value,
+        `enum: [${allowedValues.join(', ')}]`,
+      ),
+    };
+  }
+
+  return { valid: true, data: value as T };
+}
+
+/**
+ * Validates metadata object (must be plain object, not circular).
+ * This is a lightweight check; deep validation is handled by redact.ts.
+ */
+export function validateMetadata(value: unknown, fieldName: string): ValidationResult<Record<string, unknown>> {
+  if (value === null || value === undefined) {
+    return { valid: true, data: {} };
+  }
+
+  if (typeof value !== 'object' || Array.isArray(value)) {
+    return {
+      valid: false,
+      error: new AuditValidationError(
+        `${fieldName} must be a plain object`,
+        fieldName,
+        value,
+        'type: object',
+      ),
+    };
+  }
+
+  // Check serialized length to prevent oversized metadata
+  const serialized = JSON.stringify(value);
+  if (serialized.length > MAX_METADATA_LENGTH) {
+    return {
+      valid: false,
+      error: new AuditValidationError(
+        `${fieldName} serialized size exceeds maximum of ${MAX_METADATA_LENGTH}`,
+        fieldName,
+        serialized.length,
+        `maxSerializedLength: ${MAX_METADATA_LENGTH}`,
+      ),
+    };
+  }
+
+  return { valid: true, data: value as Record<string, unknown> };
+}
+
+/**
+ * Validates query limit parameter.
+ */
+export function validateLimit(value: unknown): ValidationResult<number> {
+  if (value === undefined || value === null) {
+    return { valid: true, data: 50 }; // Default limit
+  }
+
+  if (typeof value !== 'number') {
+    return {
+      valid: false,
+      error: new AuditValidationError(
+        'limit must be a number',
+        'limit',
+        value,
+        'type: number',
+      ),
+    };
+  }
+
+  if (!isFinite(value)) {
+    return {
+      valid: false,
+      error: new AuditValidationError(
+        'limit must be a finite number',
+        'limit',
+        value,
+        'finite',
+      ),
+    };
+  }
+
+  if (value < MIN_QUERY_LIMIT) {
+    return {
+      valid: false,
+      error: new AuditValidationError(
+        `limit must be at least ${MIN_QUERY_LIMIT}`,
+        'limit',
+        value,
+        `min: ${MIN_QUERY_LIMIT}`,
+      ),
+    };
+  }
+
+  if (value > MAX_QUERY_LIMIT) {
+    return {
+      valid: false,
+      error: new AuditValidationError(
+        `limit cannot exceed ${MAX_QUERY_LIMIT}`,
+        'limit',
+        value,
+        `max: ${MAX_QUERY_LIMIT}`,
+      ),
+    };
+  }
+
+  return { valid: true, data: Math.floor(value) };
+}
+
+/**
+ * Validates query offset parameter.
+ */
+export function validateOffset(value: unknown): ValidationResult<number> {
+  if (value === undefined || value === null) {
+    return { valid: true, data: 0 }; // Default offset
+  }
+
+  if (typeof value !== 'number') {
+    return {
+      valid: false,
+      error: new AuditValidationError(
+        'offset must be a number',
+        'offset',
+        value,
+        'type: number',
+      ),
+    };
+  }
+
+  if (!isFinite(value)) {
+    return {
+      valid: false,
+      error: new AuditValidationError(
+        'offset must be a finite number',
+        'offset',
+        value,
+        'finite',
+      ),
+    };
+  }
+
+  if (value < 0) {
+    return {
+      valid: false,
+      error: new AuditValidationError(
+        'offset cannot be negative',
+        'offset',
+        value,
+        'min: 0',
+      ),
+    };
+  }
+
+  return { valid: true, data: Math.floor(value) };
 }

@@ -54,6 +54,8 @@ export interface AppConfig {
   milestonesEnabled: boolean;
 }
 
+export const DEFAULT_ALLOWED_ASSETS: readonly string[] = Object.freeze(['USDC', 'XLM', 'BTC', 'ETH']);
+
 const MAX_TIMEOUT_MS = 10_000;
 const MIN_TIMEOUT_MS = 100;
 
@@ -97,33 +99,48 @@ function parseTargets(value: string | undefined): string[] {
     .filter(Boolean);
 }
 
-function _parseAssets(value: string | undefined): string[] {
+function parseAssets(value: string | undefined): string[] {
   if (!value) {
-    return ['USDC', 'XLM', 'BTC', 'ETH']; // Default assets
+    return [...DEFAULT_ALLOWED_ASSETS];
   }
 
-  return value
+  const parsed = value
     .split(',')
     .map((item) => item.trim().toUpperCase())
     .filter(Boolean);
+
+  // Deduplicate while preserving order to keep behavior deterministic.
+  return Array.from(new Set(parsed));
+}
+
+function resolveUpstreamContractsUrl(value: string | undefined): string {
+  const url = value ?? 'https://example.invalid/contracts';
+  if (!isSafeUrl(url)) {
+    throw new Error(
+      `Invalid UPSTREAM_CONTRACTS_URL: SSRF protection blocked access to internal resource "${url}" `,
+    );
+  }
+  return url;
 }
 
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
   const port = clamp(toNumber(env.PORT, 3001), 1, 65535);
-  const upstreamTimeoutMs = clamp(toNumber(env.UPSTREAM_TIMEOUT_MS, 1200), MIN_TIMEOUT_MS, MAX_TIMEOUT_MS);
+  const upstreamTimeoutMs = clamp(
+    toNumber(env.UPSTREAM_TIMEOUT_MS, 1200),
+    MIN_TIMEOUT_MS,
+    MAX_TIMEOUT_MS,
+  );
   const chaosProbability = clamp(toNumber(env.CHAOS_PROBABILITY, 0), 0, 1);
-  const idempotencyTtlMs = clamp(toNumber(env.IDEMPOTENCY_TTL_MS, 3_600_000), 0, 7 * 24 * 60 * 60 * 1000);
+  const idempotencyTtlMs = clamp(
+    toNumber(env.IDEMPOTENCY_TTL_MS, 3_600_000),
+    0,
+    7 * 24 * 60 * 60 * 1000,
+  );
 
   return {
     port,
     gracefulDegradationEnabled: parseBoolean(env.GRACEFUL_DEGRADATION_ENABLED, true),
-    upstreamContractsUrl: (() => {
-      const url = env.UPSTREAM_CONTRACTS_URL ?? 'https://example.invalid/contracts';
-      if (!isSafeUrl(url)) {
-        throw new Error(`Invalid UPSTREAM_CONTRACTS_URL: SSRF protection blocked access to internal resource "${url}"`);
-      }
-      return url;
-    })(),
+    upstreamContractsUrl: resolveUpstreamContractsUrl(env.UPSTREAM_CONTRACTS_URL),
     upstreamTimeoutMs,
     chaosMode: parseChaosMode(env.CHAOS_MODE),
     chaosTargets: parseTargets(env.CHAOS_TARGETS),
@@ -151,7 +168,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
       queueProbeTimeoutMs: clamp(toNumber(env.QUEUE_PROBE_TIMEOUT_MS, 3_000), 100, 30_000),
     },
     idempotencyTtlMs,
-    allowedAssets: _parseAssets(env.ALLOWED_ASSETS),
+    allowedAssets: parseAssets(env.ALLOWED_ASSETS),
     milestonesEnabled: parseBoolean(env.MILESTONES_ENABLED, true),
   };
 }

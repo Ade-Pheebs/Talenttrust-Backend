@@ -1,5 +1,6 @@
 import { ZodError } from 'zod';
 import { sanitizeErrorMessage, safeMessageForCode } from './safeErrors';
+import { randomUUID } from 'crypto';
 
 /**
  * Stable machine-readable error codes emitted by AppError subclasses.
@@ -23,6 +24,7 @@ export const APP_ERROR_CODES = {
   SOROBAN_RPC_TIMEOUT_ERROR: 'soroban_rpc_timeout_error',
   SOROBAN_RPC_MALFORMED_RESPONSE_ERROR: 'soroban_rpc_malformed_response_error',
   SOROBAN_RPC_APPLICATION_ERROR: 'soroban_rpc_application_error',
+  INTERNAL_ERROR: 'internal_error',
 } as const;
 
 export interface ErrorPayload {
@@ -34,6 +36,24 @@ export interface ErrorPayload {
     details?: ValidationIssue[];
     currentVersion?: number;
   };
+}
+
+/**
+ * Type guard for the public ErrorPayload contract.
+ *
+ * @remarks Used by tests and downstream consumers to assert that the
+ * serialization boundary always emits a structurally valid payload.
+ */
+export function isErrorPayload(value: unknown): value is ErrorPayload {
+  if (typeof value !== 'object' || value === null) { return false; }
+  const err = (value as { error?: unknown }).error;
+  if (typeof err !== 'object' || err === null) { return false; }
+  const e = err as Record<string, unknown>;
+  return (
+    typeof e.code === 'string' &&
+    typeof e.message === 'string' &&
+    typeof e.requestId === 'string'
+  );
 }
 
 export interface ValidationIssue {
@@ -58,6 +78,15 @@ export class AppError extends Error {
 
   public readonly expose: boolean;
 
+  /**
+   * Optional correlation identifier propagated from the request context.
+   *
+   * @remarks Preserved on the error instance so that the serialization
+   * boundary can emit it without requiring callers to thread it through
+   * every throw site.
+   */
+  public correlationId?: string;
+
   constructor(
     statusCode: number,
     code: string,
@@ -69,6 +98,20 @@ export class AppError extends Error {
     this.statusCode = statusCode;
     this.code = code;
     this.expose = expose;
+  }
+
+  /**
+   * Attaches a correlation identifier to this error in a chainable way.
+   *
+   * @remarks Idempotent: calling with the same value is a no-op, and calling
+   * with a new value overwrites the previous one. Returns `this` so it can be
+   * used inline at throw sites.
+   */
+  public withCorrelationId(correlationId?: string): this {
+    if (correlationId !== undefined) {
+      this.correlationId = correlationId;
+    }
+    return this;
   }
 }
 
@@ -238,6 +281,27 @@ function statusCodeFor(error: AppError): number {
   return 500;
 }
 
+/**
+ * Resolves the correlation id used for a terminal error response.
+ *
+ * @remarks Prefers the explicit argument (typically from the request
+ * context), then falls back to a value attached to the AppError instance,
+ * and finally generates a fresh UUID so that every error response is
+ * traceable. Never returns an empty string.
+ */
+function resolveCorrelationId(
+  error: unknown,
+  correlationId?: string,
+): string {
+  if (typeof correlationId === 'string' && correlationId.length > 0) {
+    return correlationId;
+  }
+  if (error instanceof AppError && typeof error.correlationId === 'string' && error.correlationId.length > 0) {
+    return error.correlationId;
+  }
+  return randomUUID();
+}
+
 function mapZodErrorToDetails(error: ZodError): ValidationIssue[] {
   return error.issues.map((issue) => ({
     path: issue.path.map((part) => String(part)),
@@ -259,6 +323,7 @@ export function mapErrorToPayload(
   requestId: string,
   correlationId?: string,
 ): { statusCode: number; payload: ErrorPayload } {
+  const resolvedCorrelationId = resolveCorrelationId(error, correlationId);
   if (error instanceof AppError) {
     const message = error.expose
       ? sanitizeErrorMessage(error.message, error.code)
@@ -271,7 +336,7 @@ export function mapErrorToPayload(
           code: error.code,
           message,
           requestId,
-          ...(correlationId !== undefined && { correlationId }),
+          correlationId: resolvedCorrelationId,
           ...(error instanceof VersionConflictError &&
             error.currentVersion !== undefined && {
               currentVersion: error.currentVersion,
@@ -289,7 +354,7 @@ export function mapErrorToPayload(
           code: 'validation_error',
           message: safeMessageForCode('validation_error'),
           requestId,
-          ...(correlationId !== undefined && { correlationId }),
+          correlationId: resolvedCorrelationId,
           details: mapZodErrorToDetails(error),
         },
       },
@@ -303,7 +368,7 @@ export function mapErrorToPayload(
         code: 'internal_error',
         message: safeMessageForCode('internal_error'),
         requestId,
-        ...(correlationId !== undefined && { correlationId }),
+        correlationId: resolvedCorrelationId,
       },
     },
   };

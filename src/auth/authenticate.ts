@@ -33,24 +33,61 @@ export interface AuthenticatedRequest extends Request {
 }
 
 /**
+ * Upper bound on the size of a bearer token the decoder will accept.
+ *
+ * Base64 decodes roughly 3 bytes per 4 characters, so 64 KiB of input bounds
+ * the JSON parse to ~48 KiB — far larger than any legitimate payload, yet small
+ * enough that a hostile client cannot force unbounded work on the event loop
+ * with a single header.
+ */
+export const MAX_TOKEN_LENGTH = 64 * 1024;
+
+/**
  * Decode and validate a bearer token string.
+ *
+ * This function is **total**: for any input it returns either a well-formed
+ * {@link TokenPayload} or `null`. It never throws, and it never returns a
+ * partially validated payload. Every rejection — non-string input, empty or
+ * oversized input, malformed base64, non-JSON, JSON that is not a plain object,
+ * missing or mistyped fields, unknown role — collapses to the same
+ * deterministic `null`, so a decode failure can never surface as a 500 from the
+ * middleware.
+ *
+ * The returned object is rebuilt field-by-field from validated primitives, so
+ * extra keys in the JSON (including `__proto__`) are discarded and a "JSON
+ * prototype pollution" payload cannot influence the result.
  *
  * @param token - The raw base64-encoded token.
  * @returns The decoded payload, or `null` if invalid.
  */
 export function decodeToken(token: string): TokenPayload | null {
+  // Defensive totality: callers are typed, but a JavaScript caller (or a future
+  // refactor) can pass anything, and `Buffer.from(undefined, 'base64')` throws.
+  if (typeof token !== 'string' || token.length === 0 || token.length > MAX_TOKEN_LENGTH) {
+    return null;
+  }
+
   try {
     const json = Buffer.from(token, 'base64').toString('utf-8');
-    const parsed = JSON.parse(json);
+    const parsed: unknown = JSON.parse(json);
+
+    // Only a plain object is a valid payload. `null`, arrays and primitives are
+    // rejected explicitly rather than relying on property-access quirks.
+    if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
+      return null;
+    }
+
+    const { userId, role } = parsed as Record<string, unknown>;
     if (
-      typeof parsed.userId !== 'string' ||
-      !parsed.userId ||
-      typeof parsed.role !== 'string' ||
-      !(VALID_ROLES as readonly string[]).includes(parsed.role)
+      typeof userId !== 'string' ||
+      userId.length === 0 ||
+      typeof role !== 'string' ||
+      !(VALID_ROLES as readonly string[]).includes(role)
     ) {
       return null;
     }
-    return { userId: parsed.userId, role: parsed.role as Role };
+
+    return { userId, role: role as Role };
   } catch {
     return null;
   }

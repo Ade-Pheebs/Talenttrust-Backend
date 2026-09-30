@@ -1,4 +1,4 @@
-use soroban_sdk::{Address, BytesN, Env, Vec};
+use soroban_sdk::{Address, BytesN, Env, Symbol, Vec};
 
 use crate::{
     errors::Error,
@@ -8,6 +8,14 @@ use crate::{
 /// A single bet submitted inside a batch.
 ///
 /// Extend this struct with market-specific fields as the contract grows.
+///
+/// # Validation boundaries
+///
+/// * `market_id` must be non-zero; `0` is reserved as an invalid sentinel.
+/// * `amount` must be strictly positive (`> 0`). Zero and negative amounts
+///   are rejected to prevent no-op or refund-style state transitions.
+/// * Duplicate `market_id` entries within the same batch are rejected so a
+///   single submission cannot silently double-apply to the same market.
 #[soroban_sdk::contracttype]
 #[derive(Clone)]
 pub struct Bet {
@@ -33,6 +41,10 @@ pub struct Bet {
 /// # Errors
 ///
 /// * [`Error::EmptyBatch`]                   – `bets` is empty.
+/// * [`Error::InvalidMarketId`]              – a bet has `market_id == 0`.
+/// * [`Error::InvalidAmount`]                – a bet has `amount <= 0`.
+/// * [`Error::DuplicateMarketInBatch`]       – the batch contains the same
+///                                              `market_id` more than once.
 /// * [`Error::IdempotentBatchAlreadyApplied`] – the `(caller, idempotency_key)`
 ///                                              pair has already been consumed.
 ///
@@ -66,6 +78,40 @@ pub fn place_bets(
     }
 
     // ------------------------------------------------------------------
+    // Per-bet validation (deterministic, order-independent)
+    // ------------------------------------------------------------------
+    // Validate every entry before touching idempotency state or emitting
+    // events so that a rejected batch leaves no observable side effects.
+    //
+    // Invariants enforced here:
+    //   1. `market_id != 0` (0 is a reserved invalid sentinel).
+    //   2. `amount > 0` (no zero-value or negative-value stakes).
+    //   3. No duplicate `market_id` within the same batch.
+    //
+    // The duplicate check is O(n^2) over the batch length. Batches are
+    // expected to be small; if this becomes a hot path, replace with a
+    // sorted scan or a temporary `Map<u64, ()>` in temporary storage.
+    let len = bets.len();
+    for i in 0..len {
+        let bet = bets.get(i).ok_or(Error::EmptyBatch)?;
+
+        if bet.market_id == 0 {
+            return Err(Error::InvalidMarketId);
+        }
+        if bet.amount <= 0 {
+            return Err(Error::InvalidAmount);
+        }
+
+        // Duplicate detection: compare against all previous entries.
+        for j in 0..i {
+            let prev = bets.get(j).ok_or(Error::EmptyBatch)?;
+            if prev.market_id == bet.market_id {
+                return Err(Error::DuplicateMarketInBatch);
+            }
+        }
+    }
+
+    // ------------------------------------------------------------------
     // Idempotency check
     // ------------------------------------------------------------------
     // A zero key opts out of deduplication (deprecated backward compat).
@@ -96,6 +142,3 @@ pub fn place_bets(
 
     Ok(())
 }
-
-// Symbol is used above; import it here to keep the use-site clean.
-use soroban_sdk::Symbol;

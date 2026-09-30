@@ -210,6 +210,17 @@ export const envSchema = z.object({
     .transform((val) => parseInt(val, 10))
     .pipe(z.number().int().positive('DISPUTES_CACHE_MAX_ENTRIES must be a positive integer').max(10000)),
 
+  // Auth Cache Configuration
+  AUTH_CACHE_TTL_MS: z.string()
+    .default('5000')
+    .transform((val) => parseInt(val, 10))
+    .pipe(z.number().int().positive('AUTH_CACHE_TTL_MS must be a positive integer').max(300_000)),
+
+  AUTH_CACHE_MAX_ENTRIES: z.string()
+    .default('100')
+    .transform((val) => parseInt(val, 10))
+    .pipe(z.number().int().positive('AUTH_CACHE_MAX_ENTRIES must be a positive integer').max(10000)),
+
   RATE_LIMIT_STORE_TYPE: z.enum(['memory', 'redis'])
     .default('memory'),
   REDIS_URL: z.string().optional(),

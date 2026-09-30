@@ -236,6 +236,7 @@ export class InMemoryCursorRepository implements CursorRepository {
       // No cursor to rewind — create one at the target sequence.
       const now = new Date().toISOString();
       const cursor: IndexerCursor = {
+        ...parseSourceId(sourceId),
         sourceId,
         lastSequence: toSequence,
         updatedAt: now,

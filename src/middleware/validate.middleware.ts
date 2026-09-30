@@ -3,6 +3,7 @@ import { ZodTypeAny, ZodError, z } from 'zod';
 
 export interface ValidationErrorDetail {
   path: string[];
+  field?: string;
   message: string;
   code: string;
 }

@@ -28,10 +28,10 @@ import { z } from 'zod';
 import { auditService, AuditService } from './service';
 import { auditExportService, AuditExportService, type AuditExportFilters } from './exportService';
 import type { AuditQuery } from './types';
-import { buildAuditQuerySchema, createAuditEntryBodySchema, type AuditQueryParams } from './schemas';
+import { buildAuditQuerySchema, type AuditQueryParams } from './schemas';
 import { mapZodErrorToDetails, type ValidationErrorResponse } from '../middleware/validate.middleware';
 import { idempotencyMiddleware } from '../middleware/idempotency';
-import { validateRequest } from '../middleware/validate.middleware';
+import { validateCreateAuditEntryInput, type AuditValidationIssue } from './inputValidation';
 
 export interface AuditRouterOptions {
   service?: AuditService;
@@ -53,7 +53,24 @@ function buildValidationErrorResponse(requestId: string, error: ZodError): Valid
       code: 'validation_error',
       message: 'Request validation failed',
       requestId,
-      details: mapZodErrorToDetails(error),
+      details: mapZodErrorToDetails(error).map((detail) => ({
+        ...detail,
+        field: detail.path.join('.') || '(root)',
+      })),
+    },
+  };
+}
+
+function buildValidationIssuesResponse(
+  requestId: string,
+  issues: AuditValidationIssue[],
+): ValidationErrorResponse {
+  return {
+    error: {
+      code: 'validation_error',
+      message: 'Request validation failed',
+      requestId,
+      details: issues.map(({ path, field, message, code }) => ({ path, field, message, code })),
     },
   };
 }
@@ -123,14 +140,16 @@ export function createAuditRouter(options: AuditRouterOptions = {}): Router {
     ...accessMiddleware,
     (req: Request, res: Response): void => {
       try {
-        const parseResult = createAuditEntryBodySchema.safeParse(req.body);
+        const validationResult = validateCreateAuditEntryInput(req.body);
 
-        if (!parseResult.success) {
-          res.status(400).json(buildValidationErrorResponse(getRequestId(res), parseResult.error));
+        if (!validationResult.ok) {
+          res.status(400).json(
+            buildValidationIssuesResponse(getRequestId(res), validationResult.issues),
+          );
           return;
         }
 
-        const entry = service.log(parseResult.data);
+        const entry = service.log(validationResult.data);
         res.status(201).json(entry);
       } catch (error) {
         const message = (error as Error).message;

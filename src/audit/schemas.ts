@@ -12,22 +12,9 @@
  */
 
 import { z } from 'zod';
-import { decodeCursor } from './types';
+import { AUDIT_ACTIONS, AUDIT_SEVERITIES, decodeCursor } from './types';
 
-/** Mirrors the `AuditAction` union in `./types.ts`. Keep these in sync. */
-export const AUDIT_ACTIONS = [
-  'CONTRACT_CREATED', 'CONTRACT_UPDATED', 'CONTRACT_CANCELLED', 'CONTRACT_COMPLETED',
-  'PAYMENT_INITIATED', 'PAYMENT_RELEASED', 'PAYMENT_DISPUTED',
-  'REPUTATION_UPDATED',
-  'USER_CREATED', 'USER_UPDATED', 'USER_DELETED',
-  'AUTH_LOGIN', 'AUTH_LOGOUT', 'AUTH_FAILED',
-  'ADMIN_ACTION',
-  'ENDPOINT_ACCESS', 'ENDPOINT_MUTATION',
-  'DEPLOYMENT_PROMOTED', 'DEPLOYMENT_ROLLED_BACK',
-] as const;
-
-/** Mirrors the `AuditSeverity` union in `./types.ts`. */
-export const AUDIT_SEVERITIES = ['INFO', 'WARNING', 'CRITICAL'] as const;
+export { AUDIT_ACTIONS, AUDIT_SEVERITIES };
 
 export const auditActionSchema = z.enum(AUDIT_ACTIONS);
 export const auditSeveritySchema = z.enum(AUDIT_SEVERITIES);
@@ -42,16 +29,18 @@ export const auditSeveritySchema = z.enum(AUDIT_SEVERITIES);
  * field silently passed `undefined` through to the repository; defaulting
  * to an empty object is a strictly safer, additive change).
  */
-export const createAuditEntryBodySchema = z.object({
-  action: auditActionSchema,
-  severity: auditSeveritySchema,
-  actor: z.string().min(1, 'actor must not be empty'),
-  resource: z.string().min(1, 'resource must not be empty'),
-  resourceId: z.string().min(1, 'resourceId must not be empty'),
-  metadata: z.record(z.unknown()).optional().default({}),
-  ipAddress: z.string().min(1).optional(),
-  correlationId: z.string().min(1).optional(),
-});
+export const createAuditEntryBodySchema = z
+  .object({
+    action: auditActionSchema,
+    severity: auditSeveritySchema,
+    actor: z.string().min(1, 'actor must not be empty'),
+    resource: z.string().min(1, 'resource must not be empty'),
+    resourceId: z.string().min(1, 'resourceId must not be empty'),
+    metadata: z.record(z.unknown()).optional().default({}),
+    ipAddress: z.string().min(1).optional(),
+    correlationId: z.string().min(1).optional(),
+  })
+  .strict();
 
 export type CreateAuditEntryBody = z.infer<typeof createAuditEntryBodySchema>;
 

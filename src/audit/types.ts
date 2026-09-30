@@ -65,6 +65,9 @@ export type AuditAction =
   | 'MILESTONES_UPDATED'
   | 'MILESTONES_DELETED';
 
+/** Severity levels used in the audit log. */
+export const AUDIT_SEVERITIES = ['INFO', 'WARNING', 'CRITICAL'] as const;
+
 /** Severity level of the audit event. */
 export type AuditSeverity = (typeof AUDIT_SEVERITIES)[number];
 

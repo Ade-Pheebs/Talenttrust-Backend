@@ -100,6 +100,161 @@ describe('MetricsService — webhook metrics', () => {
   });
 });
 
+describe('MetricsService — reputation metrics', () => {
+  it('records success status, duration, and no error cause', async () => {
+    const { service, register } = makeService();
+
+    service.recordReputationRequest({
+      operation: 'get_profile',
+      status: 'success',
+      statusCode: 200,
+      errorCause: 'none',
+      durationSeconds: 0.125,
+    });
+
+    const metrics = await register.getMetricsAsJSON();
+    const requestCounter = metrics.find((m) => m.name === 'reputation_requests_total');
+    const duration = metrics.find((m) => m.name === 'reputation_request_duration_seconds');
+    const errors = metrics.find((m) => m.name === 'reputation_errors_total');
+
+    expect(requestCounter).toBeDefined();
+    expect(requestCounter!.values).toContainEqual({
+      labels: {
+        operation: 'get_profile',
+        status: 'success',
+        status_code: '200',
+        error_cause: 'none',
+      },
+      value: 1,
+    });
+    expect(duration!.values).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          labels: {
+            operation: 'get_profile',
+            status: 'success',
+            status_code: '200',
+            error_cause: 'none',
+            le: '+Inf',
+          },
+        }),
+        expect.objectContaining({
+          labels: {
+            operation: 'get_profile',
+            status: 'success',
+            status_code: '200',
+            error_cause: 'none',
+          },
+          value: 0.125,
+        }),
+      ]),
+    );
+    expect(errors!.values).toEqual([]);
+  });
+
+  it.each([
+    ['client_error', 400, 'bad_request'],
+    ['server_error', 500, 'internal_error'],
+  ] as const)('records %s and increments the bounded error cause counter', async (status, statusCode, errorCause) => {
+    const { service, register } = makeService();
+
+    service.recordReputationRequest({
+      operation: 'create_rating',
+      status,
+      statusCode,
+      errorCause,
+      durationSeconds: 0.25,
+    });
+
+    const metrics = await register.getMetricsAsJSON();
+    const errors = metrics.find((m) => m.name === 'reputation_errors_total');
+    const errorValue = (errors!.values as any[]).find(
+      (value) =>
+        value.labels.operation === 'create_rating' &&
+        value.labels.error_cause === errorCause,
+    );
+
+    expect(errorValue?.value).toBe(1);
+  });
+
+  it('rejects invalid metric input before mutating the registry', () => {
+    const { service } = makeService();
+
+    expect(() =>
+      service.recordReputationRequest({
+        operation: 'unknown' as any,
+        status: 'success',
+        statusCode: 200,
+        errorCause: 'none',
+        durationSeconds: 0,
+      }),
+    ).toThrow('Invalid reputation operation');
+    expect(() =>
+      service.recordReputationRequest({
+        operation: 'get_profile',
+        status: 'unknown' as any,
+        statusCode: 200,
+        errorCause: 'none',
+        durationSeconds: 0,
+      }),
+    ).toThrow('Invalid reputation request status');
+    expect(() =>
+      service.recordReputationRequest({
+        operation: 'get_profile',
+        status: 'success',
+        statusCode: 200,
+        errorCause: 'database_message' as any,
+        durationSeconds: 0,
+      }),
+    ).toThrow('Invalid reputation error cause');
+    expect(() =>
+      service.recordReputationRequest({
+        operation: 'get_profile',
+        status: 'success',
+        statusCode: 200,
+        errorCause: 'none',
+        durationSeconds: -1,
+      }),
+    ).toThrow('Invalid reputation request duration');
+    expect(() =>
+      service.recordReputationRequest({
+        operation: 'get_profile',
+        status: 'success',
+        statusCode: 99,
+        errorCause: 'none',
+        durationSeconds: 0,
+      }),
+    ).toThrow('Invalid reputation status code');
+    expect(() =>
+      service.recordReputationRequest({
+        operation: 'get_profile',
+        status: 'server_error',
+        statusCode: 600,
+        errorCause: 'internal_error',
+        durationSeconds: 0,
+      }),
+    ).toThrow('Invalid reputation status code');
+    expect(() =>
+      service.recordReputationRequest({
+        operation: 'get_profile',
+        status: 'success',
+        statusCode: 200.5,
+        errorCause: 'none',
+        durationSeconds: 0,
+      }),
+    ).toThrow('Invalid reputation status code');
+    expect(() =>
+      service.recordReputationRequest({
+        operation: 'get_profile',
+        status: 'success',
+        statusCode: 200,
+        errorCause: 'none',
+        durationSeconds: Number.NaN,
+      }),
+    ).toThrow('Invalid reputation request duration');
+  });
+});
+
 describe('MetricsService — HTTP route labels', () => {
   it('uses the mounted Express route template instead of concrete paths', async () => {
     const { service, register } = makeService();
@@ -218,6 +373,151 @@ describe('MetricsService — health status gauge', () => {
     const json = await register.getMetricsAsJSON();
     const gauge = json.find((m) => m.name === 'service_health_status');
     expect((gauge!.values as any[])[0].value).toBe(0);
+  });
+});
+
+describe('MetricsService — disputes request metrics', () => {
+  it('increments disputes_requests_total with success error_cause', async () => {
+    const { service, register } = makeService();
+
+    service.recordDisputesRequest({
+      method: 'GET',
+      route: '/api/v1/disputes',
+      statusCode: 200,
+      errorCause: 'success',
+      durationSeconds: 0.012,
+    });
+
+    const json = await register.getMetricsAsJSON();
+    const counter = json.find((m) => m.name === 'disputes_requests_total');
+    expect(counter).toBeDefined();
+    const value = (counter!.values as any[]).find(
+      (v) =>
+        v.labels.error_cause === 'success' &&
+        v.labels.status_code === '200' &&
+        v.labels.route === '/api/v1/disputes',
+    );
+    expect(value?.value).toBe(1);
+  });
+
+  it('records 4xx_client_error and 5xx_server_error labels', async () => {
+    const { service, register } = makeService();
+
+    service.recordDisputesRequest({
+      method: 'GET',
+      route: '/api/v1/disputes',
+      statusCode: 429,
+      errorCause: '4xx_client_error',
+      durationSeconds: 0.001,
+    });
+    service.recordDisputesRequest({
+      method: 'POST',
+      route: '/api/v1/disputes',
+      statusCode: 500,
+      errorCause: '5xx_server_error',
+      durationSeconds: 0.05,
+    });
+
+    const json = await register.getMetricsAsJSON();
+    const counter = json.find((m) => m.name === 'disputes_requests_total');
+    const labels = ((counter?.values ?? []) as any[]).map((v) => v.labels.error_cause);
+    expect(labels).toEqual(expect.arrayContaining(['4xx_client_error', '5xx_server_error']));
+  });
+
+  it('observes disputes_request_duration_seconds histogram', async () => {
+    const { service, register } = makeService();
+
+    service.recordDisputesRequest({
+      method: 'GET',
+      route: '/api/v1/disputes/:id',
+      statusCode: 200,
+      errorCause: 'success',
+      durationSeconds: 0.2,
+    });
+
+    const text = await service.getMetrics();
+    expect(text).toContain('disputes_request_duration_seconds');
+    expect(text).toContain('disputes_requests_total');
+
+    const json = await register.getMetricsAsJSON();
+    const histogram = json.find((m) => m.name === 'disputes_request_duration_seconds');
+    expect(histogram).toBeDefined();
+    const count = (histogram!.values as any[]).find(
+      (v) =>
+        v.metricName === 'disputes_request_duration_seconds_count' ||
+        v.labels?.le === undefined && v.value === 1,
+    );
+    // At least one observation was recorded (count or sum present).
+    expect((histogram!.values as any[]).length).toBeGreaterThan(0);
+    expect(count || (histogram!.values as any[])[0]).toBeDefined();
+  });
+
+  it('rejects invalid error_cause values', () => {
+    const { service } = makeService();
+    expect(() =>
+      service.recordDisputesRequest({
+        method: 'GET',
+        route: '/api/v1/disputes',
+        statusCode: 200,
+        errorCause: 'timeout' as any,
+        durationSeconds: 0.01,
+      }),
+    ).toThrow(TypeError);
+  });
+
+  it('treats non-finite durations as zero', async () => {
+    const { service, register } = makeService();
+
+    service.recordDisputesRequest({
+      method: 'GET',
+      route: '/api/v1/disputes',
+      statusCode: 200,
+      errorCause: 'success',
+      durationSeconds: Number.NaN,
+    });
+
+    const json = await register.getMetricsAsJSON();
+    const histogram = json.find((m) => m.name === 'disputes_request_duration_seconds');
+    const sum = (histogram!.values as any[]).find(
+      (v) => v.metricName === 'disputes_request_duration_seconds_sum',
+    );
+    expect(sum?.value ?? 0).toBe(0);
+  });
+
+  it('treats negative durations as zero', async () => {
+    const { service, register } = makeService();
+
+    service.recordDisputesRequest({
+      method: 'GET',
+      route: '/api/v1/disputes',
+      statusCode: 200,
+      errorCause: 'success',
+      durationSeconds: -1,
+    });
+
+    const json = await register.getMetricsAsJSON();
+    const histogram = json.find((m) => m.name === 'disputes_request_duration_seconds');
+    const sum = (histogram!.values as any[]).find(
+      (v) => v.metricName === 'disputes_request_duration_seconds_sum',
+    );
+    expect(sum?.value ?? 0).toBe(0);
+  });
+
+  it('bounds empty route labels to unmatched', async () => {
+    const { service, register } = makeService();
+
+    service.recordDisputesRequest({
+      method: 'GET',
+      route: '',
+      statusCode: 200,
+      errorCause: 'success',
+      durationSeconds: 0.01,
+    });
+
+    const json = await register.getMetricsAsJSON();
+    const counter = json.find((m) => m.name === 'disputes_requests_total');
+    const value = (counter!.values as any[]).find((v) => v.labels.route === 'unmatched');
+    expect(value?.value).toBe(1);
   });
 });
 
@@ -472,5 +772,210 @@ describe('MetricsService — histogram bucket configuration', () => {
     const hist = metrics.find((m) => m.name === 'http_request_duration_seconds');
     const leValues = (hist!.values as any[]).map((v) => v.labels?.le);
     expect(leValues).toContain('+Inf');
+  });
+});
+
+describe('MetricsService — HTTP error_cause labels', () => {
+  async function errorCauseValues(register: Registry): Promise<string[]> {
+    const metrics = await register.getMetricsAsJSON();
+    const counter = metrics.find((m) => m.name === 'http_requests_total');
+    return ((counter?.values ?? []) as any[]).map((value) => value.labels.error_cause);
+  }
+
+  function recordWithLocals(
+    service: MetricsService,
+    opts: {
+      statusCode: number;
+      locals?: Record<string, unknown>;
+    },
+  ) {
+    const response = new EventEmitter() as Response & EventEmitter;
+    response.statusCode = opts.statusCode;
+    (response as any).locals = opts.locals ?? {};
+
+    const req = {
+      method: 'GET',
+      baseUrl: '',
+      route: { path: '/test' },
+    } as unknown as Request;
+
+    const next = jest.fn() as NextFunction;
+    service.trackHttpRequest(req, response, next);
+    expect(next).toHaveBeenCalledTimes(1);
+    response.emit('finish');
+  }
+
+  it('labels successful 2xx responses with error_cause=none', async () => {
+    const { service, register } = makeService();
+    recordWithLocals(service, { statusCode: 200 });
+    expect(await errorCauseValues(register)).toContain('none');
+  });
+
+  it('labels redirect 3xx responses with error_cause=none', async () => {
+    const { service, register } = makeService();
+    recordWithLocals(service, { statusCode: 302 });
+    expect(await errorCauseValues(register)).toContain('none');
+  });
+
+  it('labels client errors with generic client_error when no explicit cause set', async () => {
+    const { service, register } = makeService();
+    recordWithLocals(service, { statusCode: 400 });
+    recordWithLocals(service, { statusCode: 404 });
+    recordWithLocals(service, { statusCode: 422 });
+
+    const values = await errorCauseValues(register);
+    expect(values.every((v) => v === 'client_error')).toBe(true);
+  });
+
+  it('labels server errors with generic server_error when no explicit cause set', async () => {
+    const { service, register } = makeService();
+    recordWithLocals(service, { statusCode: 500 });
+    recordWithLocals(service, { statusCode: 503 });
+
+    const values = await errorCauseValues(register);
+    expect(values.every((v) => v === 'server_error')).toBe(true);
+  });
+
+  it('uses explicit errorCause from res.locals when provided (not_found)', async () => {
+    const { service, register } = makeService();
+    recordWithLocals(service, {
+      statusCode: 404,
+      locals: { errorCause: 'not_found' },
+    });
+    expect(await errorCauseValues(register)).toContain('not_found');
+  });
+
+  it('uses explicit errorCause for validation_error on 400', async () => {
+    const { service, register } = makeService();
+    recordWithLocals(service, {
+      statusCode: 400,
+      locals: { errorCause: 'validation_error' },
+    });
+    expect(await errorCauseValues(register)).toContain('validation_error');
+  });
+
+  it('uses explicit errorCause for internal_error on 500', async () => {
+    const { service, register } = makeService();
+    recordWithLocals(service, {
+      statusCode: 500,
+      locals: { errorCause: 'internal_error' },
+    });
+    expect(await errorCauseValues(register)).toContain('internal_error');
+  });
+
+  it('ignores empty-string explicit errorCause and falls back', async () => {
+    const { service, register } = makeService();
+    recordWithLocals(service, {
+      statusCode: 500,
+      locals: { errorCause: '' },
+    });
+    expect(await errorCauseValues(register)).toContain('server_error');
+  });
+
+  it('ignores non-string explicit errorCause and falls back', async () => {
+    const { service, register } = makeService();
+    recordWithLocals(service, {
+      statusCode: 403,
+      locals: { errorCause: 123 },
+    });
+    expect(await errorCauseValues(register)).toContain('client_error');
+  });
+
+  it('applies error_cause label on both counter and histogram series', async () => {
+    const { service, register } = makeService();
+    recordWithLocals(service, {
+      statusCode: 500,
+      locals: { errorCause: 'internal_error' },
+    });
+
+    const json = await register.getMetricsAsJSON();
+    const hist = json.find((m) => m.name === 'http_request_duration_seconds');
+    const histLabels = (hist!.values as any[]).map((v: any) => v.labels);
+    const relevant = histLabels.find(
+      (l: any) => l.method === 'GET' && l.status_code === '500',
+    );
+    expect(relevant.error_cause).toBe('internal_error');
+  });
+});
+
+describe('MetricsService — structured request metric logs', () => {
+  it('emits a structured log for each tracked request with no PII', () => {
+    const { service } = makeService();
+    const records: unknown[] = [];
+    const originalWrite = require('../logger').writeRecord;
+    require('../logger').setWriteRecordImpl((rec: unknown) => records.push(rec));
+
+    try {
+      const response = new EventEmitter() as Response & EventEmitter;
+      response.statusCode = 200;
+      (response as any).locals = {
+        requestId: 'req-123',
+        correlationId: 'corr-456',
+      };
+
+      const req = {
+        method: 'POST',
+        baseUrl: '/api/v1',
+        route: { path: '/contracts/:id' },
+      } as unknown as Request;
+
+      service.trackHttpRequest(req, response, jest.fn() as NextFunction);
+      response.emit('finish');
+
+      const metricLogs = records.filter(
+        (r: any) => r.message === 'http request metric',
+      );
+      expect(metricLogs.length).toBe(1);
+
+      const log = metricLogs[0] as any;
+      expect(log.metric).toBe('http_request');
+      expect(log.method).toBe('POST');
+      expect(log.route).toBe('/api/v1/contracts/:id');
+      expect(log.statusCode).toBe(200);
+      expect(log.errorCause).toBe('none');
+      expect(typeof log.durationMs).toBe('number');
+      expect(log.requestId).toBe('req-123');
+      expect(log.correlationId).toBe('corr-456');
+      expect(log).not.toHaveProperty('ip');
+      expect(log).not.toHaveProperty('userAgent');
+      expect(log).not.toHaveProperty('headers');
+      expect(log).not.toHaveProperty('email');
+      expect(log).not.toHaveProperty('token');
+    } finally {
+      require('../logger').setWriteRecordImpl(originalWrite);
+    }
+  });
+
+  it('omits optional correlation IDs when absent from res.locals', () => {
+    const { service } = makeService();
+    const records: unknown[] = [];
+    const originalWrite = require('../logger').writeRecord;
+    require('../logger').setWriteRecordImpl((rec: unknown) => records.push(rec));
+
+    try {
+      const response = new EventEmitter() as Response & EventEmitter;
+      response.statusCode = 404;
+      (response as any).locals = { errorCause: 'not_found' };
+
+      const req = {
+        method: 'GET',
+        baseUrl: '',
+        route: { path: '/missing' },
+      } as unknown as Request;
+
+      service.trackHttpRequest(req, response, jest.fn() as NextFunction);
+      response.emit('finish');
+
+      const log = records.find(
+        (r: any) => r.message === 'http request metric',
+      ) as any;
+      expect(log).toBeDefined();
+      expect(log.statusCode).toBe(404);
+      expect(log.errorCause).toBe('not_found');
+      expect(log).not.toHaveProperty('requestId');
+      expect(log).not.toHaveProperty('correlationId');
+    } finally {
+      require('../logger').setWriteRecordImpl(originalWrite);
+    }
   });
 });

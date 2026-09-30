@@ -29,6 +29,17 @@ The Reputation API lets integrators read a freelancer's public reputation
 profile and submit a new rating against a completed contract.  All endpoints
 require a valid JWT bearer token.
 
+### Feature Flag
+
+The reputation system is controlled by the `REPUTATION_ENABLED` environment
+variable. When set to `false` (default), all reputation endpoints return a
+`403 Forbidden` error with the message "Reputation system is currently disabled".
+This allows the reputation behavior to be toggled at runtime without requiring
+a deployment.
+
+To enable the reputation system, set `REPUTATION_ENABLED=true` in your
+environment configuration.
+
 Source files:
 
 | Layer | File |
@@ -226,6 +237,19 @@ normal HTTP routing, but covered defensively).
 
 ---
 
+**403 Forbidden — reputation system disabled**
+
+Returned when the `REPUTATION_ENABLED` feature flag is set to `false`.
+
+```json
+{
+  "status": "error",
+  "message": "Reputation system is currently disabled"
+}
+```
+
+---
+
 ### PUT /api/v1/reputation/:id
 
 Submits a new reputation rating for a freelancer.  The caller must be an
@@ -397,6 +421,19 @@ Returned by `requirePermission` when the caller's role does not have
 
 ---
 
+**403 Forbidden — reputation system disabled**
+
+Returned when the `REPUTATION_ENABLED` feature flag is set to `false`.
+
+```json
+{
+  "status": "error",
+  "message": "Reputation system is currently disabled"
+}
+```
+
+---
+
 **409 Conflict — duplicate rating**
 
 One rating is allowed per `(reviewerId, targetId, contextId)` triple.  Both
@@ -527,6 +564,7 @@ stable API contract strings; clients may branch on them safely.
 | 400 | `validation_error` | Zod schema validation failure from `validateSchema` middleware. |
 | 401 | `unauthorized` | Missing or invalid JWT bearer token. |
 | 403 | `forbidden` | `requirePermission` denied the caller's role, or service-layer self-rating / contract-participation check failed. |
+| 403 | `forbidden` | `REPUTATION_ENABLED` feature flag is set to `false`. |
 | 409 | `conflict` | Duplicate `(reviewerId, targetId, contextId)` rating already exists. |
 | 422 | `validation_error` | Service-layer comment validation failure (spam, whitespace-only). |
 | 500 | `internal_error` | Unexpected server error (DB failure, audit log failure, etc.). |
@@ -597,6 +635,22 @@ The following guards are applied (in order) on every `PUT` request:
 7. **Contract participation check** — Both reviewer and target must appear on the contract referenced by `contextId` → 403.
 8. **Comment validation** — Enforced by Zod (max length, spam pattern) and service layer (defense-in-depth).
 9. **Audit log** — Every successful write produces an immutable audit entry.  If audit logging fails the entire request fails; no silent skips.
+
+---
+
+## Observability
+
+Every `GET` and `PUT` reputation request emits:
+
+- `reputation_requests_total` with bounded operation, status, status-code, and error-cause labels
+- `reputation_request_duration_seconds` with the same bounded labels
+- `reputation_errors_total` for client and server failures
+- A structured `reputation_request` completion log with method, operation, status, status code, error cause, and duration
+
+The instrumentation runs before authentication and validation, so `401`, `403`,
+and `400` failures are included. It never logs or labels freelancer IDs,
+reviewer IDs, comments, request bodies, headers, or raw exception messages.
+Metrics are available from the Prometheus scrape endpoint at `GET /metrics`.
 
 ---
 

@@ -58,6 +58,55 @@ To guarantee non-repudiation and regulatory accountability, the `ComplianceAudit
 
 - `COMPLIANCE_AUDIT_SECRET`: Required string used as the HMAC secret key for generating audit log proofs.
 - `RETENTION_DRY_RUN`: If set to `true` (or run with the flag `--dry-run`), the purge process strictly calculates and outputs candidate counts per table without executing any `DELETE` operations.
+- `RETENTION_OVERRIDES`: Optional JSON string that overrides the default retention period for individual entity types. The value must be a JSON object mapping `DataEntityType` names to `RetentionPeriod` values. Overrides are validated at startup; values below the per-entity legal minimum are rejected. Examples below.
+
+#### RETENTION_OVERRIDES Format
+
+```bash
+# Extend contract retention to 2 years, transaction to 1 year,
+# and audit logs to indefinite.
+RETENTION_OVERRIDES='{"contract":"2y","transaction":"1y","audit_log":"indefinite"}'
+
+# Shorten document retention to 30 days (minimum for document is 90d,
+# so this will be clamped to 90d at startup).
+RETENTION_OVERRIDES='{"document":"30d"}'
+```
+
+**Valid entity types:** `contract`, `user_profile`, `transaction`, `audit_log`, `document`, `message`
+
+**Valid periods:** `30d`, `90d`, `6m`, `1y`, `2y`, `indefinite`
+
+**Legal minimums per entity type:**
+
+| Entity Type | Legal Minimum | Rationale |
+|---|---|---|
+| `contract` | `1y` | Contracts must be retained for at least one year for regulatory compliance. |
+| `transaction` | `1y` | Financial transaction records require a minimum one-year retention. |
+| `audit_log` | `2y` | Audit logs must be retained for at least two years for compliance review. |
+| `user_profile` | `30d` | User profiles have a minimum 30-day retention for account recovery. |
+| `document` | `90d` | Documents require a minimum 90-day retention. |
+| `message` | `30d` | Messages have a minimum 30-day retention. |
+
+If an override value is below the legal minimum, it is clamped to the minimum at startup. The engine logs the effective period for each entity type via `getResolvedPolicies()`.
+
+#### Auditability
+
+The `RetentionPolicyEngine.getResolvedPolicies()` method returns the full set of effective, resolved policies — one per entity type — with the period that would actually be used for expiration calculations and a `source` field indicating whether the period came from an override or the default:
+
+```typescript
+const engine = new RetentionPolicyEngine();
+engine.applyOverrides({ contract: '2y' });
+
+const resolved = engine.getResolvedPolicies();
+// {
+//   contract:     { period: '2y', source: 'override' },
+//   transaction:  { period: '90d', source: 'default' },
+//   audit_log:    { period: '90d', source: 'default' },
+//   user_profile: { period: '90d', source: 'default' },
+//   document:     { period: '90d', source: 'default' },
+//   message:      { period: '90d', source: 'default' },
+// }
+```
 
 ### Safety & Idempotency
 

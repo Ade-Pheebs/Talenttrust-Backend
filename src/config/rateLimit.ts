@@ -24,6 +24,8 @@
  * | RL_AUDIT_ABUSE_THRESHOLD   | 5          | Violations before hard block (audit)     |
  * | RL_AUDIT_INTEGRITY_MAX     | 10         | Max requests per window (audit integrity)|
  * | RL_AUDIT_INTEGRITY_WINDOW_MS | 60000    | Window duration in ms (audit integrity)  |
+ * | RL_HEALTH_MAX              | 60         | Max requests per window (health tier)    |
+ * | RL_HEALTH_WINDOW_MS        | 60000      | Window duration in ms (health)           |
  *
  * ## Tier Descriptions
  *
@@ -93,6 +95,7 @@ function toCount(value: string | undefined, fallback: number): number {
 }
 
 export const rateLimitStore = new RateLimitStore({ sweepIntervalMs: 60_000 });
+export const apiKeysRateLimitStore = new RateLimitStore({ sweepIntervalMs: 60_000 });
 
 const sharedStore = { store: rateLimitStore };
 
@@ -181,6 +184,24 @@ export const rateLimitConfig = {
   } satisfies RateLimiterConfig,
 
   /**
+   * Audit bulk tier: `POST /api/v1/audit/bulk` batch writes.
+   * Kept tighter than the general `audit`/write-request limit because each
+   * request can append up to `MAX_BULK_AUDIT_ITEMS` entries to the hash
+   * chain (sequential appends), not just one — similar rationale to
+   * `auditExport` being its own tier rather than reusing `audit`.
+   */
+  auditBulk: {
+    maxRequests: toCount(process.env.RL_AUDIT_BULK_MAX, 30),
+    windowMs: toMs(process.env.RL_AUDIT_BULK_WINDOW_MS, 60_000),
+    abuseThreshold: toCount(process.env.RL_AUDIT_BULK_ABUSE_THRESHOLD, 5),
+    blockWindowMs: toMs(process.env.RL_AUDIT_BULK_BLOCK_WINDOW_MS, 300_000),
+    blockDurationMs: toMs(process.env.RL_AUDIT_BULK_BLOCK_DURATION_MS, 600_000),
+    maxBlockDurationMs: toMs(process.env.RL_AUDIT_BULK_MAX_BLOCK_MS, 86_400_000),
+    sendHeaders: true,
+    ...sharedStore,
+  } satisfies RateLimiterConfig,
+
+  /**
    * Audit tier: general query/read endpoints on the audit log
    * (`GET /api/v1/audit`, `GET /api/v1/audit/:id`), issue #746.
    *
@@ -222,6 +243,22 @@ export const rateLimitConfig = {
   } satisfies RateLimiterConfig,
 
   /**
+   * Milestones tier: contract/milestone CRUD operations.
+   * Per-client rate limiting using API key if available, otherwise IP.
+   * Default: 60 requests per minute (~1 req/s).
+   */
+  milestones: {
+    maxRequests: toCount(process.env.RL_MILESTONES_MAX, 60),
+    windowMs: toMs(process.env.RL_MILESTONES_WINDOW_MS, 60_000),
+    abuseThreshold: toCount(process.env.RL_ABUSE_THRESHOLD, 5),
+    blockWindowMs: toMs(process.env.RL_BLOCK_WINDOW_MS, 300_000),
+    blockDurationMs: toMs(process.env.RL_BLOCK_DURATION_MS, 600_000),
+    maxBlockDurationMs: toMs(process.env.RL_MAX_BLOCK_MS, 86_400_000),
+    sendHeaders: true,
+    ...sharedStore,
+  } satisfies RateLimiterConfig,
+
+  /**
    * Disputes tier: dispute creation, resolution, and management.
    * Write-heavy endpoints with moderate limits (~5 req/s).
    */
@@ -232,6 +269,44 @@ export const rateLimitConfig = {
     blockWindowMs: toMs(process.env.RL_DISPUTES_BLOCK_WINDOW_MS, 300_000),
     blockDurationMs: toMs(process.env.RL_DISPUTES_BLOCK_DURATION_MS, 600_000),
     maxBlockDurationMs: toMs(process.env.RL_DISPUTES_MAX_BLOCK_MS, 86_400_000),
+    sendHeaders: true,
+    ...sharedStore,
+  } satisfies RateLimiterConfig,
+
+  /**
+   * Health tier: /health/*, /health/live, /health/ready, /health/router.
+   *
+   * These endpoints are hit by load-balancers, orchestrators, and monitoring
+   * agents. The default of 60 req/min gives a scrape-every-second poller
+   * comfortable headroom while making a flood-level DDoS attack noticeably
+   * expensive. The key is derived from X-API-Key when present (for service
+   * clients) and falls back to IP.
+   *
+   * Tuning knobs:
+   *   RL_HEALTH_MAX        — max requests per window (default 60)
+   *   RL_HEALTH_WINDOW_MS  — window size in ms (default 60 000)
+   */
+  health: {
+    maxRequests: toCount(process.env.RL_HEALTH_MAX, 60),
+    windowMs: toMs(process.env.RL_HEALTH_WINDOW_MS, 60_000),
+    abuseThreshold: toCount(process.env.RL_HEALTH_ABUSE_THRESHOLD, 10),
+    blockWindowMs: toMs(process.env.RL_BLOCK_WINDOW_MS, 300_000),
+    blockDurationMs: toMs(process.env.RL_BLOCK_DURATION_MS, 600_000),
+    maxBlockDurationMs: toMs(process.env.RL_MAX_BLOCK_MS, 86_400_000),
+    sendHeaders: true,
+    ...sharedStore,
+  } satisfies RateLimiterConfig,
+
+  /**
+   * Reputation tier: rate limits on reputation queries and mutations.
+   */
+  reputation: {
+    maxRequests: toCount(process.env.RL_REPUTATION_MAX, 100),
+    windowMs: toMs(process.env.RL_REPUTATION_WINDOW_MS, 60_000),
+    abuseThreshold: toCount(process.env.RL_REPUTATION_ABUSE_THRESHOLD, 5),
+    blockWindowMs: toMs(process.env.RL_BLOCK_WINDOW_MS, 300_000),
+    blockDurationMs: toMs(process.env.RL_BLOCK_DURATION_MS, 600_000),
+    maxBlockDurationMs: toMs(process.env.RL_MAX_BLOCK_MS, 86_400_000),
     sendHeaders: true,
     ...sharedStore,
   } satisfies RateLimiterConfig,

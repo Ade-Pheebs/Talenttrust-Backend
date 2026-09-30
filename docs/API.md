@@ -658,6 +658,8 @@ Soft deletes a metadata record. The record is marked as deleted but retained in 
 ## Reputation API
 Manage freelancer reviews and ratings. Registered dynamically in the OpenAPI registry. All reputation routes require a valid JWT.
 
+**Rate limit:** Reputation routes use a dedicated per-client bucket keyed by `X-API-Key` when present, otherwise client IP. Configure with `RL_REPUTATION_MAX` and `RL_REPUTATION_WINDOW_MS`; exceeded requests return `429` with `Retry-After`.
+
 ### Get Reputation Profile
 **GET** `/api/v1/reputation/:id`
 

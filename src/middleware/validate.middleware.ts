@@ -16,7 +16,7 @@ export interface ValidationErrorResponse {
   };
 }
 
-const mapZodErrorToDetails = (error: ZodError): ValidationErrorDetail[] => {
+export const mapZodErrorToDetails = (error: ZodError): ValidationErrorDetail[] => {
   return error.issues.map((issue) => ({
     path: issue.path.map((p) => String(p)),
     message: issue.message,
@@ -47,11 +47,13 @@ export const validateSchema = (schema: ZodTypeAny) => {
     } catch (error) {
       if (error instanceof ZodError) {
         const requestId = typeof res.locals.requestId === 'string' ? res.locals.requestId : 'unknown';
-        const response: ValidationErrorResponse = {
+        const correlationId = typeof res.locals.correlationId === 'string' ? res.locals.correlationId : undefined;
+        const response: ValidationErrorResponse & { error: { correlationId?: string } } = {
           error: {
             code: 'validation_error',
             message: 'Request validation failed',
             requestId,
+            ...(correlationId !== undefined && { correlationId }),
             details: mapZodErrorToDetails(error),
           },
         };

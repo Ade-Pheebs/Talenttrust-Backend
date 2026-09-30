@@ -1,4 +1,4 @@
-use soroban_sdk::{Address, BytesN, Env, Vec};
+use soroban_sdk::{Address, BytesN, Env, Symbol, Vec};
 
 use crate::{
     errors::Error,
@@ -17,6 +17,13 @@ pub struct Bet {
     pub amount: i128,
 }
 
+/// Maximum number of bets allowed in a single batch submission.
+///
+/// Bounds the amount of work performed per invocation so that a single
+/// transaction cannot exhaust the ledger budget or produce an unbounded
+/// state transition.
+pub const MAX_BATCH_SIZE: u32 = 100;
+
 /// Process a batch of bets atomically with an idempotency guarantee.
 ///
 /// # Arguments
@@ -33,6 +40,10 @@ pub struct Bet {
 /// # Errors
 ///
 /// * [`Error::EmptyBatch`]                   – `bets` is empty.
+/// * [`Error::BatchTooLarge`]                – `bets` exceeds [`MAX_BATCH_SIZE`].
+/// * [`Error::InvalidBetAmount`]             – a bet has a non-positive amount.
+/// * [`Error::DuplicateBet`]                 – the same `market_id` appears
+///                                              more than once in the batch.
 /// * [`Error::IdempotentBatchAlreadyApplied`] – the `(caller, idempotency_key)`
 ///                                              pair has already been consumed.
 ///
@@ -63,6 +74,24 @@ pub fn place_bets(
     // Reject empty batches early.
     if bets.is_empty() {
         return Err(Error::EmptyBatch);
+    }
+
+    // Enforce the upper bound on batch size.
+    if bets.len() > MAX_BATCH_SIZE {
+        return Err(Error::BatchTooLarge);
+    }
+
+    // Validate each bet: positive amount and no duplicate market ids.
+    for i in 0..bets.len() {
+        let bet = bets.get(i).unwrap();
+        if bet.amount <= 0 {
+            return Err(Error::InvalidBetAmount);
+        }
+        for j in (i + 1)..bets.len() {
+            if bets.get(j).unwrap().market_id == bet.market_id {
+                return Err(Error::DuplicateBet);
+            }
+        }
     }
 
     // ------------------------------------------------------------------
@@ -96,6 +125,3 @@ pub fn place_bets(
 
     Ok(())
 }
-
-// Symbol is used above; import it here to keep the use-site clean.
-use soroban_sdk::Symbol;

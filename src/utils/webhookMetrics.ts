@@ -78,11 +78,3 @@ export function incrementDlqReplay(outcome: 'success' | 'failed' | 'idempotent_n
   }
   webhookDlqReplaysTotal.labels(result.data).inc();
 }
-
-/**
- * Reset the webhook DLQ metrics registry.
- * Used in tests to ensure test isolation.
- */
-export function resetWebhookMetrics(): void {
-  webhookDlqRegistry.clear();
-}

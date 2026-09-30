@@ -1,5 +1,6 @@
 import { z } from 'zod';
 import { isSafeUrl } from '../utils/ssrf';
+import { parseFinalityDepths } from '../finality/policy';
 
 
 /**
@@ -23,12 +24,25 @@ export const envSchema = z.object({
     .default('development'),
 
   // API Configuration
-  API_BASE_URL: z.string().url().refine(val => {
-    if (process.env.SSRF_ALLOW_PRIVATE_HOSTS === 'true') return true;
-    return isSafeUrl(val);
-  }, {
+  API_BASE_URL: z.string().url().refine(val => isSafeUrl(val), {
     message: "API_BASE_URL must be a public URL and cannot point to internal resources (SSRF protection)"
   }).optional(),
+
+  /**
+   * Explicit SSRF private-host bypass. Default off.
+   * Rejected outright when NODE_ENV==='production' (see superRefine below).
+   * Only honoured by isSafeUrl when NODE_ENV is development|test|staging.
+   */
+  SSRF_ALLOW_PRIVATE_HOSTS: z.string()
+    .optional()
+    .transform((val) => {
+      if (val === undefined || val.trim() === '') return false;
+      const lower = val.trim().toLowerCase();
+      if (lower === 'true' || lower === '1') return true;
+      if (lower === 'false' || lower === '0') return false;
+      return false;
+    })
+    .pipe(z.boolean()),
 
 
   DEBUG: z.string()
@@ -43,6 +57,12 @@ export const envSchema = z.object({
       if (val === undefined) return undefined;
       return val.split(',').map(o => o.trim()).filter(Boolean);
     }),
+
+  // Feature Flags
+  CONTRACTS_ENABLED: z.string()
+    .optional()
+    .transform((val) => val !== 'false')
+    .pipe(z.boolean()),
 
   // Database
   DATABASE_URL: z.string().optional(),
@@ -60,12 +80,17 @@ export const envSchema = z.object({
     .transform((val) => val ? val.split(',') : ['deploy:*', '*', 'jobs:admin', 'jobs:*'])
     .pipe(z.array(z.string()).optional()),
 
+  // API-key management rate limiting
+  RL_API_KEYS_MAX: z.string().optional(),
+  RL_API_KEYS_WINDOW_MS: z.string().optional(),
+  RL_API_KEYS_ABUSE_THRESHOLD: z.string().optional(),
+  RL_API_KEYS_BLOCK_WINDOW_MS: z.string().optional(),
+  RL_API_KEYS_BLOCK_DURATION_MS: z.string().optional(),
+  RL_API_KEYS_MAX_BLOCK_MS: z.string().optional(),
+
   // Stellar/Soroban Configuration
   STELLAR_HORIZON_URL: z.string().url()
-    .refine(val => {
-      if (process.env.SSRF_ALLOW_PRIVATE_HOSTS === 'true') return true;
-      return isSafeUrl(val);
-    }, {
+    .refine(val => isSafeUrl(val), {
       message: "STELLAR_HORIZON_URL must be a public URL and cannot point to internal resources (SSRF protection)"
     })
     .default('https://horizon-testnet.stellar.org'),
@@ -75,10 +100,7 @@ export const envSchema = z.object({
     .default('Test SDF Network ; September 2015'),
 
   SOROBAN_RPC_URL: z.string().url()
-    .refine(val => {
-      if (process.env.SSRF_ALLOW_PRIVATE_HOSTS === 'true') return true;
-      return isSafeUrl(val);
-    }, {
+    .refine(val => isSafeUrl(val), {
       message: "SOROBAN_RPC_URL must be a public URL and cannot point to internal resources (SSRF protection)"
     })
     .default('https://soroban-testnet.stellar.org'),
@@ -87,10 +109,7 @@ export const envSchema = z.object({
   SOROBAN_CONTRACT_ID: z.string().optional(),
 
   STELLAR_RPC_URL: z.string().url()
-    .refine(val => {
-      if (process.env.SSRF_ALLOW_PRIVATE_HOSTS === 'true') return true;
-      return isSafeUrl(val);
-    }, {
+    .refine(val => isSafeUrl(val), {
       message: "STELLAR_RPC_URL must be a public URL and cannot point to internal resources (SSRF protection)"
     })
     .default('https://rpc-testnet.stellar.org'),
@@ -113,13 +132,28 @@ export const envSchema = z.object({
     .transform((val) => parseInt(val, 10))
     .pipe(z.number().int().nonnegative('STELLAR_RPC_RETRY_BASE_DELAY_MS must be >= 0').max(60_000)),
 
-  STELLAR_RPC_RETRY_MAX_DELAY_MS: z.string()
-    .default('2000')
-    .transform((val) => parseInt(val, 10))
-    .pipe(z.number().int().nonnegative('STELLAR_RPC_RETRY_MAX_DELAY_MS must be >= 0').max(60_000)),
+   STELLAR_RPC_RETRY_MAX_DELAY_MS: z.string()
+     .default('2000')
+     .transform((val) => parseInt(val, 10))
+     .pipe(z.number().int().nonnegative('STELLAR_RPC_RETRY_MAX_DELAY_MS must be >= 0').max(60_000)),
 
+   // Health Probe Configuration
+   QUEUE_FAILED_THRESHOLD: z.string()
+     .default('10')
+     .transform((val) => parseInt(val, 10))
+     .pipe(z.number().int().nonnegative('QUEUE_FAILED_THRESHOLD must be >= 0').max(10_000)),
 
-  // Router / Blue-Green Deployment Configuration
+   QUEUE_BACKLOG_THRESHOLD: z.string()
+     .default('100')
+     .transform((val) => parseInt(val, 10))
+     .pipe(z.number().int().nonnegative('QUEUE_BACKLOG_THRESHOLD must be >= 0').max(1_000_000)),
+
+   QUEUE_PROBE_TIMEOUT_MS: z.string()
+     .default('3000')
+     .transform((val) => parseInt(val, 10))
+     .pipe(z.number().int().positive('QUEUE_PROBE_TIMEOUT_MS must be > 0').max(30_000)),
+
+   // Router / Blue-Green Deployment Configuration
   ACTIVE_COLOR: z.enum(['blue', 'green']).default('blue'),
   BLUE_PORT: z.string().default('3001'),
   GREEN_PORT: z.string().default('3002'),
@@ -150,10 +184,31 @@ export const envSchema = z.object({
     .transform((val) => parseInt(val, 10))
     .pipe(z.number().int().min(100).max(120_000)),
 
+  WEBHOOK_MAX_PAYLOAD_SIZE_BYTES: z.string()
+    .default('1048576')
+    .transform((val) => parseInt(val, 10))
+    .pipe(z.number().int().min(1024).max(10485760)),
+
   IDEMPOTENCY_TTL_MS: z.string()
     .optional()
     .transform((val) => val === undefined ? undefined : parseInt(val, 10))
     .pipe(z.number().int().positive().optional()),
+
+  // Disputes Cache Configuration
+  DISPUTES_CACHE_TTL_MS: z.string()
+    .default('5000')
+    .transform((val) => parseInt(val, 10))
+    .pipe(z.number().int().positive('DISPUTES_CACHE_TTL_MS must be a positive integer').max(300_000)),
+
+  DISPUTES_CACHE_SWR_MS: z.string()
+    .default('30000')
+    .transform((val) => parseInt(val, 10))
+    .pipe(z.number().int().nonnegative('DISPUTES_CACHE_SWR_MS must be >= 0').max(600_000)),
+
+  DISPUTES_CACHE_MAX_ENTRIES: z.string()
+    .default('100')
+    .transform((val) => parseInt(val, 10))
+    .pipe(z.number().int().positive('DISPUTES_CACHE_MAX_ENTRIES must be a positive integer').max(10000)),
 
   RATE_LIMIT_STORE_TYPE: z.enum(['memory', 'redis'])
     .default('memory'),
@@ -194,7 +249,24 @@ export const envSchema = z.object({
     .transform((val) => parseInt(val, 10))
     .pipe(z.number().int().positive().max(10000)),
 
+  // Metrics Rate Limiting
+  METRICS_RATE_LIMIT_MAX_REQUESTS: z.string()
+    .default('100')
+    .transform((val) => parseInt(val, 10))
+    .pipe(z.number().int().positive()),
+
+  METRICS_RATE_LIMIT_WINDOW_MS: z.string()
+    .default('60000')
+    .transform((val) => parseInt(val, 10))
+    .pipe(z.number().int().positive()),
+
+
   // Reputation Scoring Configuration
+  REPUTATION_ENABLED: z.string()
+    .optional()
+    .transform((val) => val === undefined ? false : val === 'true')
+    .pipe(z.boolean()),
+
   REPUTATION_DECAY_LAMBDA: z.string()
     .default('0.005')
     .transform((val) => parseFloat(val))
@@ -204,6 +276,31 @@ export const envSchema = z.object({
 
   REPUTATION_SCORE_ALGORITHM_VERSION: z.string()
     .default('exp-decay-v1'),
+
+  // Reputation Read Cache Configuration
+  /**
+   * Time-to-live (ms) for cached reputation profiles.
+   * Reads within this window are served from in-memory LRU cache without
+   * hitting the database. Must be a positive integer. Default: 60 000 (1 min).
+   */
+  REPUTATION_CACHE_TTL_MS: z.string()
+    .default('60000')
+    .transform((val) => parseInt(val, 10))
+    .pipe(z.number()
+      .int('REPUTATION_CACHE_TTL_MS must be an integer')
+      .positive('REPUTATION_CACHE_TTL_MS must be greater than 0')),
+
+  /**
+   * Maximum number of reputation profiles to hold in the LRU cache.
+   * When this bound is exceeded, the least-recently-used entry is evicted.
+   * Must be a positive integer. Default: 500.
+   */
+  REPUTATION_CACHE_MAX_ENTRIES: z.string()
+    .default('500')
+    .transform((val) => parseInt(val, 10))
+    .pipe(z.number()
+      .int('REPUTATION_CACHE_MAX_ENTRIES must be an integer')
+      .positive('REPUTATION_CACHE_MAX_ENTRIES must be greater than 0')),
 
   // Email transport (queue processor + notification service)
   EMAIL_PROVIDER: z.enum(['console', 'smtp', 'ses', 'sendgrid'])
@@ -236,25 +333,83 @@ export const envSchema = z.object({
 
   SENDGRID_API_KEY: z.string().optional(),
 
-  // Auth Cache Configuration
-  AUTH_CACHE_TTL_MS: z.string()
-    .default('5000')
-    .transform((val) => parseInt(val, 10))
-    .pipe(z.number().int().positive('AUTH_CACHE_TTL_MS must be greater than 0').max(300_000)),
-  AUTH_CACHE_MAX_ENTRIES: z.string()
-    .default('1000')
-    .transform((val) => parseInt(val, 10))
-    .pipe(z.number().int().positive('AUTH_CACHE_MAX_ENTRIES must be greater than 0').max(100_000)),
+  // ── Webhooks Feature Flag ───────────────────────────────────────────────────
+  /**
+   * WEBHOOKS_ENABLED — master switch for the webhooks subsystem.
+   *
+   * When `false`:
+   *  - `WebhookService.trigger()` is a no-op and returns immediately without
+   *    delivering any events or touching subscriptions.
+   *  - The `/api/v1/webhook-subscriptions` router is not mounted on the
+   *    Express app and all subscription endpoints return `404`.
+   *
+   * Default: `true` (webhooks are on unless explicitly disabled).
+   */
+  WEBHOOKS_ENABLED: z.string()
+    .optional()
+    .transform((val) => val !== 'false'),
 
-  // Audit Cache Configuration
-  AUDIT_CACHE_TTL_MS: z.string()
-    .default('10000')
+  // ── Audit Feature Flag ──────────────────────────────────────────────────────
+  /**
+   * AUDIT_ENABLED — master switch for the audit subsystem.
+   *
+   * When `false`:
+   *  - `auditMiddleware` attaches a no-op helper to `res.locals.audit` so
+   *    route handlers continue to compile and run without changes.
+   *  - `protectedEndpointAuditMiddleware` skips registering its `finish`
+   *    listener, so no entries are written for protected-endpoint traffic.
+   *  - The `/api/v1/audit` router is not mounted on the Express app.
+   *
+   * Default: `true` (audit is on unless explicitly disabled).
+   */
+  AUDIT_ENABLED: z.string()
+    .optional()
+    .transform((val) => val !== 'false'),
+
+  // ── Blockchain Finality Configuration ───────────────────────────────────────
+  /**
+   * FINALITY_DEPTHS — per-network confirmation depth, comma-separated
+   * `network=depth` pairs (e.g. `stellar=1,soroban=2`). Depth is the
+   * number of confirmations an event must accumulate before it is
+   * exposed through public reads. A depth of `0` enables
+   * zero-confirmation for that network (only honoured outside
+   * production unless FINALITY_ALLOW_ZERO_CONFIRMATION is explicit).
+   *
+   * Default: `stellar=1,soroban=1`.
+   */
+  FINALITY_DEPTHS: z.string()
+    .default('stellar=1,soroban=1')
+    .transform((val) => parseFinalityDepths(val)),
+
+  /**
+   * FINALITY_DEFAULT_DEPTH — confirmation depth applied to networks
+   * without an explicit FINALITY_DEPTHS entry. Conservative (fail-closed)
+   * so an unconfigured network is never exposed early.
+   *
+   * Default: `6`.
+   */
+  FINALITY_DEFAULT_DEPTH: z.string()
+    .default('6')
     .transform((val) => parseInt(val, 10))
-    .pipe(z.number().int().positive('AUDIT_CACHE_TTL_MS must be greater than 0').max(300_000)),
-  AUDIT_CACHE_MAX_ENTRIES: z.string()
-    .default('500')
-    .transform((val) => parseInt(val, 10))
-    .pipe(z.number().int().positive('AUDIT_CACHE_MAX_ENTRIES must be greater than 0').max(100_000)),
+    .pipe(z.number().int().nonnegative('FINALITY_DEFAULT_DEPTH must be a non-negative integer').max(1000)),
+
+  /**
+   * FINALITY_ALLOW_ZERO_CONFIRMATION — when `true`, a configured depth
+   * of `0` is honoured (zero-confirmation). When `false`, depth `0` is
+   * clamped to `1`. When unset, zero-confirmation is permitted in
+   * development/test/staging and forbidden in production.
+   */
+  FINALITY_ALLOW_ZERO_CONFIRMATION: z.string()
+    .optional()
+    .transform((val) => {
+      if (val === undefined || val.trim() === '') return undefined;
+      const lower = val.trim().toLowerCase();
+      if (lower === 'true' || lower === '1') return true;
+      if (lower === 'false' || lower === '0') return false;
+      return undefined;
+    })
+    .pipe(z.boolean().optional()),
+
 }).superRefine((obj, ctx) => {
   const requireForEmailProvider = (field: keyof typeof obj, message: string): void => {
     if (!obj[field]) {
@@ -277,6 +432,14 @@ export const envSchema = z.object({
   }
 
   if (obj.NODE_ENV === 'production') {
+    if (obj.SSRF_ALLOW_PRIVATE_HOSTS === true) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['SSRF_ALLOW_PRIVATE_HOSTS'],
+        message:
+          'SSRF_ALLOW_PRIVATE_HOSTS must not be enabled in production; private hosts are always blocked',
+      });
+    }
     if (!obj.JWT_SECRET) {
       ctx.addIssue({
         code: z.ZodIssueCode.custom,

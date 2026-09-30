@@ -28,6 +28,10 @@ describe('isValidReputationRatingPayload', () => {
     expect(isValidReputationRatingPayload(payload)).toBe(false);
   });
 
+  it('rejects truthy non-string reviewerId (boolean)', () => {
+    expect(isValidReputationRatingPayload({ reviewerId: true, rating: 3 })).toBe(false);
+  });
+
   it.each([1, 2, 3, 4, 5])('accepts integer rating %i', (rating) => {
     expect(isValidReputationRatingPayload({ ...validPayload, rating })).toBe(true);
   });

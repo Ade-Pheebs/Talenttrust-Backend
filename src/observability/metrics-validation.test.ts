@@ -35,6 +35,9 @@ import {
   assertWebhookOutcome,
   assertDlqDepth,
   assertServiceStatus,
+  assertDisputesErrorCause,
+  mapDisputesErrorCause,
+  DISPUTES_ERROR_CAUSES,
 } from './metrics-validation';
 
 // ---------------------------------------------------------------------------
@@ -444,5 +447,47 @@ describe('assertServiceStatus', () => {
     } catch (err) {
       expect((err as Error).message).toContain('running');
     }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Disputes error-cause mapping / assertion
+// ---------------------------------------------------------------------------
+describe('mapDisputesErrorCause', () => {
+  it('maps 2xx to success', () => {
+    expect(mapDisputesErrorCause(200)).toBe('success');
+    expect(mapDisputesErrorCause(201)).toBe('success');
+    expect(mapDisputesErrorCause(204)).toBe('success');
+  });
+
+  it('maps 4xx to 4xx_client_error', () => {
+    expect(mapDisputesErrorCause(400)).toBe('4xx_client_error');
+    expect(mapDisputesErrorCause(401)).toBe('4xx_client_error');
+    expect(mapDisputesErrorCause(403)).toBe('4xx_client_error');
+    expect(mapDisputesErrorCause(429)).toBe('4xx_client_error');
+  });
+
+  it('maps 5xx to 5xx_server_error', () => {
+    expect(mapDisputesErrorCause(500)).toBe('5xx_server_error');
+    expect(mapDisputesErrorCause(503)).toBe('5xx_server_error');
+  });
+
+  it('maps other codes to unknown', () => {
+    expect(mapDisputesErrorCause(100)).toBe('unknown');
+    expect(mapDisputesErrorCause(301)).toBe('unknown');
+  });
+});
+
+describe('assertDisputesErrorCause', () => {
+  it.each(DISPUTES_ERROR_CAUSES)('returns the validated cause for "%s"', (cause) => {
+    expect(assertDisputesErrorCause(cause)).toBe(cause);
+  });
+
+  it('throws TypeError for an unknown string', () => {
+    expect(() => assertDisputesErrorCause('timeout')).toThrow(TypeError);
+  });
+
+  it('throws TypeError for null', () => {
+    expect(() => assertDisputesErrorCause(null)).toThrow(TypeError);
   });
 });

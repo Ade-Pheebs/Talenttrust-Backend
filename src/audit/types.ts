@@ -9,30 +9,72 @@
  * - Sensitive payloads are stored as opaque strings; callers must sanitise PII before logging.
  */
 
+/**
+ * Every audited action, as a runtime value list.
+ *
+ * This is the single source of truth: {@link AuditAction} is derived from it,
+ * and both the request-body validator (`audit/inputValidation`) and the query
+ * filter validator (`audit/router`) validate against this same array, so a new
+ * action can never be accepted by one path and rejected by the other.
+ */
+export const AUDIT_ACTIONS = [
+  'CONTRACT_CREATED',
+  'CONTRACT_UPDATED',
+  'CONTRACT_CANCELLED',
+  'CONTRACT_COMPLETED',
+  'PAYMENT_INITIATED',
+  'PAYMENT_RELEASED',
+  'PAYMENT_DISPUTED',
+  'REPUTATION_UPDATED',
+  'REPUTATION_CORRECTED',
+  'USER_CREATED',
+  'USER_UPDATED',
+  'USER_DELETED',
+  'AUTH_LOGIN',
+  'AUTH_LOGOUT',
+  'AUTH_FAILED',
+  'AUTH_LOCKOUT_TRIGGERED',
+  'AUTH_LOCKOUT_RELEASED',
+  'ADMIN_ACTION',
+  'ENDPOINT_ACCESS',
+  'ENDPOINT_MUTATION',
+  'DEPLOYMENT_PROMOTED',
+  'DEPLOYMENT_ROLLED_BACK',
+] as const;
+
 /** Categories of sensitive state changes that must be audited. */
 export type AuditAction =
   | 'CONTRACT_CREATED'
   | 'CONTRACT_UPDATED'
   | 'CONTRACT_CANCELLED'
   | 'CONTRACT_COMPLETED'
+  | 'CONTRACT_DELETED'
   | 'PAYMENT_INITIATED'
   | 'PAYMENT_RELEASED'
   | 'PAYMENT_DISPUTED'
   | 'REPUTATION_UPDATED'
+  | 'REPUTATION_CORRECTED'
   | 'USER_CREATED'
   | 'USER_UPDATED'
   | 'USER_DELETED'
   | 'AUTH_LOGIN'
   | 'AUTH_LOGOUT'
   | 'AUTH_FAILED'
+  | 'AUTH_LOCKOUT_TRIGGERED'
+  | 'AUTH_LOCKOUT_RELEASED'
   | 'ADMIN_ACTION'
   | 'ENDPOINT_ACCESS'
   | 'ENDPOINT_MUTATION'
   | 'DEPLOYMENT_PROMOTED'
-  | 'DEPLOYMENT_ROLLED_BACK';
+  | 'DEPLOYMENT_ROLLED_BACK'
+  | 'MILESTONES_CREATED'
+  | 'MILESTONES_UPDATED'
+  | 'MILESTONES_DELETED';
+
+export const AUDIT_SEVERITIES = ['INFO', 'WARNING', 'CRITICAL'] as const;
 
 /** Severity level of the audit event. */
-export type AuditSeverity = 'INFO' | 'WARNING' | 'CRITICAL';
+export type AuditSeverity = (typeof AUDIT_SEVERITIES)[number];
 
 /**
  * An immutable audit log entry.
@@ -73,6 +115,25 @@ export interface AuditEntry {
 
 /** Input required to create a new audit entry (hash fields are computed internally). */
 export type CreateAuditEntryInput = Omit<AuditEntry, 'id' | 'timestamp' | 'hash' | 'previousHash'>;
+
+/**
+ * Outcome of a single item within a `POST /api/v1/audit/bulk` request.
+ * Exactly one of `entry` / `error` is populated, matching `success`.
+ */
+export interface BulkAuditItemResult {
+  /** Position of this item within the submitted `entries` array. */
+  index: number;
+  success: boolean;
+  entry?: AuditEntry;
+  error?: string;
+}
+
+/** Aggregate response body for `POST /api/v1/audit/bulk`. */
+export interface BulkAuditResult {
+  results: BulkAuditItemResult[];
+  succeeded: number;
+  failed: number;
+}
 
 /** Opaque cursor for pagination. Encodes position and filters. */
 export type AuditCursor = string;
@@ -145,7 +206,7 @@ export function decodeCursor(cursor: string): CursorData {
   try {
     const json = Buffer.from(cursor, 'base64').toString('utf-8');
     return JSON.parse(json) as CursorData;
-  } catch (_error) {
+  } catch {
     throw new Error('Invalid cursor format');
   }
 }

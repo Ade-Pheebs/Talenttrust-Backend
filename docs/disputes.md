@@ -626,6 +626,22 @@ See [docs/backend/notifications.md](./backend/notifications.md) and [docs/email-
 
 ---
 
+## Soft-delete, restore, and purge
+
+Disputes support soft-delete so deletes are reversible within a retention window.
+
+| Concern | Behaviour |
+|---------|-----------|
+| Soft-delete | `DELETE /api/v1/disputes/:id` sets `deletedAt` (record is kept) |
+| Default reads | `GET /api/v1/disputes` and `GET /api/v1/disputes/:id` exclude soft-deleted rows (`?includeDeleted=true` on list to include) |
+| Restore | `POST /api/v1/disputes/:id/restore` clears `deletedAt` if still inside the retention window; otherwise `410 soft_delete_retention_expired` |
+| Retention | `DISPUTES_SOFT_DELETE_RETENTION_DAYS` (default **30**) |
+| Purge | `runDisputesSoftDeletePurge()` hard-deletes soft-deleted rows past the window (maintenance / cron) |
+
+Sources: [`src/services/disputes.service.ts`](../src/services/disputes.service.ts), [`src/routes/disputes.routes.ts`](../src/routes/disputes.routes.ts), [`src/utils/softDelete.ts`](../src/utils/softDelete.ts)
+
+---
+
 ## Related Documentation
 
 - [Contract Lifecycle & Bounds](./contracts-lifecycle.md) — full state machine diagram and OCC semantics

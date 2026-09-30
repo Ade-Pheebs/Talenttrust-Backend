@@ -4,6 +4,12 @@
  *
  * Used by load balancers and CI smoke tests to verify the service is alive.
  *
+ * Rate limiting:
+ * - All health routes are protected by a per-client rate limiter using the
+ *   shared `health` tier from {@link module:config/rateLimit}.
+ * - Key is derived from X-API-Key (service clients) or client IP.
+ * - Exceeding the limit returns HTTP 429 with a `Retry-After` header.
+ *
  * Validation notes:
  * - POST /health validates the request body against {@link HealthWriteBodySchema}.
  *   Unknown fields, wrong types, out-of-range values, and oversized strings are
@@ -15,14 +21,26 @@
  * @route POST /health
  * @returns {{ status: string, service: string }} 200 JSON payload on success
  * @returns {{ error: { code: 'validation_error', ... } }} 400 on validation failure
+ * @returns {{ error: { code: 'rate_limited', ... } }} 429 when rate limit exceeded
  */
 
 import { Router, Request, Response } from 'express';
 import { registry } from '../docs/openapi-registry';
 import { validateRequest, validateQuery } from '../middleware/validation';
 import { HealthWriteBodySchema, HealthQuerySchema } from '../health/validation';
+import { createRateLimiter } from '../middleware/rateLimiter';
+import { rateLimitConfig } from '../config/rateLimit';
+import { healthRateLimitKeyFn } from '../health/rateLimitKey';
 
 export const healthRouter = Router();
+
+// Apply per-client rate limiter to all /health routes in this router.
+healthRouter.use(
+  createRateLimiter({
+    ...rateLimitConfig.health,
+    keyFn: healthRateLimitKeyFn,
+  }),
+);
 
 registry.registerPath({
   method: "get",
@@ -42,6 +60,9 @@ registry.registerPath({
           },
         },
       },
+    },
+    429: {
+      description: "Rate limit exceeded",
     },
   },
 });
@@ -68,7 +89,10 @@ registry.registerPath({
     },
     400: {
       description: 'Validation error — malformed or out-of-bounds fields',
-    }
+    },
+    429: {
+      description: 'Rate limit exceeded',
+    },
   }
 });
 

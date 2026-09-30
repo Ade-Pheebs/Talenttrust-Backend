@@ -25,6 +25,7 @@ import { auditExportService, AuditExportService, type AuditExportFilters } from 
 import type { AuditAction, AuditQuery, AuditSeverity, CreateAuditEntryInput } from './types';
 import { decodeCursor } from './types';
 import { idempotencyMiddleware } from '../middleware/idempotency';
+import { validateAuditInput, AuditValidationError } from './inputValidation';
 
 export interface AuditRouterOptions {
   service?: AuditService;
@@ -175,6 +176,9 @@ export function createAuditRouter(options: AuditRouterOptions = {}): Router {
    *
    * Write an audit entry with idempotency support.
    * Accepts an Idempotency-Key header to prevent duplicate entries.
+   *
+   * Validation is deterministic — the same invalid input always returns
+   * the same 400 response with a structured `issues` array.
    */
   router.post(
     '/',
@@ -182,16 +186,22 @@ export function createAuditRouter(options: AuditRouterOptions = {}): Router {
     ...accessMiddleware,
     (req: Request, res: Response): void => {
       try {
-        const input = req.body as CreateAuditEntryInput;
-
-        if (!input.action || !input.severity || !input.actor || !input.resource || !input.resourceId) {
-          res.status(400).json({ error: 'Missing required fields: action, severity, actor, resource, resourceId' });
-          return;
-        }
-
-        const entry = service.log(input);
+        // validateAuditInput throws AuditValidationError (HTTP 400) for any
+        // invalid field, or returns a typed CreateAuditEntryInput on success.
+        // The service.log() call re-uses the same validation internally, but
+        // calling it here lets the router return the structured issues array
+        // directly without an extra try-catch inside service.log().
+        const validated = validateAuditInput(req.body);
+        const entry = service.log(validated);
         res.status(201).json(entry);
       } catch (error) {
+        if (error instanceof AuditValidationError) {
+          res.status(400).json({
+            error: error.message,
+            issues: error.issues,
+          });
+          return;
+        }
         res.status(500).json({ error: (error as Error).message });
       }
     },

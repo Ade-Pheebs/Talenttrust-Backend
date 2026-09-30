@@ -172,12 +172,19 @@ export class AuditService {
   log(input: CreateAuditEntryInput): AuditEntry {
     try {
       const entry = this.repository.append(input);
-      
-      // Invalidate cache on write operations
+
+      // A write can change the result of *any* cached read: unfiltered queries
+      // and aggregate result sets contain this entry too, and they are keyed by
+      // their filter object (`query:{}`) rather than by `resourceId`. Invalidating
+      // only the resourceId-scoped keys left those caches serving a snapshot
+      // that predates the write, so a read that raced the write could observe
+      // the old result indefinitely (until the TTL expired). Clearing the whole
+      // read cache is the only invalidation that is correct for every filter
+      // shape; audit reads are cheap relative to the write they follow.
       if (this.cache) {
-        this.cache.invalidateByResourceId(input.resourceId);
+        this.cache.invalidate();
       }
-      
+
       return entry;
     } catch (err) {
       console.error('[AuditService] Failed to persist audit entry:', err);
@@ -439,20 +446,22 @@ export class AuditService {
    * @returns Matching entries in insertion order.
    */
   query(query: AuditQuery = {}): AuditEntry[] {
-    // Check cache first
+    // Check cache first. The array stored in the cache is a snapshot owned by
+    // the cache, so a hit is handed out as a fresh copy: a caller that sorts or
+    // truncates the result cannot mutate what a concurrent reader sees.
     if (this.cache) {
       const cached = this.cache.get(query, 'query');
       if (cached) {
-        return cached as AuditEntry[];
+        return [...(cached as AuditEntry[])];
       }
     }
 
     // Cache miss - fetch from repository
     const entries = this.repository.query(query);
 
-    // Store in cache
+    // Store a copy so mutations of the returned array cannot poison the cache.
     if (this.cache) {
-      this.cache.set(query, entries, 'query');
+      this.cache.set(query, [...entries], 'query');
     }
 
     return entries;
@@ -465,20 +474,23 @@ export class AuditService {
    * @returns Paginated result with entries and next cursor.
    */
   queryWithCursor(query: AuditQuery = {}): AuditQueryResult {
-    // Check cache first
+    // Check cache first. Both the result object and its `entries` array are
+    // copied out of the cache so a caller cannot mutate the shared snapshot.
     if (this.cache) {
       const cached = this.cache.get(query, 'queryWithCursor');
       if (cached) {
-        return cached as AuditQueryResult;
+        const result = cached as AuditQueryResult;
+        return { ...result, entries: [...result.entries] };
       }
     }
 
     // Cache miss - fetch from repository
     const result = this.repository.queryWithCursor(query);
 
-    // Store in cache
+    // Store a copy so mutations of the returned object/array cannot poison the
+    // cache.
     if (this.cache) {
-      this.cache.set(query, result, 'queryWithCursor');
+      this.cache.set(query, { ...result, entries: [...result.entries] }, 'queryWithCursor');
     }
 
     return result;
@@ -495,20 +507,21 @@ export class AuditService {
    * Retrieves a single audit entry by ID.
    */
   getById(id: string): AuditEntry | undefined {
-    // Check cache first
+    // Check cache first. A hit is copied out of the cache so a caller cannot
+    // mutate the entry a concurrent reader will receive.
     if (this.cache) {
       const cached = this.cache.get({}, 'getById', id);
       if (cached) {
-        return cached as AuditEntry;
+        return { ...(cached as AuditEntry) };
       }
     }
 
     // Cache miss - fetch from repository
     const entry = this.repository.getById(id);
 
-    // Store in cache
+    // Store a copy so mutations of the returned entry cannot poison the cache.
     if (this.cache && entry) {
-      this.cache.set({}, entry, 'getById', id);
+      this.cache.set({}, { ...entry }, 'getById', id);
     }
 
     return entry;

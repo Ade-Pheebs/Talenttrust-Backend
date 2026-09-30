@@ -1,9 +1,6 @@
 use soroban_sdk::{Address, BytesN, Env, Vec};
 
-use crate::{
-    errors::Error,
-    storage::{DataKey, IDEM_KEY_TTL_LEDGERS},
-};
+use crate::{errors::Error, storage::consume_idempotency_key};
 
 /// A single bet submitted inside a batch.
 ///
@@ -23,27 +20,30 @@ pub struct Bet {
 ///
 /// * `env`             – Soroban host environment.
 /// * `caller`          – Address of the submitting account; `require_auth` is
-///                       called to authenticate the caller.
+///   called to authenticate the caller.
 /// * `bets`            – Non-empty vector of [`Bet`] entries.
 /// * `idempotency_key` – 32-byte caller-generated token that makes this
-///                       submission unique.  The key is bound to `caller` so
-///                       the same token may be used by different callers
-///                       without conflict.
+///   submission unique. The key is bound to `caller` so the same token may
+///   be used by different callers without conflict.
 ///
 /// # Errors
 ///
 /// * [`Error::EmptyBatch`]                   – `bets` is empty.
 /// * [`Error::IdempotentBatchAlreadyApplied`] – the `(caller, idempotency_key)`
-///                                              pair has already been consumed.
+///   pair has already been consumed.
+/// * [`Error::IdempotencyRetentionUnavailable`] – the full retention window
+///   cannot be represented or supported.
 ///
 /// # Idempotency semantics
 ///
-/// The key is written to instance storage **before** processing the bets.
+/// The key is reserved in temporary storage **before** processing the bets.
 /// If a previous call with the same key succeeded, the function returns
 /// [`Error::IdempotentBatchAlreadyApplied`] immediately without re-applying
-/// the batch.  Once written, the key expires after [`IDEM_KEY_TTL_LEDGERS`]
-/// ledgers; after expiry a new submission with the same token is accepted as
-/// a fresh batch.
+/// the batch. Each key has its own inclusive deadline at acceptance ledger +
+/// [`crate::storage::IDEM_KEY_TTL_LEDGERS`]; unrelated submissions and duplicate retries do
+/// not renew it. In the following ledger the token is accepted as a fresh
+/// batch. Reservation and effects commit or roll back together. Legacy
+/// instance sentinels follow the conservative cutoff documented in storage.
 ///
 /// # Deprecation note — zero-key backward path
 ///
@@ -71,18 +71,7 @@ pub fn place_bets(
     // A zero key opts out of deduplication (deprecated backward compat).
     let zero_key: BytesN<32> = BytesN::from_array(env, &[0u8; 32]);
     if idempotency_key != zero_key {
-        let idem_key = DataKey::PlaceBetsIdem(caller.clone(), idempotency_key.clone());
-
-        if env.storage().instance().has(&idem_key) {
-            return Err(Error::IdempotentBatchAlreadyApplied);
-        }
-
-        // Mark the key as consumed before applying the batch so that
-        // concurrent invocations on the same ledger also fail fast.
-        env.storage().instance().set(&idem_key, &true);
-        env.storage()
-            .instance()
-            .extend_ttl(IDEM_KEY_TTL_LEDGERS, IDEM_KEY_TTL_LEDGERS);
+        consume_idempotency_key(env, &caller, &idempotency_key)?;
     }
 
     // ------------------------------------------------------------------

@@ -5,9 +5,9 @@
 //! ## Idempotency
 //!
 //! `place_bets` accepts a caller-supplied `BytesN<32>` idempotency key.
-//! The key is stored in instance storage under
-//! `DataKey::PlaceBetsIdem(caller, key)` with a TTL of
-//! [`storage::IDEM_KEY_TTL_LEDGERS`] ledgers (~24 h).  Repeated
+//! The key is stored in temporary storage under
+//! `DataKey::PlaceBetsIdem(caller, key)` with an independent inclusive
+//! deadline of acceptance ledger + [`storage::IDEM_KEY_TTL_LEDGERS`] (~24 h). Repeated
 //! submissions with the same `(caller, key)` pair are rejected with
 //! `Error::IdempotentBatchAlreadyApplied`.
 
@@ -16,6 +16,11 @@
 mod bets;
 mod errors;
 mod storage;
+
+#[cfg(test)]
+mod batch_operations_tests;
+#[cfg(test)]
+mod storage_tests;
 
 pub use bets::Bet;
 pub use errors::Error;

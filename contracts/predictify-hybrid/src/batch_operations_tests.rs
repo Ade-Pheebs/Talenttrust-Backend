@@ -5,10 +5,8 @@
 //! cargo test -p predictify-hybrid batch_operations_tests -- --nocapture
 //! ```
 
-#![cfg(test)]
-
 use soroban_sdk::{
-    testutils::{Address as _, Ledger},
+    testutils::{Address as _, EnvTestConfig, Ledger},
     Address, BytesN, Env, Vec,
 };
 
@@ -17,11 +15,17 @@ use crate::{bets::Bet, errors::Error, storage::IDEM_KEY_TTL_LEDGERS, PredictifyH
 // ── helpers ──────────────────────────────────────────────────────────────────
 
 fn fresh_env() -> Env {
-    Env::default()
+    let env = Env::new_with_config(EnvTestConfig {
+        capture_snapshot_at_drop: false,
+    });
+    env.ledger().with_mut(|li| {
+        li.min_persistent_entry_ttl = IDEM_KEY_TTL_LEDGERS * 3;
+    });
+    env
 }
 
-fn register(env: &Env) -> (Address, PredictifyHybridClient) {
-    let contract_id = env.register(crate::PredictifyHybrid, ());
+fn register(env: &Env) -> (Address, PredictifyHybridClient<'_>) {
+    let contract_id = env.register_contract(None, crate::PredictifyHybrid);
     let client = PredictifyHybridClient::new(env, &contract_id);
     (contract_id, client)
 }
@@ -45,7 +49,7 @@ fn one_bet(env: &Env) -> Vec<Bet> {
 
 // ── batch_operations_tests module ─────────────────────────────────────────────
 
-mod batch_operations_tests {
+mod idempotency_tests {
     use super::*;
 
     /// A fresh (never-seen) key is accepted and the call succeeds.

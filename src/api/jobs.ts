@@ -15,14 +15,29 @@
  *
  * ## Usage
  * Call {@link initializeJobs} once at application startup (e.g., from `index.ts`).
+ *
+ * ## Failure recovery invariants
+ * 1. **Delivery before removal**: `removeEntry` is only called after a confirmed
+ *    2xx from `deliverRaw`. This prevents silent data loss.
+ * 2. **Idempotency key registered immediately after removal**: if the process
+ *    crashes between `removeEntry` and `markEventProcessed`, the next replay of
+ *    the same DLQ record will get a 404 (entry gone) rather than re-delivering.
+ *    This trades at-most-once delivery (one missed mark) for freedom from
+ *    duplicate deliveries, which is safer for downstream consumers.
+ * 3. **Partial batch results are always surfaced**: the batch handler catches
+ *    per-item errors without aborting the loop, and the final response always
+ *    contains the committed `successIds` so callers can reconcile.
+ * 4. **Delivery failures are observable**: `deliverRaw` logs the HTTP status code
+ *    and a sanitised error type without leaking payload content or secrets.
  */
 
-import axios from 'axios';
+import axios, { AxiosError } from 'axios';
 import { Router, Request, Response, NextFunction } from 'express';
 import { startDlqMetricsSampling, incrementDlqReplay } from '../webhookMetrics';
 import { redactPayload } from '../utils/redact';
 import { IdempotencyLayer } from '../events/idempotency';
 import { requireAuth, requireRole } from '../middleware/authorization';
+import { logger } from '../logger';
 
 // ---------------------------------------------------------------------------
 // Request context propagation
@@ -89,6 +104,29 @@ export interface ReplayableDlqStore {
 }
 
 // ---------------------------------------------------------------------------
+// DeliveryResult — structured outcome returned by deliverRaw
+// ---------------------------------------------------------------------------
+
+/**
+ * Structured outcome from a single delivery attempt. Carries enough
+ * diagnostic context to log failures without leaking payload content.
+ */
+export interface DeliveryResult {
+  /** `true` when the destination responded with HTTP 2xx. */
+  success: boolean;
+  /**
+   * HTTP status code returned by the destination, or `undefined` when the
+   * request never reached the server (network-level failure).
+   */
+  statusCode?: number;
+  /**
+   * Sanitised error type (e.g. `ECONNREFUSED`, `ETIMEDOUT`). Only present on
+   * network-level failures; `undefined` on HTTP-level responses.
+   */
+  errorCode?: string;
+}
+
+// ---------------------------------------------------------------------------
 // Module-level state
 // ---------------------------------------------------------------------------
 
@@ -97,29 +135,57 @@ let stopSampling: (() => void) | null = null;
 
 const router = Router();
 
+// ---------------------------------------------------------------------------
+// Internal helpers
+// ---------------------------------------------------------------------------
+
 /**
  * Deliver a raw DLQ payload to its target URL.
  *
- * @returns `true` when the destination responded with a 2xx status.
+ * Uses `validateStatus: () => true` so every HTTP response (including 4xx/5xx)
+ * resolves rather than rejects, giving callers a stable `DeliveryResult`.
+ * Network-level failures (DNS, TLS, timeout, connection refused) are caught and
+ * surfaced via `errorCode` so failures are diagnosable in logs without exposing
+ * payload content or secrets.
+ *
+ * @returns A {@link DeliveryResult} describing the outcome of this attempt.
  */
-async function deliverRaw(
+export async function deliverRaw(
   targetUrl: string,
   eventId: string,
   payload: Record<string, unknown>,
   context: RequestContextEnvelope = {},
-): Promise<boolean> {
+): Promise<DeliveryResult> {
+  const headers: Record<string, string> = { 'X-Event-Id': eventId };
+  if (context.requestId) headers['X-Request-Id'] = context.requestId;
+  if (context.tenantId) headers['X-Tenant-Id'] = context.tenantId;
+  if (context.actorId) headers['X-Actor-Id'] = context.actorId;
+
   try {
-    const headers: Record<string, string> = { 'X-Event-Id': eventId };
-    if (context.requestId) headers['X-Request-Id'] = context.requestId;
-    if (context.tenantId) headers['X-Tenant-Id'] = context.tenantId;
-    if (context.actorId) headers['X-Actor-Id'] = context.actorId;
     const response = await axios.post(targetUrl, payload, {
       headers,
       validateStatus: () => true,
     });
-    return response.status >= 200 && response.status < 300;
-  } catch {
-    return false;
+    const success = response.status >= 200 && response.status < 300;
+    if (!success) {
+      logger.warn('DLQ delivery returned non-2xx status', {
+        eventId,
+        statusCode: response.status,
+        // targetUrl intentionally omitted — may contain tokens in path params
+      });
+    }
+    return { success, statusCode: response.status };
+  } catch (err: unknown) {
+    // Only network-level errors reach here (DNS, TLS, timeout, refused, etc.)
+    // because validateStatus suppresses HTTP-level throws.
+    const axiosErr = err as AxiosError;
+    const errorCode = axiosErr.code ?? 'UNKNOWN_NETWORK_ERROR';
+    logger.warn('DLQ delivery network failure', {
+      eventId,
+      errorCode,
+      // message intentionally not logged — may contain URL fragments with tokens
+    });
+    return { success: false, errorCode };
   }
 }
 
@@ -131,6 +197,7 @@ async function deliverRaw(
  * Load DLQ metrics sampling interval from environment variables.
  *
  * @returns Sampling interval in milliseconds.
+ * @throws {Error} when the environment value is missing, non-finite, or ≤ 0.
  */
 function loadDlqMetricsInterval(): number {
   const raw = process.env.DLQ_METRICS_INTERVAL_MS ?? '30000';
@@ -156,11 +223,17 @@ function loadDlqMetricsInterval(): number {
  * This function is idempotent — calling it multiple times will stop the
  * previous sampling loop and start a new one.
  *
+ * If the metrics sampling interval is misconfigured, or if
+ * {@link startDlqMetricsSampling} itself throws, `initializeJobs` logs a
+ * structured warning and continues without sampling rather than crashing the
+ * process. The DLQ store is still activated so replay endpoints remain
+ * operational.
+ *
  * @param customDlqStore - The DLQ store backing replay operations.
  * @returns The initialized DLQ store.
  */
 export function initializeJobs(customDlqStore: ReplayableDlqStore): ReplayableDlqStore {
-  // Stop any existing sampling loop
+  // Stop any existing sampling loop before replacing it.
   if (stopSampling !== null) {
     stopSampling();
     stopSampling = null;
@@ -168,9 +241,19 @@ export function initializeJobs(customDlqStore: ReplayableDlqStore): ReplayableDl
 
   dlqStore = customDlqStore;
 
-  // Start DLQ metrics sampling
-  const intervalMs = loadDlqMetricsInterval();
-  stopSampling = startDlqMetricsSampling(dlqStore, intervalMs);
+  // Start DLQ metrics sampling. Guard against misconfigured env vars and any
+  // unexpected throw from startDlqMetricsSampling — the process must stay up
+  // even if sampling cannot start (replay endpoints remain fully operational).
+  try {
+    const intervalMs = loadDlqMetricsInterval();
+    stopSampling = startDlqMetricsSampling(dlqStore, intervalMs);
+  } catch (err: unknown) {
+    const message = err instanceof Error ? err.message : String(err);
+    logger.warn('[api/jobs] DLQ metrics sampling could not be started — replay endpoints remain active', {
+      reason: message,
+    });
+    stopSampling = null;
+  }
 
   return dlqStore;
 }
@@ -206,7 +289,21 @@ const adminOnly = [requireAuth, requireRole('admin')];
 
 /**
  * POST /jobs/dlq/:id/replay
- * Replays an individual dead letter queue message back through the delivery stack.
+ *
+ * Replays a single dead-letter-queue message back through the delivery stack.
+ *
+ * ### Atomicity contract
+ * The operation is logically sequenced as:
+ *   1. Check idempotency key — short-circuit on duplicate.
+ *   2. Deliver payload to `targetUrl`.
+ *   3. Remove DLQ entry (delivery confirmed).
+ *   4. Register idempotency key (prevents future re-delivery).
+ *
+ * Steps 3 and 4 are not wrapped in a distributed transaction. If the process
+ * crashes after step 3 but before step 4, the next replay attempt will receive
+ * 404 (entry already removed) and cannot re-deliver — this is the safe
+ * at-most-once outcome. The alternative (mark-before-remove) would risk
+ * permanent data loss if `removeEntry` fails after the key was marked.
  */
 router.post(
   '/jobs/dlq/:id/replay',
@@ -236,7 +333,8 @@ router.post(
         return;
       }
 
-      // Check the event idempotency layer cache before delivery
+      // Step 1: idempotency check — if the event was already processed by a
+      // previous successful replay, short-circuit without re-delivering.
       const isDuplicate = await IdempotencyLayer.isEventProcessed(dlqItem.eventId);
       if (isDuplicate) {
         incrementDlqReplay('idempotent_noop');
@@ -244,21 +342,36 @@ router.post(
         return;
       }
 
-      // Redact sensitive payload properties before delivery logic processing
+      // Step 2: redact secrets, then attempt delivery.
       const safePayload = redactPayload(dlqItem.payload);
       const context = extractRequestContext(req);
+      const result = await deliverRaw(dlqItem.targetUrl, dlqItem.eventId, safePayload, context);
 
-      const deliverySuccess = await deliverRaw(dlqItem.targetUrl, dlqItem.eventId, safePayload, context);
-
-      if (deliverySuccess) {
+      if (result.success) {
+        // Step 3: remove from DLQ — delivery is confirmed.
         await dlqStore.removeEntry(id);
+
+        // Step 4: register idempotency key — suppresses future re-delivery.
+        // If this step fails the process is still correct (at-most-once): the
+        // entry is gone so a second replay attempt will get 404.
         await IdempotencyLayer.markEventProcessed(dlqItem.eventId);
+
         incrementDlqReplay('success');
-        res.status(200).json({ status: 'success', message: 'DLQ record replayed and processed', auditReason: reason });
+        res.status(200).json({
+          status: 'success',
+          message: 'DLQ record replayed and processed',
+          auditReason: reason,
+        });
       } else {
+        // Delivery failed — increment attempt counter for poison-message detection.
         await dlqStore.incrementReplayAttempts(id);
         incrementDlqReplay('failed');
-        res.status(500).json({ status: 'failed', error: 'Delivery transmission failed during retry execution' });
+        res.status(500).json({
+          status: 'failed',
+          error: 'Delivery transmission failed during retry execution',
+          ...(result.statusCode !== undefined && { statusCode: result.statusCode }),
+          ...(result.errorCode !== undefined && { errorCode: result.errorCode }),
+        });
       }
     } catch (error) {
       incrementDlqReplay('error');
@@ -269,7 +382,18 @@ router.post(
 
 /**
  * POST /jobs/dlq/replay
- * Performs batch replay over an arbitrary array of target active DLQ item IDs.
+ *
+ * Batch replay over an arbitrary array of DLQ record IDs.
+ *
+ * ### Partial-failure semantics
+ * Each record is processed independently. Per-item errors (store failure,
+ * unexpected throw) are caught, counted as failures, and logged — they do not
+ * abort the loop or discard already-committed deliveries. The response always
+ * includes `successIds` so callers can reconcile what was committed even when
+ * the overall response status is 200 with non-zero `failureCount`.
+ *
+ * An outer `try/catch` covers unrecoverable errors (e.g. store unavailable
+ * before the loop starts) and delegates to Express error handling via `next`.
  */
 router.post(
   '/jobs/dlq/replay',
@@ -294,38 +418,60 @@ router.post(
       }
 
       const summary = { successCount: 0, noOpCount: 0, failureCount: 0 };
+      // Track IDs that were successfully delivered and removed so callers can
+      // reconcile even when failureCount > 0.
+      const successIds: string[] = [];
       const context = extractRequestContext(req);
 
       for (const id of ids as string[]) {
-        const dlqItem = await dlqStore.getEntryById(id);
-        if (!dlqItem) {
-          summary.failureCount++;
-          continue;
-        }
+        try {
+          const dlqItem = await dlqStore.getEntryById(id);
+          if (!dlqItem) {
+            summary.failureCount++;
+            continue;
+          }
 
-        const isDuplicate = await IdempotencyLayer.isEventProcessed(dlqItem.eventId);
-        if (isDuplicate) {
-          incrementDlqReplay('idempotent_noop');
-          summary.noOpCount++;
-          continue;
-        }
+          // Idempotency guard — skip already-processed events.
+          const isDuplicate = await IdempotencyLayer.isEventProcessed(dlqItem.eventId);
+          if (isDuplicate) {
+            incrementDlqReplay('idempotent_noop');
+            summary.noOpCount++;
+            continue;
+          }
 
-        const safePayload = redactPayload(dlqItem.payload);
-        const deliverySuccess = await deliverRaw(dlqItem.targetUrl, dlqItem.eventId, safePayload, context);
+          const safePayload = redactPayload(dlqItem.payload);
+          const result = await deliverRaw(dlqItem.targetUrl, dlqItem.eventId, safePayload, context);
 
-        if (deliverySuccess) {
-          await dlqStore.removeEntry(id);
-          await IdempotencyLayer.markEventProcessed(dlqItem.eventId);
-          incrementDlqReplay('success');
-          summary.successCount++;
-        } else {
-          await dlqStore.incrementReplayAttempts(id);
-          incrementDlqReplay('failed');
+          if (result.success) {
+            // Remove before marking — see atomicity contract on the single-item handler.
+            await dlqStore.removeEntry(id);
+            await IdempotencyLayer.markEventProcessed(dlqItem.eventId);
+            incrementDlqReplay('success');
+            summary.successCount++;
+            successIds.push(id);
+          } else {
+            await dlqStore.incrementReplayAttempts(id);
+            incrementDlqReplay('failed');
+            summary.failureCount++;
+          }
+        } catch (itemError: unknown) {
+          // Per-item errors must not abort the batch. Log with enough context
+          // to diagnose without leaking payload content.
+          const message = itemError instanceof Error ? itemError.message : 'unknown error';
+          logger.error('Batch DLQ replay: unexpected error processing item', {
+            dlqItemId: id,
+            error: message,
+          });
           summary.failureCount++;
         }
       }
 
-      res.status(200).json({ status: 'batch_completed', auditReason: reason, details: summary });
+      res.status(200).json({
+        status: 'batch_completed',
+        auditReason: reason,
+        details: summary,
+        successIds,
+      });
     } catch (error) {
       next(error);
     }

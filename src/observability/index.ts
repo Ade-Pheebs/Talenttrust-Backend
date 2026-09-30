@@ -8,17 +8,10 @@ export {
 export {
   MetricsService,
   type MetricsServiceLike,
-  type ReputationErrorCause,
-  type ReputationOperation,
-  type ReputationRequestMetric,
-  type ReputationRequestStatus,
   type WebhookOutcome,
+  type MilestoneOperation,
+  type MilestoneOperationStatus,
 } from './metrics-service';
-export {
-  classifyReputationResponse,
-  createReputationObservabilityMiddleware,
-  type ReputationObservabilityOptions,
-} from './reputation-observability';
 export {
   readObservabilityConfig,
   type ObservabilityConfig,

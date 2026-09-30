@@ -95,7 +95,11 @@ export class SqliteAuditRepository implements AuditLogRepository {
       return entry;
     });
 
-    return insert(input);
+    // Acquire SQLite's writer lock before reading the chain tip. With a
+    // deferred transaction, competing writers can read the same snapshot and
+    // then fail while upgrading to a write lock instead of serializing cleanly.
+    const immediate = (insert as typeof insert & { immediate?: (payload: CreateAuditEntryInput) => AuditEntry }).immediate;
+    return typeof immediate === 'function' ? immediate(input) : insert(input);
   }
 
   getById(id: string): AuditEntry | undefined {

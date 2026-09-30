@@ -1,3 +1,4 @@
+import { randomUUID } from 'crypto';
 import { createWriteStream, createReadStream, promises as fsp } from 'fs';
 import { pipeline } from 'stream/promises';
 import { Readable } from 'stream';
@@ -8,11 +9,15 @@ import { AuditService, auditService } from './service';
 import { redactBody } from './redact';
 import type { AuditEntry, AuditQuery } from './types';
 
+export const AUDIT_EXPORT_SCHEMA_VERSION = 1 as const;
+
 export interface AuditExportResult {
   filePath: string;
   fileName: string;
   bytesWritten: number;
   recordCount: number;
+  /** Schema version of the export payload; incremented on breaking changes. */
+  schemaVersion: typeof AUDIT_EXPORT_SCHEMA_VERSION;
   openReadStream(): ReadStream;
   cleanup(): Promise<void>;
 }
@@ -25,6 +30,11 @@ export interface AuditExportServiceOptions {
    * @default 500
    */
   batchSize?: number;
+}
+
+export interface AuditExportStreamResult extends Omit<AuditExportResult, 'openReadStream'> {
+  /** Always true for stream helpers: the temp file is removed before resolving. */
+  cleanedUp: true;
 }
 
 /**
@@ -63,6 +73,9 @@ const CSV_HEADERS = [
   'correlationId',
   'metadata',
 ] as const;
+
+/** Public, stable contract for the CSV column order. */
+export const AUDIT_EXPORT_CSV_HEADERS: readonly string[] = CSV_HEADERS;
 
 type CsvColumn = (typeof CSV_HEADERS)[number];
 
@@ -136,6 +149,11 @@ export class AuditExportService {
       options.exportRoot ?? path.join(tmpdir(), 'talenttrust-audit-exports'),
     );
     this.batchSize = Math.max(options.batchSize ?? 500, 1);
+  }
+
+  /** Returns the stable CSV header order used by every CSV export. */
+  getCsvHeaders(): readonly string[] {
+    return CSV_HEADERS;
   }
 
   // ─── NDJSON export ─────────────────────────────────────────────────────────

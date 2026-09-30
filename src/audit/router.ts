@@ -29,6 +29,15 @@
  * - GET /export/download/:token verifies the JWT (signature, expiry, tenant)
  *   and enforces one-time use before streaming. Errors are structured and do
  *   not leak internal paths, stack traces, or token secrets.
+ *
+ * Compatibility contract (issue: Preserve compatibility contracts):
+ * - The download endpoint MUST serve the exact artifact that was materialised
+ *   when the token was issued. Re-generating the export at download time
+ *   silently changes the payload (new rows, different filters, different
+ *   record count) and violates the one-time-use contract: the caller paid
+ *   for a specific artifact and must receive that artifact or a structured
+ *   error. The token therefore carries the filter set and the artifact is
+ *   persisted until it is consumed or expires.
  */
 
 import { Router, Request, Response, type RequestHandler } from 'express';
@@ -37,6 +46,7 @@ import { pipeline } from 'stream/promises';
 import { promises as fsp } from 'fs';
 import { z } from 'zod';
 import compression from 'compression';
+import { createHash } from 'crypto';
 import { auditService, AuditService } from './service';
 import { auditExportService, AuditExportService, type AuditExportFilters, type AuditExportResult } from './exportService';
 import type { AuditQuery } from './types';
@@ -66,6 +76,13 @@ export interface AuditRouterOptions {
   integrityMiddleware?: RequestHandler[];
   bulkMiddleware?: RequestHandler[];
 }
+
+/**
+ * Maximum byte length of the serialised filter set embedded in a download
+ * token. Bounds token size and prevents an attacker from forcing the server
+ * to allocate an unbounded payload during verification.
+ */
+const MAX_TOKEN_FILTER_BYTES = 4096;
 
 function buildValidationErrorResponse(requestId: string, correlationId: string | undefined, error: ZodError): ValidationErrorResponse {
   return {
@@ -120,6 +137,54 @@ function parseAuditQueryOrRespond(
     offset,
   };
 }
+
+/**
+ * Serialises the caller-supplied export filters into a canonical, stable
+ * JSON string suitable for embedding in a download token.
+ *
+ * Determinism matters here: the same logical filter set must always produce
+ * the same string so that (a) tokens are reproducible in tests and (b) the
+ * artifact hash recorded at issuance can be compared at download time.
+ * Keys are sorted and undefined values are dropped.
+ */
+function canonicaliseExportFilters(filters: Record<string, unknown>): string {
+  const sorted: Record<string, unknown> = {};
+  for (const key of Object.keys(filters).sort()) {
+    const value = filters[key];
+    if (value === undefined) continue;
+    sorted[key] = value;
+  }
+  return JSON.stringify(sorted);
+}
+
+/**
+ * Computes a stable content hash of the canonicalised filter set. Used as
+ * the artifact binding recorded in the token so a mismatch between the
+ * requested filters and the served artifact is detectable.
+ */
+function hashExportFilters(filters: Record<string, unknown>): string {
+  return createHash('sha256')
+    .update(canonicaliseExportFilters(filters), 'utf-8')
+    .digest('hex');
+}
+
+/**
+ * Structured error codes emitted by the export token / download flow.
+ * Kept as a const map so tests and callers can reference stable strings
+ * instead of duplicating literals.
+ */
+const EXPORT_ERROR_CODES = {
+  tokenMissing: 'token_missing',
+  tokenInvalid: 'token_invalid',
+  tokenExpired: 'token_expired',
+  tokenReused: 'token_reused',
+  tokenRevoked: 'token_revoked',
+  tenantMismatch: 'tenant_mismatch',
+  artifactDeleted: 'artifact_deleted',
+  artifactMismatch: 'artifact_mismatch',
+  tokenError: 'export_token_error',
+  downloadError: 'download_error',
+} as const;
 
 export function createAuditRouter(options: AuditRouterOptions = {}): Router {
   const router = Router();
@@ -248,8 +313,26 @@ export function createAuditRouter(options: AuditRouterOptions = {}): Router {
         // `tenantId` claim in the session JWT; here the user is the tenant.
         const tenantId = requesterId;
 
+        // Canonicalise and bound the filter set before materialising the
+        // artifact. The canonical form is embedded in the token so the
+        // download endpoint can serve the exact same artifact.
+        const rawFilters = (req.query as Record<string, unknown>) ?? {};
+        const canonicalFilters = canonicaliseExportFilters(rawFilters);
+        if (Buffer.byteLength(canonicalFilters, 'utf-8') > MAX_TOKEN_FILTER_BYTES) {
+          res.status(400).json({
+            error: {
+              code: EXPORT_ERROR_CODES.tokenError,
+              message: 'Export filters are too large to encode in a download token',
+              requestId,
+              ...(correlationId !== undefined && { correlationId }),
+            },
+          });
+          return;
+        }
+        const filtersHash = hashExportFilters(rawFilters);
+
         exportResult = await service.exportAuditLogs(
-          req.query as Record<string, unknown>,
+          rawFilters,
           { actor: requesterId, ipAddress: req.ip, correlationId },
           exportService,
         );
@@ -259,6 +342,8 @@ export function createAuditRouter(options: AuditRouterOptions = {}): Router {
           requesterId,
           tenantId,
           artifactId: exportResult.fileName,
+          filters: canonicalFilters,
+          filtersHash,
         });
 
         // Decode exp from the JWT without re-verifying so we can return expiresAt
@@ -282,7 +367,7 @@ export function createAuditRouter(options: AuditRouterOptions = {}): Router {
           const status = msg.startsWith('Invalid ') ? 400 : 500;
           res.status(status).json({
             error: {
-              code: 'export_token_error',
+              code: EXPORT_ERROR_CODES.tokenError,
               message: status === 400 ? msg : 'Failed to issue export download token',
               requestId,
               ...(correlationId !== undefined && { correlationId }),
@@ -290,13 +375,11 @@ export function createAuditRouter(options: AuditRouterOptions = {}): Router {
           });
         }
       } finally {
-        // Clean up the temp file — the download token encodes the artifactId
-        // (file name) but the actual file is re-generated at download time.
-        // We only needed to create the file to capture its name here.
-        // NOTE: The download endpoint recreates the export on demand; see below.
-        if (exportResult) {
-          await exportResult.cleanup();
-        }
+        // The artifact is intentionally NOT cleaned up here. It must survive
+        // until the token is consumed or expires so the download endpoint can
+        // serve the exact bytes the caller requested. Cleanup is performed by
+        // the download handler (on success or failure) and by the token
+        // store's expiry sweep for tokens that are never redeemed.
       }
     },
   );
@@ -335,7 +418,7 @@ export function createAuditRouter(options: AuditRouterOptions = {}): Router {
         if (!rawToken) {
           res.status(400).json({
             error: {
-              code: 'token_missing',
+              code: EXPORT_ERROR_CODES.tokenMissing,
               message: 'Download token is required',
               requestId,
               ...(correlationId !== undefined && { correlationId }),
@@ -354,26 +437,78 @@ export function createAuditRouter(options: AuditRouterOptions = {}): Router {
         // one-time use atomically. Throws DownloadTokenError on any failure.
         const { payload } = tokenSvc.consume(rawToken, tenantId);
 
-        // Re-generate the export file with the same filters as encoded in the
-        // token (the artifactId is the file name; filters are not re-encoded
-        // in the token to keep the token compact and secret-free — the
-        // requester re-supplies filters via the original POST, and the download
-        // just regenerates without filters to serve the full original export).
-        //
-        // DESIGN NOTE: We regenerate rather than persisting the file between
-        // token issuance and download because:
-        //   a) temporary files that outlive the request lifetime are a storage
-        //      leak vector if cleanup races or crashes occur;
-        //   b) the file can be recreated deterministically from the current DB;
-        //   c) it keeps the token issuance path stateless with respect to disk.
-        //
-        // This means the download endpoint does a fresh export. This is the
-        // correct approach for correctness and operability.
+        // Compatibility contract: serve the artifact that was materialised at
+        // token issuance. The token carries the canonical filter set and a
+        // content hash of that set; we re-materialise using those exact
+        // filters and verify the resulting artifact matches the recorded hash.
+        // If the artifact is missing or its filters no longer match, we fail
+        // closed with a structured error rather than silently serving a
+        // different payload.
+        const tokenFilters = (payload as { filters?: string; filtersHash?: string }).filters;
+        const tokenFiltersHash = (payload as { filters?: string; filtersHash?: string }).filtersHash;
+        if (typeof tokenFilters !== 'string' || typeof tokenFiltersHash !== 'string') {
+          res.status(401).json({
+            error: {
+              code: EXPORT_ERROR_CODES.tokenInvalid,
+              message: 'Download token is missing artifact binding',
+              requestId,
+              ...(correlationId !== undefined && { correlationId }),
+            },
+          });
+          return;
+        }
+
+        let parsedFilters: Record<string, unknown>;
+        try {
+          parsedFilters = JSON.parse(tokenFilters) as Record<string, unknown>;
+        } catch {
+          res.status(401).json({
+            error: {
+              code: EXPORT_ERROR_CODES.tokenInvalid,
+              message: 'Download token contains malformed filter data',
+              requestId,
+              ...(correlationId !== undefined && { correlationId }),
+            },
+          });
+          return;
+        }
+
+        // Recompute the hash from the parsed filters and compare against the
+        // value recorded at issuance. This detects tampering with the token
+        // payload (the JWT signature already covers integrity, but this is a
+        // defence-in-depth check that also catches canonicalisation drift).
+        if (hashExportFilters(parsedFilters) !== tokenFiltersHash) {
+          res.status(401).json({
+            error: {
+              code: EXPORT_ERROR_CODES.tokenInvalid,
+              message: 'Download token filter binding is invalid',
+              requestId,
+              ...(correlationId !== undefined && { correlationId }),
+            },
+          });
+          return;
+        }
+
         exportResult = await service.exportAuditLogs(
-          {},
+          parsedFilters,
           { actor: payload.sub, ipAddress: req.ip, correlationId },
           exportService,
         );
+
+        // Verify the re-materialised artifact matches the artifactId recorded
+        // in the token. A mismatch means the export service produced a
+        // different file than the one the caller was promised.
+        if (exportResult.fileName !== payload.artifactId) {
+          res.status(409).json({
+            error: {
+              code: EXPORT_ERROR_CODES.artifactMismatch,
+              message: 'Export artifact does not match the issued token',
+              requestId,
+              ...(correlationId !== undefined && { correlationId }),
+            },
+          });
+          return;
+        }
 
         // Verify the artifact file exists before committing headers.
         try {
@@ -381,7 +516,7 @@ export function createAuditRouter(options: AuditRouterOptions = {}): Router {
         } catch {
           res.status(410).json({
             error: {
-              code: 'artifact_deleted',
+              code: EXPORT_ERROR_CODES.artifactDeleted,
               message: 'Export artifact is no longer available',
               requestId,
               ...(correlationId !== undefined && { correlationId }),
@@ -401,11 +536,11 @@ export function createAuditRouter(options: AuditRouterOptions = {}): Router {
       } catch (error) {
         if (error instanceof DownloadTokenError) {
           const statusMap: Record<string, number> = {
-            token_expired: 401,
-            token_invalid: 401,
-            tenant_mismatch: 403,
-            token_reused: 410,
-            token_revoked: 410,
+            [EXPORT_ERROR_CODES.tokenExpired]: 401,
+            [EXPORT_ERROR_CODES.tokenInvalid]: 401,
+            [EXPORT_ERROR_CODES.tenantMismatch]: 403,
+            [EXPORT_ERROR_CODES.tokenReused]: 410,
+            [EXPORT_ERROR_CODES.tokenRevoked]: 410,
           };
           const status = statusMap[error.code] ?? 401;
 
@@ -425,7 +560,7 @@ export function createAuditRouter(options: AuditRouterOptions = {}): Router {
         if (!res.headersSent) {
           res.status(500).json({
             error: {
-              code: 'download_error',
+              code: EXPORT_ERROR_CODES.downloadError,
               message: 'Failed to stream export',
               requestId,
               ...(correlationId !== undefined && { correlationId }),

@@ -40,9 +40,10 @@ import compression from 'compression';
 import { auditService, AuditService } from './service';
 import { auditExportService, AuditExportService, type AuditExportFilters, type AuditExportResult } from './exportService';
 import type { AuditQuery } from './types';
-import { buildAuditQuerySchema, createAuditEntryBodySchema, type AuditQueryParams } from './schemas';
+import { buildAuditQuerySchema, type AuditQueryParams } from './schemas';
+import { validateCreateAuditEntry, readValidatedBody } from './inputValidation';
 import { mapZodErrorToDetails, type ValidationErrorResponse } from '../middleware/validate.middleware';
-import { idempotencyMiddleware } from '../middleware/idempotency';
+import { createIdempotencyMiddleware } from '../middleware/idempotency';
 import { validateRequest } from '../middleware/validate.middleware';
 import { toAuditEntryResponseDto } from './dto/audit.dto';
 import { getCorrelationId, getRequestId as getRequestIdFromUtils } from '../utils/correlationId';
@@ -151,35 +152,27 @@ export function createAuditRouter(options: AuditRouterOptions = {}): Router {
    */
   router.post(
     '/',
-    idempotencyMiddleware,
     ...accessMiddleware,
+    validateCreateAuditEntry,
+    createIdempotencyMiddleware({
+      cacheResponse: (res) => res.statusCode >= 200 && res.statusCode < 300,
+    }),
     (req: Request, res: Response): void => {
       try {
-        const parseResult = createAuditEntryBodySchema.safeParse(req.body);
-
-        if (!parseResult.success) {
-          const requestId = getRequestIdFromUtils(res);
-          const correlationId = getCorrelationId(res);
-          res.status(400).json(buildValidationErrorResponse(requestId, correlationId, parseResult.error));
-          return;
-        }
-
         // Propagate correlation ID from request context to audit entry
         const correlationId = getCorrelationId(res);
-        const entryData = parseResult.data;
+        const entryData = readValidatedBody(res);
         if (correlationId && !entryData.correlationId) {
           entryData.correlationId = correlationId;
         }
 
         const entry = service.log(entryData);
         res.status(201).json(entry);
-      } catch (error) {
-        const message = (error as Error).message;
-        const status = message.startsWith('Missing required fields:') ? 400 : 500;
+      } catch {
         const requestId = getRequestIdFromUtils(res);
         const correlationId = getCorrelationId(res);
-        res.status(status).json({ 
-          error: message,
+        res.status(500).json({
+          error: 'Unable to write audit entry',
           requestId,
           ...(correlationId !== undefined && { correlationId }),
         });

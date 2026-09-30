@@ -63,11 +63,8 @@
 
 import type { Request, Response, NextFunction } from 'express';
 import { z } from 'zod';
-import {
-  AUDIT_ACTIONS,
-  AUDIT_SEVERITIES,
-  type CreateAuditEntryInput,
-} from './types';
+import { getCorrelationId } from '../utils/correlationId';
+import { AUDIT_ACTIONS, AUDIT_SEVERITIES, type CreateAuditEntryInput } from './types';
 
 // ── Bounds ────────────────────────────────────────────────────────────────────
 
@@ -111,11 +108,11 @@ export const MAX_METADATA_NUMBER = Number.MAX_SAFE_INTEGER;
  * prototype downstream. `JSON.parse` does create `__proto__` as an own
  * property, so this is reachable from a request body.
  */
-export const FORBIDDEN_METADATA_KEYS: readonly string[] = [
+export const FORBIDDEN_METADATA_KEYS: readonly string[] = Object.freeze([
   '__proto__',
   'constructor',
   'prototype',
-];
+]);
 
 /**
  * Control characters (C0, C1 and DEL) are rejected in identifier fields: they
@@ -254,9 +251,21 @@ function formatPath(path: Array<string | number>): string {
     if (typeof segment === 'number') {
       return `${acc}[${segment}]`;
     }
-    return acc.length === 0 ? segment : `${acc}.${segment}`;
+    const safe = safePathSegment(segment);
+    return acc.length === 0 ? safe : `${acc}.${safe}`;
   }, '');
 }
+
+/** Never echo arbitrary, oversized or multiline property names in errors. */
+function safePathSegment(value: string | number): string {
+  const text = String(value);
+  return /^[A-Za-z0-9_.:-]{1,128}$/.test(text) ? text : '<key>';
+}
+
+const MAX_VALIDATION_ISSUES = 64;
+// Every visited value consumes at least one serialized byte. This permits
+// all payloads inside the byte bound while bounding work on invalid trees.
+const MAX_METADATA_NODES = MAX_METADATA_BYTES;
 
 /**
  * Recursively checks one `metadata` value against the structural bounds.
@@ -271,13 +280,24 @@ function walkMetadataValue(
   depth: number,
   seen: WeakSet<object>,
   issues: MetadataIssue[],
-): void {
+  budget: { nodes: number },
+): unknown {
+  if (issues.length >= MAX_VALIDATION_ISSUES) return undefined;
+  budget.nodes += 1;
+  if (budget.nodes > MAX_METADATA_NODES) {
+    issues.push({
+      path: [],
+      code: AUDIT_VALIDATION_CODES.METADATA_TOO_LARGE,
+      message: 'metadata exceeds the validation work limit',
+    });
+    return undefined;
+  }
   // Messages address the field the way an API client sees it, i.e. rooted at
   // 'metadata', while the issue path stays relative for Zod to prefix.
   const label = formatPath(['metadata', ...path]);
 
   if (value === null) {
-    return;
+    return null;
   }
 
   switch (typeof value) {
@@ -289,7 +309,7 @@ function walkMetadataValue(
           message: `${label} must be at most ${MAX_METADATA_STRING_LENGTH} characters`,
         });
       }
-      return;
+      return value;
 
     case 'number':
       if (!Number.isFinite(value)) {
@@ -305,10 +325,10 @@ function walkMetadataValue(
           message: `${label} magnitude must be at most ${MAX_METADATA_NUMBER}`,
         });
       }
-      return;
+      return value;
 
     case 'boolean':
-      return;
+      return value;
 
     case 'object':
       break;
@@ -353,16 +373,39 @@ function walkMetadataValue(
         message: `${label} must have at most ${MAX_METADATA_ARRAY_ITEMS} items`,
       });
     }
-    container
-      .slice(0, MAX_METADATA_ARRAY_ITEMS)
-      .forEach((item, index) =>
-        walkMetadataValue(item, [...path, index], depth + 1, seen, issues),
+    const copy: unknown[] = [];
+    for (let index = 0; index < Math.min(container.length, MAX_METADATA_ARRAY_ITEMS); index += 1) {
+      const descriptor = Object.getOwnPropertyDescriptor(container, String(index));
+      if (!descriptor || !('value' in descriptor)) {
+        issues.push({
+          path: [...path, index],
+          code: AUDIT_VALIDATION_CODES.METADATA_NOT_SERIALISABLE,
+          message: 'metadata arrays must contain explicit data values',
+        });
+        break;
+      }
+      copy.push(
+        walkMetadataValue(descriptor.value, [...path, index], depth + 1, seen, issues, budget),
       );
+      if (budget.nodes > MAX_METADATA_NODES || issues.length >= MAX_VALIDATION_ISSUES) break;
+    }
     seen.delete(container);
-    return;
+    return copy;
   }
 
-  const entries = Object.entries(container as Record<string, unknown>);
+  const prototype = Object.getPrototypeOf(container);
+  if (prototype !== Object.prototype && prototype !== null) {
+    issues.push({
+      path,
+      code: AUDIT_VALIDATION_CODES.INVALID_TYPE,
+      message: `${label} must be a plain JSON object`,
+    });
+    seen.delete(container);
+    return undefined;
+  }
+  const descriptors = Object.getOwnPropertyDescriptors(container);
+  const entries = Object.entries(descriptors).filter(([, descriptor]) => descriptor.enumerable);
+  const copy: Record<string, unknown> = Object.create(null);
 
   if (entries.length > MAX_METADATA_ENTRIES) {
     issues.push({
@@ -372,10 +415,10 @@ function walkMetadataValue(
     });
   }
 
-  for (const [key, child] of entries) {
+  for (const [key, descriptor] of entries.slice(0, MAX_METADATA_ENTRIES)) {
     if (FORBIDDEN_METADATA_KEYS.includes(key)) {
       issues.push({
-        path: [...path, key],
+        path: [...path, safePathSegment(key)],
         code: AUDIT_VALIDATION_CODES.METADATA_FORBIDDEN_KEY,
         message: `${formatPath(['metadata', ...path, key])} is a reserved key and is not allowed`,
       });
@@ -384,17 +427,34 @@ function walkMetadataValue(
 
     if (key.length > MAX_METADATA_KEY_LENGTH) {
       issues.push({
-        path: [...path, key],
+        path: [...path, safePathSegment(key)],
         code: AUDIT_VALIDATION_CODES.METADATA_KEY_TOO_LONG,
         message: `metadata keys must be at most ${MAX_METADATA_KEY_LENGTH} characters`,
       });
       continue;
     }
 
-    walkMetadataValue(child, [...path, key], depth + 1, seen, issues);
+    if (!('value' in descriptor)) {
+      issues.push({
+        path: [...path, safePathSegment(key)],
+        code: AUDIT_VALIDATION_CODES.METADATA_NOT_SERIALISABLE,
+        message: 'metadata must contain data properties, not accessors',
+      });
+      continue;
+    }
+    copy[key] = walkMetadataValue(
+      descriptor.value,
+      [...path, safePathSegment(key)],
+      depth + 1,
+      seen,
+      issues,
+      budget,
+    );
+    if (budget.nodes > MAX_METADATA_NODES || issues.length >= MAX_VALIDATION_ISSUES) break;
   }
 
   seen.delete(container);
+  return copy;
 }
 
 /**
@@ -404,37 +464,50 @@ function walkMetadataValue(
  * @returns One entry per violation. An empty array means the value is valid.
  */
 export function validateMetadata(metadata: unknown): MetadataIssue[] {
+  return inspectMetadata(metadata).issues;
+}
+
+function inspectMetadata(metadata: unknown): {
+  issues: MetadataIssue[];
+  data?: Record<string, unknown>;
+} {
   const issues: MetadataIssue[] = [];
-
-  if (typeof metadata !== 'object' || metadata === null || Array.isArray(metadata)) {
-    return [
-      {
-        path: [],
-        code: AUDIT_VALIDATION_CODES.INVALID_TYPE,
-        message: 'metadata must be a JSON object',
-      },
-    ];
-  }
-
+  let data: Record<string, unknown>;
   try {
-    walkMetadataValue(metadata, [], 1, new WeakSet(), issues);
+    if (typeof metadata !== 'object' || metadata === null || Array.isArray(metadata)) {
+      return {
+        issues: [
+          {
+            path: [],
+            code: AUDIT_VALIDATION_CODES.INVALID_TYPE,
+            message: 'metadata must be a JSON object',
+          },
+        ],
+      };
+    }
+    data = walkMetadataValue(metadata, [], 1, new WeakSet(), issues, { nodes: 0 }) as Record<
+      string,
+      unknown
+    >;
   } catch {
     // Reading a property can itself throw (a getter that raises, an exotic
     // proxy). Such a value cannot be serialised into an audit entry either, so
     // report it rather than letting the exception escape a total function.
-    return [
-      {
-        path: [],
-        code: AUDIT_VALIDATION_CODES.METADATA_NOT_SERIALISABLE,
-        message: 'metadata must be JSON-serialisable',
-      },
-    ];
+    return {
+      issues: [
+        {
+          path: [],
+          code: AUDIT_VALIDATION_CODES.METADATA_NOT_SERIALISABLE,
+          message: 'metadata must be JSON-serialisable',
+        },
+      ],
+    };
   }
 
   // Size is only meaningful once the shape is known to be serialisable, and a
   // structurally invalid payload has already been rejected above.
   if (issues.length === 0) {
-    const bytes = serialisedByteLength(metadata);
+    const bytes = serialisedByteLength(data);
     if (bytes === undefined) {
       issues.push({
         path: [],
@@ -450,7 +523,7 @@ export function validateMetadata(metadata: unknown): MetadataIssue[] {
     }
   }
 
-  return issues;
+  return { issues, ...(issues.length === 0 && { data }) };
 }
 
 /** Serialised byte length, or `undefined` when the value cannot be stringified. */
@@ -499,12 +572,13 @@ export const CreateAuditEntrySchema = z
     resourceId: identifierSchema('resourceId', MAX_ID_LENGTH),
     metadata: z
       .unknown()
-      .superRefine((value, ctx) => {
-        for (const issue of validateMetadata(value)) {
+      .transform((value, ctx) => {
+        const inspected = inspectMetadata(value);
+        for (const issue of inspected.issues) {
           addIssue(ctx, issue.code, issue.message, issue.path);
         }
+        return inspected.data ?? {};
       })
-      .transform((value) => value as Record<string, unknown>)
       .optional()
       .default({}),
     ipAddress: z
@@ -578,9 +652,7 @@ function issueCode(issue: z.ZodIssue): string {
       return AUDIT_VALIDATION_CODES.NOT_FINITE;
     case z.ZodIssueCode.custom: {
       const params = (issue as z.ZodIssueOptionalMessage & { params?: { code?: unknown } }).params;
-      return typeof params?.code === 'string'
-        ? params.code
-        : AUDIT_VALIDATION_CODES.INVALID_VALUE;
+      return typeof params?.code === 'string' ? params.code : AUDIT_VALIDATION_CODES.INVALID_VALUE;
     }
     default:
       return AUDIT_VALIDATION_CODES.INVALID_VALUE;
@@ -595,10 +667,10 @@ function issueCode(issue: z.ZodIssue): string {
  */
 function toValidationIssues(issue: z.ZodIssue): AuditValidationIssue[] {
   if (issue.code === z.ZodIssueCode.unrecognized_keys) {
-    return issue.keys.map((key) => {
+    return issue.keys.slice(0, MAX_VALIDATION_ISSUES).map((key) => {
       const path = [...issue.path, key];
       return {
-        path: path.map(String),
+        path: path.map(safePathSegment),
         field: formatPath(path) || '(root)',
         code: AUDIT_VALIDATION_CODES.UNKNOWN_FIELD,
         message: `${formatPath(path)} is not an allowed field`,
@@ -608,7 +680,7 @@ function toValidationIssues(issue: z.ZodIssue): AuditValidationIssue[] {
 
   return [
     {
-      path: issue.path.map(String),
+      path: issue.path.map(safePathSegment),
       field: formatPath(issue.path) || '(root)',
       code: issueCode(issue),
       message: issue.message,
@@ -636,17 +708,47 @@ function toValidationIssues(issue: z.ZodIssue): AuditValidationIssue[] {
  * ```
  */
 export function validateCreateAuditEntryInput(input: unknown): AuditValidationResult {
-  const parsed = CreateAuditEntrySchema.safeParse(input);
+  try {
+    // Zod reads properties. Reject accessors before parsing and copy only
+    // own enumerable data properties; inherited fields never satisfy a body.
+    let candidate = input;
+    if (typeof input === 'object' && input !== null && !Array.isArray(input)) {
+      const prototype = Object.getPrototypeOf(input);
+      if (prototype !== Object.prototype && prototype !== null) throw new Error('Invalid record');
+      const descriptors = Object.getOwnPropertyDescriptors(input);
+      const copy: Record<string, unknown> = Object.create(null);
+      for (const [key, descriptor] of Object.entries(descriptors)) {
+        if (!descriptor.enumerable) continue;
+        if (!('value' in descriptor)) throw new Error('Invalid accessor');
+        copy[key] = descriptor.value;
+      }
+      candidate = copy;
+    }
+    const parsed = CreateAuditEntrySchema.safeParse(candidate);
 
-  if (parsed.success) {
-    return { ok: true, data: parsed.data };
+    if (parsed.success) {
+      return { ok: true, data: parsed.data };
+    }
+
+    return {
+      ok: false,
+      code: AUDIT_VALIDATION_ERROR_CODE,
+      issues: parsed.error.issues.flatMap(toValidationIssues).slice(0, MAX_VALIDATION_ISSUES),
+    };
+  } catch {
+    return {
+      ok: false,
+      code: AUDIT_VALIDATION_ERROR_CODE,
+      issues: [
+        {
+          path: [],
+          field: '(root)',
+          code: AUDIT_VALIDATION_CODES.INVALID_TYPE,
+          message: 'Audit entry must be a plain data object',
+        },
+      ],
+    };
   }
-
-  return {
-    ok: false,
-    code: AUDIT_VALIDATION_ERROR_CODE,
-    issues: parsed.error.issues.flatMap(toValidationIssues),
-  };
 }
 
 // ── Express middleware ────────────────────────────────────────────────────────
@@ -671,11 +773,8 @@ export const VALIDATED_BODY_KEY = 'validatedBody';
  * });
  * ```
  */
-export function validateCreateAuditEntry(
-  req: Request,
-  res: Response,
-  next: NextFunction,
-): void {
+export function validateCreateAuditEntry(req: Request, res: Response, next: NextFunction): void {
+  delete res.locals[VALIDATED_BODY_KEY];
   const result = validateCreateAuditEntryInput(req.body);
 
   if (!result.ok) {
@@ -687,6 +786,7 @@ export function validateCreateAuditEntry(
         code: result.code,
         message: 'Request validation failed',
         requestId,
+        ...(getCorrelationId(res) && { correlationId: getCorrelationId(res) }),
         details: result.issues,
       },
     });
@@ -706,9 +806,7 @@ export function validateCreateAuditEntry(
 export function readValidatedBody(res: Response): CreateAuditEntryInput {
   const body = res.locals[VALIDATED_BODY_KEY] as CreateAuditEntryInput | undefined;
   if (!body) {
-    throw new Error(
-      'validateCreateAuditEntry middleware must run before the audit create handler',
-    );
+    throw new Error('validateCreateAuditEntry middleware must run before the audit create handler');
   }
   return body;
 }

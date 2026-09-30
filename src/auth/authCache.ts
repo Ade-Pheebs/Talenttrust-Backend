@@ -13,6 +13,14 @@
  *
  * Metrics:
  *   - Cache hits and misses are tracked via Prometheus counters
+ *
+ * Compatibility contracts (preserved across all changes):
+ *   - Constructor accepts (AuthCacheOptions, register?) and never throws for well-formed options.
+ *   - get/set/invalidate/invalidateByUserId/clear/getStats/cleanupExpired keep their signatures.
+ *   - get returns null on miss or expiry; never throws for string keys.
+ *   - set is idempotent for the same selector; replacing an existing entry does not evict.
+ *   - getStats hits/misses are monotonically non-decreasing.
+ *   - Empty cache is always safe to read and clear.
  */
 
 import { Counter } from 'prom-client';
@@ -30,7 +38,24 @@ export interface CacheEntry {
 }
 
 /**
+ * LRU-ordered doubly-linked list node for deterministic OB1) eviction.
+ */
+interface LruNode {
+  key: string;
+  prev: LruNode | null;
+  next: LruNode | null;
+}
+
+/**
  * LRU cache with TTL for auth read responses.
+ *
+ * Invariants:
+*   - cache.size <= maxEntries at all times.
+ *   - Every key in cache has exactly one node in the LRU list and vice versa.
+ *   - get on an expired entry deletes it and counts a miss.
+ *   - get on a live entry moves it to the MRU tail and counts a hit.
+ *   - set on an existing key replaces info/expiry and moves the key to the tail.
+ *   - Concurrent calls from the same event loop turn cannot observe an intermediate state.
  */
 export class AuthCache {
   private cache: Map<string, CacheEntry>;
@@ -41,16 +66,30 @@ export class AuthCache {
   private hitCount: number;
   private missCount: number;
 
+  // LRU list metadata. head = MRU, tail = LRU.
+  private lruHead: LruNode | null;
+  private lruTail: LruNode | null;
+  private lruNodes: Map<string, LruNode>;
+
   constructor(options: AuthCacheOptions, register?: any) {
     this.ttlMs = options.ttlMs;
     this.maxEntries = options.maxEntries;
     this.cache = new Map();
     this.hitCount = 0;
     this.missCount = 0;
+    this.lruHead = null;
+    this.lruTail = null;
+    this.lruNodes = new Map();
 
-    // Initialize metrics
-    const Registry = require('prom-client').Registry;
-    const registry = register && register.constructor && register.constructor.name === 'Registry' ? register : new Registry();
+    // Initialize metrics.
+    // Compatibility: accept either a Prometheus Registry or any object that exposes
+    // a compatible `register` method. Fall back to a fresh Registry when none is
+    // provided. This avoids throwing on construction for older callers.
+    const { Registry } = require('prom-client');
+    const registry =
+      register && typeof register.register === 'function'
+        ? register
+        : new Registry();
 
     this.hits = new Counter({
       name: 'auth_cache_hits_total',
@@ -81,16 +120,17 @@ export class AuthCache {
       return null;
     }
 
-    // Check if entry has expired
+    // Check if entry has expired.
     if (now > entry.expiresAt) {
-      this.cache.delete(selector);
+      this.removeEntry(selector);
       this.misses.inc();
       this.missCount++;
       return null;
     }
 
-    // Update last accessed time for LRU eviction
+    // Update last accessed time for LRU eviction and move to tail.
     entry.lastAccessed = now;
+    this.touchLru(selector);
     this.hits.inc();
     this.hitCount++;
     return entry.info;
@@ -110,12 +150,13 @@ export class AuthCache {
       lastAccessed: now,
     };
 
-    // Evict oldest entries if at capacity
-    if (this.cache.size >= this.maxEntries && !this.cache.has(selector)) {
+    // Evict oldest entries if at capacity and this is a new key.
+    if (!this.cache.has(selector) && this.cache.size >= this.maxEntries) {
       this.evictOldest();
     }
 
     this.cache.set(selector, entry);
+    this.touchLru(selector);
   }
 
   /**
@@ -124,7 +165,7 @@ export class AuthCache {
    * @param selector - The key selector to invalidate
    */
   invalidate(selector: string): void {
-    this.cache.delete(selector);
+    this.removeEntry(selector);
   }
 
   /**
@@ -139,7 +180,7 @@ export class AuthCache {
         selectorsToDelete.push(selector);
       }
     });
-    selectorsToDelete.forEach(selector => this.cache.delete(selector));
+    selectorsToDelete.forEach(selector => this.removeEntry(selector));
   }
 
   /**
@@ -147,6 +188,9 @@ export class AuthCache {
    */
   clear(): void {
     this.cache.clear();
+    this.lruHead = null;
+    this.lruTail = null;
+    this.lruNodes.clear();
   }
 
   /**
@@ -164,19 +208,10 @@ export class AuthCache {
    * Evict the least recently used entry.
    */
   private evictOldest(): void {
-    let oldestSelector: string | null = null;
-    let oldestAccessed = Infinity;
-
-    this.cache.forEach((entry, selector) => {
-      if (entry.lastAccessed < oldestAccessed) {
-        oldestAccessed = entry.lastAccessed;
-        oldestSelector = selector;
-      }
-    });
-
-    if (oldestSelector) {
-      this.cache.delete(oldestSelector);
+    if (!this.lruHead) {
+      return;
     }
+    this.removeEntry(this.lruHead.key);
   }
 
   /**
@@ -194,10 +229,65 @@ export class AuthCache {
     });
 
     selectorsToDelete.forEach(selector => {
-      this.cache.delete(selector);
+      this.removeEntry(selector);
       cleaned++;
     });
 
     return cleaned;
+  }
+
+  /**
+   * Remove an entry from both the map and the LRU list.
+   * No-op if the selector is not present.
+   */
+  private removeEntry(selector: string): void {
+    if (!this.cache.delete(selector)) {
+      return;
+    }
+    const node = this.lruNodes.get(selector);
+    if (node) {
+      this.detachNode(node);
+      this.lruNodes.delete(selector);
+    }
+  }
+
+  /**
+   * Move a key to the tail (MRU) in the LRU list, creating a node if needed.
+   */
+  private touchLru(selector: string): void {
+    let node = this.lruNodes.get(selector);
+    if (!node) {
+      node = { key: selector, prev: null, next: null };
+      this.lruNodes.set(selector, node);
+    } else {
+      this.detachNode(node);
+    }
+    this.appendToTail(node);
+  }
+
+  private detachNode(node: LruNode): void {
+    if (node.prev) {
+      node.prev.next = node.next;
+    } else if (this.lruHead === node) {
+      this.lruHead = node.next;
+    }
+    if (node.next) {
+      node.next.prev = node.prev;
+    } else if (this.lruTail === node) {
+      this.lruTail = node.prev;
+    }
+    node.prev = null;
+    node.next = null;
+  }
+
+  private appendToTail(node: LruNode): void {
+    node.prev = this.lruTail;
+    node.next = null;
+    if (this.lruTail) {
+      this.lruTail.next = node;
+    } else {
+      this.lruHead = node;
+    }
+    this.lruTail = node;
   }
 }

@@ -349,6 +349,35 @@ Numbers, booleans, and `null`/`undefined` pass through unmodified.
 
 ---
 
+## Failure Recovery (SQLite backend)
+
+Failures in `src/audit/sqliteRepository.ts` are recovered **deterministically**:
+the same failure always triggers the same bounded sequence of actions, with no
+random jitter and no unbounded retry loop. The invariants below are documented
+in the module header and enforced by the test suite.
+
+| Invariant | How it is enforced |
+| --- | --- |
+| A failed write never leaves a partial row or a broken hash chain | The previous-hash read and the `INSERT` run in one `better-sqlite3` transaction; any throw rolls the whole transaction back |
+| Transient lock contention is retried, bounded | `SQLITE_BUSY` / `SQLITE_LOCKED` are retried up to `MAX_WRITE_ATTEMPTS` (3) with a fixed backoff; the transaction re-reads the chain tail on every attempt, so a retry can never fork the chain |
+| A missing schema self-repairs in-process | `no such table` / `no such column` / `no such index` triggers exactly one idempotent `initSchema()` repair and one retry on the **same** repository instance |
+| Non-retryable errors surface immediately | Constraint violations, disk-full, malformed input and every other deterministic error are thrown on the first attempt — a retry loop never masks a real bug |
+| Recovery is observable but not sensitive | Each recovery attempt is logged (structured JSON) with the operation name, attempt number and error code only; entry payloads and metadata are never logged |
+| Integrity checks never throw | `verifyIntegrity()` converts an unparseable row (e.g. malformed `metadata_json`) into a deterministic `{ valid: false, firstCorruptedIndex, firstCorruptedId }` report instead of crashing the monitoring job |
+
+**Operational notes**
+
+- The connection is hardened on construction with `busy_timeout = 5000`,
+  `journal_mode = WAL` and `synchronous = NORMAL` so lock contention waits
+  instead of failing fast. Pragma failures are non-fatal and logged at warn.
+- Callers that prefer fail-fast behaviour over automatic schema repair can pass
+  `new SqliteAuditRepository(db, { autoRepairSchema: false })`. The existing
+  single-argument construction is unchanged.
+- If schema repair itself fails (e.g. a read-only volume), the **original**
+  root-cause error is rethrown so the caller is not misled by a repair error.
+
+---
+
 ## Testing
 
 ```bash
@@ -364,7 +393,7 @@ single layer of the architecture:
 | --- | --- | --- |
 | `src/audit/audit.test.ts` | `AuditStore`, `auditMiddleware`, `auditRouter`, `protectedEndpointAuditMiddleware`, `redact` module | Broad integration + security threat-scenario coverage. |
 | `src/audit/service.test.ts` | `AuditService` contract | Routing of `action`/`actor`/`ipAddress`/`correlationId` to the repository, the redaction responsibility (callers must pre-process via `redactBody()`), write-failure surfacing, and convenience-wrapper severity rules. Uses a pure in-memory mock repository — no SQLite dependency. |
-| `src/audit/sqliteRepository.test.ts` | `SqliteAuditRepository` behaviour | Append → read round-trip with deeply nested metadata, every supported filter (`action`, `severity`, `actor`, `resource`, `resourceId`, `from`/`to`) and combinations thereof, pagination edge cases (`offset > count`, `limit = 0`), incremental `stream()`, transactional write-failure surfacing with no partial rows left behind, two-`:memory:`-DB isolation, and chain-integrity verification over a 100-entry chain. All tests run on a fresh in-memory SQLite connection (`':memory:'`) for determinism and DB isolation. |
+| `src/audit/sqliteRepository.test.ts` | `SqliteAuditRepository` behaviour | Append → read round-trip with deeply nested metadata, every supported filter (`action`, `severity`, `actor`, `resource`, `resourceId`, `from`/`to`) and combinations thereof, pagination edge cases (`offset > count`, `limit = 0`), incremental `stream()`, transactional write-failure surfacing with no partial rows left behind, two-`:memory:`-DB isolation, and chain-integrity verification over a 100-entry chain. Also pins the deterministic recovery policy: schema self-repair on the same instance, opt-out fail-fast, repair-failure passthrough, non-retry of deterministic errors, bounded retry of transient serialization conflicts (chain stays linear), retry-budget exhaustion, error classification, and non-throwing integrity verification of a corrupt row. All tests run on a fresh in-memory SQLite connection (`':memory:'`) for determinism and DB isolation. |
 | `src/audit/exportService.test.ts` | `AuditExportService`, `neutraliseCsvInjection` | NDJSON round-trip fidelity, RFC 4180 CSV quoting (commas, embedded quotes, newlines), CSV-injection neutralisation for leading `=`/`+`/`-`/`@` formula prefixes, empty-dataset and large-dataset (1 500-row) streaming, `AuditExportResult` contract fields, `cleanup()` removes temp directory, `streamNdjsonExport`/`streamCsvExport` pipe helpers. All tests use a fresh in-memory `AuditStore` — no live database dependency. |
 
 Coverage targets: ≥ 95% for all audit modules.

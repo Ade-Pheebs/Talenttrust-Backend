@@ -45,9 +45,23 @@
 // single default import — see the JSDoc at the constructor of
 // `SqliteAuditRepository` for why `typeof Database` is wrong.
 import Database, { Database as DbInstance } from '../db/betterSqlite3';
-import { SqliteAuditRepository } from './sqliteRepository';
+import {
+  SqliteAuditRepository,
+  MAX_WRITE_ATTEMPTS,
+  isSerializationError,
+  isMissingSchemaError,
+} from './sqliteRepository';
+import { GENESIS_HASH } from './store';
 import type { CreateAuditEntryInput } from './types';
 import { encodeCursor, decodeCursor, type CursorData } from './types';
+import { setWriteRecordImpl, type LogRecord } from '../logger';
+
+// Capture structured log records instead of emitting them to the test console.
+// The logger module is instantiated once per test file, so this override is
+// scoped to this suite and lets recovery assertions read exactly what was
+// logged without touching stdout.
+const capturedLogs: LogRecord[] = [];
+setWriteRecordImpl((record) => capturedLogs.push(record));
 
 // ─── Fixtures ───────────────────────────────────────────────────────────────
 
@@ -176,29 +190,20 @@ describe('SqliteAuditRepository', () => {
   });
 });
 
-// ─── Append() — write-failure surfacing (transactional integrity) ──────────
+// ─── Append() — deterministic failure recovery ─────────────────────────────
 
-describe('SqliteAuditRepository — append() surfaces write failures (transactional)', () => {
+describe('SqliteAuditRepository — append() failure recovery (deterministic)', () => {
   let db: DbInstance;
   let repository: SqliteAuditRepository;
 
   beforeEach(() => {
     db = new Database(':memory:');
     repository = new SqliteAuditRepository(db);
+    capturedLogs.length = 0;
   });
 
   afterEach(() => {
     db.close();
-  });
-
-  it('propagates a SQLite-level write failure out of append()', () => {
-    // Sabotage: drop the audit table AFTER the repository's idempotent
-    // initSchema() has created it. The next INSERT will hit a
-    // "no such table" error — a deterministic, real disk-level failure
-    // that exercises the prepare/run error path. We intentionally do not
-    // match the error message verbatim — better-sqlite3 may rewrite it.
-    db.exec('DROP TABLE audit_log_entries');
-    expect(() => repository.append(makeInput())).toThrow();
   });
 
   it('a failed append leaves no partial row (transactional rollback)', () => {
@@ -240,27 +245,142 @@ describe('SqliteAuditRepository — append() surfaces write failures (transactio
     ).toBe(false);
   });
 
-  it('a fresh repository on a sabotaged connection can self-recover via initSchema()', () => {
-    // The sabotaged `repository` is permanently broken after the table
-    // is dropped — its constructor has already cached `this.db` and
-    // won't re-run `initSchema`. We construct a *new* repository on the
-    // same connection and rely on the production `initSchema()` (with
-    // `CREATE TABLE IF NOT EXISTS`) to rebuild the schema: no manual
-    // `db.exec('CREATE TABLE ...')` is needed.
-    db.exec('DROP TABLE audit_log_entries');
-    expect(() => repository.append(makeInput())).toThrow();
+  it('self-repairs a dropped schema in-process and retries the write once', () => {
+    repository.append(makeInput({ actor: 'before-drop' }));
+    expect(repository.count()).toBe(1);
 
-    const recovered = new SqliteAuditRepository(db);
-    expect(() => recovered.append(makeInput({ actor: 'recovered' }))).not.toThrow();
-    expect(recovered.count()).toBe(1);
+    // Sabotage: drop the table AFTER the repository's idempotent
+    // initSchema() has created it. The next append hits a real
+    // "no such table" error, which the repository repairs deterministically
+    // and retries — on the SAME instance, no reconstruction required.
+    db.exec('DROP TABLE audit_log_entries');
+
+    const recovered = repository.append(makeInput({ actor: 'after-drop' }));
+    expect(recovered.actor).toBe('after-drop');
+    // The repaired table starts a fresh chain; rows were lost with the table.
+    expect(recovered.previousHash).toBe(GENESIS_HASH);
+    expect(repository.count()).toBe(1);
+
+    // Recovery is observable: a structured warning names the operation.
+    expect(
+      capturedLogs.some(
+        (record) => record.level === 'warn' && record.message.includes('schema missing'),
+      ),
+    ).toBe(true);
+  });
+
+  it('fails fast when schema auto-repair is explicitly disabled', () => {
+    const strict = new SqliteAuditRepository(db, { autoRepairSchema: false });
+    db.exec('DROP TABLE audit_log_entries');
+    expect(() => strict.append(makeInput())).toThrow();
+  });
+
+  it('surfaces the original error when the repair attempt itself fails', () => {
+    db.exec('DROP TABLE audit_log_entries');
+
+    // If the repair cannot rebuild the schema (e.g. a read-only volume), the
+    // caller must still see the original root-cause error, not a masked one.
+    const execSpy = jest.spyOn(db, 'exec').mockImplementation(() => {
+      throw new Error('simulated read-only filesystem');
+    });
+    try {
+      expect(() => repository.append(makeInput())).toThrow(/no such table/);
+    } finally {
+      execSpy.mockRestore();
+    }
+  });
+
+  it('does not retry a non-transient write failure (no masked bugs)', () => {
+    let insertAttempts = 0;
+    const originalPrepare = db.prepare.bind(db);
+    const insertSpy = jest.spyOn(db, 'prepare').mockImplementation(((sql: string) => {
+      if (sql.toUpperCase().includes('INSERT INTO AUDIT_LOG_ENTRIES')) {
+        insertAttempts += 1;
+        return {
+          run: () => {
+            throw new Error('simulated disk-full');
+          },
+        } as unknown as ReturnType<typeof db.prepare>;
+      }
+      return originalPrepare(sql);
+    }) as typeof db.prepare);
+
+    try {
+      expect(() => repository.append(makeInput())).toThrow('simulated disk-full');
+      // Exactly one attempt: a disk-full must never be masked by a retry.
+      expect(insertAttempts).toBe(1);
+    } finally {
+      insertSpy.mockRestore();
+    }
+  });
+
+  it('retries a transient serialization failure and keeps the chain linear', () => {
+    const first = repository.append(makeInput({ actor: 'first' }));
+
+    let insertAttempts = 0;
+    const originalPrepare = db.prepare.bind(db);
+    const insertSpy = jest.spyOn(db, 'prepare').mockImplementation(((sql: string) => {
+      if (sql.toUpperCase().includes('INSERT INTO AUDIT_LOG_ENTRIES')) {
+        insertAttempts += 1;
+        if (insertAttempts === 1) {
+          const err = new Error('database is locked') as Error & { code: number };
+          err.code = 5; // SQLITE_BUSY
+          throw err;
+        }
+      }
+      return originalPrepare(sql);
+    }) as typeof db.prepare);
+
+    try {
+      const second = repository.append(makeInput({ actor: 'second' }));
+      expect(insertAttempts).toBe(2);
+      // The retry re-read the chain tail inside the transaction: no fork,
+      // no gap, and no stale previous hash.
+      expect(second.previousHash).toBe(first.hash);
+    } finally {
+      insertSpy.mockRestore();
+    }
+
+    expect(repository.verifyIntegrity().valid).toBe(true);
+    expect(
+      capturedLogs.some(
+        (record) => record.level === 'warn' && record.message.includes('serialization conflict'),
+      ),
+    ).toBe(true);
+  });
+
+  it('gives up after the bounded retry budget and leaves no partial row', () => {
+    let insertAttempts = 0;
+    const originalPrepare = db.prepare.bind(db);
+    const insertSpy = jest.spyOn(db, 'prepare').mockImplementation(((sql: string) => {
+      if (sql.toUpperCase().includes('INSERT INTO AUDIT_LOG_ENTRIES')) {
+        insertAttempts += 1;
+        const err = new Error('database is locked') as Error & { code: number };
+        err.code = 5; // SQLITE_BUSY
+        throw err;
+      }
+      return originalPrepare(sql);
+    }) as typeof db.prepare);
+
+    try {
+      expect(() => repository.append(makeInput())).toThrow('database is locked');
+      // Bounded: exactly MAX_WRITE_ATTEMPTS attempts, then rethrow.
+      expect(insertAttempts).toBe(MAX_WRITE_ATTEMPTS);
+    } finally {
+      insertSpy.mockRestore();
+    }
+
+    expect(repository.count()).toBe(0);
+    expect(repository.verifyIntegrity().valid).toBe(true);
   });
 
   it('does not crash a request-style caller that catches the failure', () => {
+    const strict = new SqliteAuditRepository(db, { autoRepairSchema: false });
     db.exec('DROP TABLE audit_log_entries');
     let requestContinued = false;
     let caughtMessage: string | null = null;
     try {
-      repository.append(makeInput());
+      strict.append(makeInput());
     } catch (err) {
       caughtMessage = (err as Error).message;
     } finally {
@@ -268,6 +388,37 @@ describe('SqliteAuditRepository — append() surfaces write failures (transactio
     }
     expect(caughtMessage).not.toBeNull();
     expect(requestContinued).toBe(true);
+  });
+});
+
+// ─── Retry policy — error classification ────────────────────────────────────
+
+describe('SqliteAuditRepository — error classification (deterministic retry policy)', () => {
+  it('classifies numeric serialization codes as retryable', () => {
+    expect(isSerializationError(Object.assign(new Error('x'), { code: 5 }))).toBe(true); // BUSY
+    expect(isSerializationError(Object.assign(new Error('x'), { code: 517 }))).toBe(true); // BUSY_SNAPSHOT
+    expect(isSerializationError(Object.assign(new Error('x'), { rawCode: 6 }))).toBe(true); // LOCKED
+  });
+
+  it('classifies lock-contention messages as retryable', () => {
+    expect(isSerializationError(new Error('database is locked'))).toBe(true);
+    expect(isSerializationError(new Error('SQLITE_BUSY: database is locked'))).toBe(true);
+  });
+
+  it('does not classify deterministic failures as retryable', () => {
+    expect(
+      isSerializationError(Object.assign(new Error('constraint failed'), { code: 787 })),
+    ).toBe(false);
+    expect(isSerializationError(new Error('disk I/O error'))).toBe(false);
+    expect(isSerializationError('not an error object')).toBe(false);
+  });
+
+  it('detects missing-schema errors from table/column/index text', () => {
+    expect(isMissingSchemaError(new Error('no such table: audit_log_entries'))).toBe(true);
+    expect(isMissingSchemaError(new Error('no such column: previous_hash'))).toBe(true);
+    expect(isMissingSchemaError(new Error('no such index: idx_audit_actor'))).toBe(true);
+    expect(isMissingSchemaError(new Error('UNIQUE constraint failed: audit_log_entries.id'))).toBe(false);
+    expect(isMissingSchemaError('not an error object')).toBe(false);
   });
 });
 
@@ -521,6 +672,22 @@ describe('SqliteAuditRepository — verifyIntegrity()', () => {
 
     const report = repository.verifyIntegrity();
     expect(report.valid).toBe(false);
+  });
+
+  it('reports corruption instead of throwing when a row has malformed metadata_json', () => {
+    const created = repository.append(makeInput());
+    // A metadata payload that is not valid JSON cannot be decoded by
+    // toAuditEntry(); the monitoring job must still get a deterministic
+    // report rather than an unhandled throw.
+    db.prepare('UPDATE audit_log_entries SET metadata_json = ? WHERE id = ?').run(
+      '{not valid json',
+      created.id,
+    );
+
+    const report = repository.verifyIntegrity();
+    expect(report.valid).toBe(false);
+    expect(report.firstCorruptedIndex).toBe(0);
+    expect(report.firstCorruptedId).toBe(created.id);
   });
 });
 

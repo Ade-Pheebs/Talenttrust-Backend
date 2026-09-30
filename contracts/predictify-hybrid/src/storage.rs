@@ -3,7 +3,7 @@ use soroban_sdk::{contracttype, Address, BytesN};
 /// TTL for consumed idempotency keys, expressed in ledgers.
 ///
 /// At ~5 s/ledger this gives roughly 24 hours of replay protection.
-/// After expiry the key is eligible for eviction from instance storage
+/// After expiry the key is eligible for eviction from temporary storage
 /// and a fresh submission with the same token is treated as a new batch.
 ///
 /// If you need a longer window, increase this constant and redeploy.

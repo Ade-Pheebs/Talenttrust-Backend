@@ -21,7 +21,7 @@ fn fresh_env() -> Env {
 }
 
 fn register(env: &Env) -> (Address, PredictifyHybridClient) {
-    let contract_id = env.register(crate::PredictifyHybrid, ());
+    let contract_id = env.register_contract(None, crate::PredictifyHybrid);
     let client = PredictifyHybridClient::new(env, &contract_id);
     (contract_id, client)
 }
@@ -128,6 +128,13 @@ mod batch_operations_tests {
 
         // First submission — consumed.
         client.place_bets(&user, &one_bet(&env), &idem);
+
+        // Extend the instance TTL before advancing so it doesn't expire.
+        env.as_contract(&_id, || {
+            env.storage()
+                .instance()
+                .extend_ttl(IDEM_KEY_TTL_LEDGERS * 3, IDEM_KEY_TTL_LEDGERS * 3);
+        });
 
         // Simulate ledger advancing past TTL so storage is evicted.
         env.ledger().with_mut(|li| {

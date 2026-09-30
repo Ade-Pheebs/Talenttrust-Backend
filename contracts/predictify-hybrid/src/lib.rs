@@ -5,7 +5,7 @@
 //! ## Idempotency
 //!
 //! `place_bets` accepts a caller-supplied `BytesN<32>` idempotency key.
-//! The key is stored in instance storage under
+//! The key is stored in temporary storage under
 //! `DataKey::PlaceBetsIdem(caller, key)` with a TTL of
 //! [`storage::IDEM_KEY_TTL_LEDGERS`] ledgers (~24 h).  Repeated
 //! submissions with the same `(caller, key)` pair are rejected with
@@ -40,3 +40,6 @@ impl PredictifyHybrid {
         bets::place_bets(&env, caller, bets, idempotency_key)
     }
 }
+
+#[cfg(test)]
+mod batch_operations_tests;

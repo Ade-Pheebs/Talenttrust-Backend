@@ -38,7 +38,7 @@ pub struct Bet {
 ///
 /// # Idempotency semantics
 ///
-/// The key is written to instance storage **before** processing the bets.
+/// The key is written to temporary storage **before** processing the bets.
 /// If a previous call with the same key succeeded, the function returns
 /// [`Error::IdempotentBatchAlreadyApplied`] immediately without re-applying
 /// the batch.  Once written, the key expires after [`IDEM_KEY_TTL_LEDGERS`]
@@ -73,17 +73,20 @@ pub fn place_bets(
     if idempotency_key != zero_key {
         let idem_key = DataKey::PlaceBetsIdem(caller.clone(), idempotency_key.clone());
 
-        if env.storage().instance().has(&idem_key) {
+        if env.storage().temporary().has(&idem_key) {
             return Err(Error::IdempotentBatchAlreadyApplied);
         }
 
         // Mark the key as consumed before applying the batch so that
         // concurrent invocations on the same ledger also fail fast.
-        env.storage().instance().set(&idem_key, &true);
+        env.storage().temporary().set(&idem_key, &true);
         env.storage()
-            .instance()
-            .extend_ttl(IDEM_KEY_TTL_LEDGERS, IDEM_KEY_TTL_LEDGERS);
+            .temporary()
+            .extend_ttl(&idem_key, IDEM_KEY_TTL_LEDGERS, IDEM_KEY_TTL_LEDGERS);
     }
+    env.storage()
+        .instance()
+        .extend_ttl(IDEM_KEY_TTL_LEDGERS, IDEM_KEY_TTL_LEDGERS);
 
     // ------------------------------------------------------------------
     // Apply the batch

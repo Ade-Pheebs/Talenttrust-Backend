@@ -20,8 +20,9 @@ fn fresh_env() -> Env {
     Env::default()
 }
 
-fn register(env: &Env) -> (Address, PredictifyHybridClient) {
-    let contract_id = env.register(crate::PredictifyHybrid, ());
+fn register(env: &Env) -> (Address, PredictifyHybridClient<'_>) {
+    // `Env::register` only exists from soroban-sdk 22; this crate pins 21.
+    let contract_id = env.register_contract(None, crate::PredictifyHybrid);
     let client = PredictifyHybridClient::new(env, &contract_id);
     (contract_id, client)
 }

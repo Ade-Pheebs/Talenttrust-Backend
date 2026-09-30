@@ -2,7 +2,7 @@ use soroban_sdk::{Address, BytesN, Env, Vec};
 
 use crate::{
     errors::Error,
-    storage::{DataKey, IDEM_KEY_TTL_LEDGERS},
+    storage::{DataKey, IDEM_KEY_TTL_LEDGERS, INSTANCE_TTL_LEDGERS},
 };
 
 /// A single bet submitted inside a batch.
@@ -21,20 +21,19 @@ pub struct Bet {
 ///
 /// # Arguments
 ///
-/// * `env`             – Soroban host environment.
-/// * `caller`          – Address of the submitting account; `require_auth` is
-///                       called to authenticate the caller.
-/// * `bets`            – Non-empty vector of [`Bet`] entries.
+/// * `env` – Soroban host environment.
+/// * `caller` – Address of the submitting account; `require_auth` is called
+///   to authenticate the caller.
+/// * `bets` – Non-empty vector of [`Bet`] entries.
 /// * `idempotency_key` – 32-byte caller-generated token that makes this
-///                       submission unique.  The key is bound to `caller` so
-///                       the same token may be used by different callers
-///                       without conflict.
+///   submission unique.  The key is bound to `caller` so the same token may be
+///   used by different callers without conflict.
 ///
 /// # Errors
 ///
-/// * [`Error::EmptyBatch`]                   – `bets` is empty.
+/// * [`Error::EmptyBatch`] – `bets` is empty.
 /// * [`Error::IdempotentBatchAlreadyApplied`] – the `(caller, idempotency_key)`
-///                                              pair has already been consumed.
+///   pair has already been consumed.
 ///
 /// # Idempotency semantics
 ///
@@ -72,17 +71,51 @@ pub fn place_bets(
     let zero_key: BytesN<32> = BytesN::from_array(env, &[0u8; 32]);
     if idempotency_key != zero_key {
         let idem_key = DataKey::PlaceBetsIdem(caller.clone(), idempotency_key.clone());
+        let idem_ledger_key = DataKey::PlaceBetsIdemLedger(caller.clone(), idempotency_key.clone());
+        let now = env.ledger().sequence();
 
         if env.storage().instance().has(&idem_key) {
-            return Err(Error::IdempotentBatchAlreadyApplied);
+            // Instance storage shares the contract instance's TTL entry, so a
+            // consumed key cannot simply be evicted when its own window
+            // elapses: the window has to be enforced in contract code from the
+            // ledger recorded next to the sentinel.
+            let consumed_at = env
+                .storage()
+                .instance()
+                .get::<DataKey, u32>(&idem_ledger_key);
+
+            match consumed_at {
+                // A sentinel with no recorded ledger was written by an older
+                // contract version that stored only `true`. Treat it as a
+                // durable replay guard: an upgrade must never make a token
+                // that was already consumed replayable again.
+                None => return Err(Error::IdempotentBatchAlreadyApplied),
+
+                // Still inside the replay window.
+                Some(consumed_at) if now < consumed_at.saturating_add(IDEM_KEY_TTL_LEDGERS) => {
+                    return Err(Error::IdempotentBatchAlreadyApplied)
+                }
+
+                // The window has elapsed: drop the stale sentinel and fall
+                // through so the batch is accepted as a fresh submission.
+                Some(_) => {
+                    env.storage().instance().remove(&idem_key);
+                    env.storage().instance().remove(&idem_ledger_key);
+                }
+            }
         }
 
         // Mark the key as consumed before applying the batch so that
         // concurrent invocations on the same ledger also fail fast.
         env.storage().instance().set(&idem_key, &true);
+        env.storage().instance().set(&idem_ledger_key, &now);
+
+        // Keep the *instance* entry alive well past the replay window; using
+        // the idempotency window here would archive the contract at exactly
+        // the moment the newest key expires.
         env.storage()
             .instance()
-            .extend_ttl(IDEM_KEY_TTL_LEDGERS, IDEM_KEY_TTL_LEDGERS);
+            .extend_ttl(INSTANCE_TTL_LEDGERS, INSTANCE_TTL_LEDGERS);
     }
 
     // ------------------------------------------------------------------

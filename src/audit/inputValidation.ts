@@ -664,6 +664,16 @@ export const VALIDATED_BODY_KEY = 'validatedBody';
  * On failure it responds `400` with the standard error envelope and does not
  * call `next()`, so no invalid entry can reach the store.
  *
+ * Additional guards:
+ * - If `res.headersSent` is already `true` when this middleware runs (e.g.
+ *   in a streaming pipeline or after an upstream middleware already sent a
+ *   response), `next()` is called immediately and no second response is
+ *   attempted.
+ * - The `requestId` pulled from `res.locals.requestId` is sanitised via an
+ *   internal helper: values that are absent, non-string, empty, or longer
+ *   than 128 characters are replaced with `'unknown'` before being included
+ *   in the error envelope.
+ *
  * @example
  * ```ts
  * router.post('/', validateCreateAuditEntry, (_req, res) => {
@@ -671,16 +681,59 @@ export const VALIDATED_BODY_KEY = 'validatedBody';
  * });
  * ```
  */
+/**
+ * Maximum length of a `requestId` value accepted from `res.locals.requestId`
+ * for inclusion in error response envelopes.
+ *
+ * The value is set by the internal `requestIdMiddleware` and is always a UUID
+ * (36 chars), but this bound defends against an unexpected value (e.g.
+ * injected via a malicious proxy header that somehow reached `res.locals`).
+ * Values longer than this are replaced with `'unknown'` in the error response.
+ */
+const MAX_REQUEST_ID_LENGTH = 128;
+
+/**
+ * Sanitise a `requestId` value from `res.locals` for safe inclusion in an
+ * error response envelope.
+ *
+ * Returns `'unknown'` when:
+ * - the value is absent or not a string,
+ * - the value is empty after trimming,
+ * - the value exceeds {@link MAX_REQUEST_ID_LENGTH} characters.
+ *
+ * The returned value is always a non-empty string — callers can include it
+ * in a JSON response body without further checking.
+ *
+ * @internal
+ */
+function safeRequestId(raw: unknown): string {
+  if (typeof raw !== 'string') return 'unknown';
+  const trimmed = raw.trim();
+  if (trimmed.length === 0 || trimmed.length > MAX_REQUEST_ID_LENGTH) return 'unknown';
+  return trimmed;
+}
+
 export function validateCreateAuditEntry(
   req: Request,
   res: Response,
   next: NextFunction,
 ): void {
+  // Guard against calling res.json() on a response that has already been sent
+  // (e.g. in a streaming context or after a prior middleware already responded).
+  // Writing to a finished response throws in some Express versions and silently
+  // no-ops in others; both are wrong for a validation middleware.
+  if (res.headersSent) {
+    next();
+    return;
+  }
+
   const result = validateCreateAuditEntryInput(req.body);
 
   if (!result.ok) {
-    const requestId =
-      typeof res.locals['requestId'] === 'string' ? res.locals['requestId'] : 'unknown';
+    // Sanitise the requestId before including it in the error envelope so
+    // that a pathologically long or malformed value from res.locals cannot
+    // inflate the response or break downstream JSON parsing.
+    const requestId = safeRequestId(res.locals['requestId']);
 
     res.status(400).json({
       error: {

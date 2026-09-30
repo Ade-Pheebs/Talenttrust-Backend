@@ -13,7 +13,15 @@ import { parseFinalityDepths } from '../finality/policy';
  *  - Do not log secret values in error messages.
  *  - Use transformations to sanitize inputs.
  */
-export const envSchema = z.object({
+/**
+ * Field-level schema (types, defaults, per-field bounds).
+ *
+ * Exported separately from {@link envSchema} so the individual field parsers can
+ * be exercised directly (e.g. asserting a default, or that a bound rejects an
+ * out-of-range value) without having to satisfy every required variable and the
+ * cross-field rules below.
+ */
+export const envObjectSchema = z.object({
   // Server Configuration
   PORT: z.string()
     .default('3001')
@@ -209,6 +217,25 @@ export const envSchema = z.object({
     .default('100')
     .transform((val) => parseInt(val, 10))
     .pipe(z.number().int().positive('DISPUTES_CACHE_MAX_ENTRIES must be a positive integer').max(10000)),
+
+  // API-key auth cache configuration.
+  //
+  // `src/auth/apiKeys.ts` has always read these two values off the validated
+  // environment, but they were never declared here, so they arrived as
+  // `undefined`: `expiresAt` became `Date.now() + undefined = NaN` (which is
+  // *never* past, so entries never expired) and the capacity check
+  // `size >= undefined` was always false (so nothing was ever evicted). The
+  // shared auth cache was therefore unbounded and immortal. Declaring them here
+  // with explicit bounds restores both TTL and LRU eviction.
+  AUTH_CACHE_TTL_MS: z.string()
+    .default('300000')
+    .transform((val) => parseInt(val, 10))
+    .pipe(z.number().int().positive('AUTH_CACHE_TTL_MS must be a positive integer').max(3_600_000)),
+
+  AUTH_CACHE_MAX_ENTRIES: z.string()
+    .default('1000')
+    .transform((val) => parseInt(val, 10))
+    .pipe(z.number().int().positive('AUTH_CACHE_MAX_ENTRIES must be a positive integer').max(100_000)),
 
   RATE_LIMIT_STORE_TYPE: z.enum(['memory', 'redis'])
     .default('memory'),
@@ -410,7 +437,13 @@ export const envSchema = z.object({
     })
     .pipe(z.boolean().optional()),
 
-}).superRefine((obj, ctx) => {
+});
+
+/**
+ * Full environment schema: the field-level shape plus cross-field constraints
+ * (provider-specific requirements, production safety rails, ...).
+ */
+export const envSchema = envObjectSchema.superRefine((obj, ctx) => {
   const requireForEmailProvider = (field: keyof typeof obj, message: string): void => {
     if (!obj[field]) {
       ctx.addIssue({ code: z.ZodIssueCode.custom, path: [field], message });

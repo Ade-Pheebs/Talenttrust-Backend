@@ -31,7 +31,10 @@ describe('webhook subscription boundary DTO mappings', () => {
       eventType: 'contract.updated',
     };
 
-    expect(toCreateWebhookSubscriptionDto(request)).toEqual(request);
+    expect(toCreateWebhookSubscriptionDto(request)).toEqual({
+      ...request,
+      tenantId: 'default', // Default tenant ID is added when not provided
+    });
   });
 
   it('maps an update request and preserves explicit false values', () => {

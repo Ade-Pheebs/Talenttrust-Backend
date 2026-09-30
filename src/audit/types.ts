@@ -16,6 +16,11 @@
  * and both the request-body validator (`audit/inputValidation`) and the query
  * filter validator (`audit/router`) validate against this same array, so a new
  * action can never be accepted by one path and rejected by the other.
+ *
+ * Compatibility contract: the order and membership of this array is part of the
+ * public API contract. Existing entries must never be removed or reordered; new
+ * actions must be appended at the end. This keeps persisted audit records and
+ * clients that switch on the value stable across upgrades.
  */
 export const AUDIT_ACTIONS = [
   'CONTRACT_CREATED',
@@ -40,36 +45,20 @@ export const AUDIT_ACTIONS = [
   'ENDPOINT_MUTATION',
   'DEPLOYMENT_PROMOTED',
   'DEPLOYMENT_ROLLED_BACK',
+  'CONTRACT_DELETED',
+  'MILESTONES_CREATED',
+  'MILESTONES_UPDATED',
+  'MILESTONES_DELETED',
 ] as const;
 
-/** Categories of sensitive state changes that must be audited. */
-export type AuditAction =
-  | 'CONTRACT_CREATED'
-  | 'CONTRACT_UPDATED'
-  | 'CONTRACT_CANCELLED'
-  | 'CONTRACT_COMPLETED'
-  | 'CONTRACT_DELETED'
-  | 'PAYMENT_INITIATED'
-  | 'PAYMENT_RELEASED'
-  | 'PAYMENT_DISPUTED'
-  | 'REPUTATION_UPDATED'
-  | 'REPUTATION_CORRECTED'
-  | 'USER_CREATED'
-  | 'USER_UPDATED'
-  | 'USER_DELETED'
-  | 'AUTH_LOGIN'
-  | 'AUTH_LOGOUT'
-  | 'AUTH_FAILED'
-  | 'AUTH_LOCKOUT_TRIGGERED'
-  | 'AUTH_LOCKOUT_RELEASED'
-  | 'ADMIN_ACTION'
-  | 'ENDPOINT_ACCESS'
-  | 'ENDPOINT_MUTATION'
-  | 'DEPLOYMENT_PROMOTED'
-  | 'DEPLOYMENT_ROLLED_BACK'
-  | 'MILESTONES_CREATED'
-  | 'MILESTONES_UPDATED'
-  | 'MILESTONES_DELETED';
+/**
+ * Categories of sensitive state changes that must be audited.
+ *
+ * This type is derived from {@link AUDIT_ACTIONS} so that the runtime validator
+ * and the compile-time type can never drift apart. Any action accepted at runtime
+ * is therefore also representable in typepositions, and vice versa.
+ */
+export type AuditAction = (typeof AUDIT_ACTIONS)[number];
 
 export const AUDIT_SEVERITIES = ['INFO', 'WARNING', 'CRITICAL'] as const;
 
@@ -117,7 +106,7 @@ export interface AuditEntry {
 export type CreateAuditEntryInput = Omit<AuditEntry, 'id' | 'timestamp' | 'hash' | 'previousHash'>;
 
 /**
- * Outcome of a single item within a `POST /api/v1/audit/bulk` request.
+ * Outcome of a single item within a `POST /api/v1/audit/bulk ` request.
  * Exactly one of `entry` / `error` is populated, matching `success`.
  */
 export interface BulkAuditItemResult {
@@ -128,7 +117,7 @@ export interface BulkAuditItemResult {
   error?: string;
 }
 
-/** Aggregate response body for `POST /api/v1/audit/bulk`. */
+/** Aggregate response body for `POST /api/v1/audit/bulk `. */
 export interface BulkAuditResult {
   results: BulkAuditItemResult[];
   succeeded: number;

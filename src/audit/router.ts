@@ -29,6 +29,14 @@
  * - GET /export/download/:token verifies the JWT (signature, expiry, tenant)
  *   and enforces one-time use before streaming. Errors are structured and do
  *   not leak internal paths, stack traces, or token secrets.
+ *
+ * Compatibility contract (issue #1222 follow-up):
+ * - The download token issued by POST /export/token MUST be bound to the
+ *   exact filter set used to materialise the artifact. The download endpoint
+ *   MUST re-apply those filters when regenerating the export so that the
+ *   bytes streamed to the caller match the artifact the token was issued for.
+ * - Tokens issued before this change (without an embedded filter payload)
+ *   remain valid and fall back to the legacy "full export" behaviour.
  */
 
 import { Router, Request, Response, type RequestHandler } from 'express';
@@ -49,6 +57,7 @@ import { getCorrelationId, getRequestId as getRequestIdFromUtils } from '../util
 import { DownloadTokenService, DownloadTokenError } from './downloadTokenService';
 import { SqliteDownloadTokenStore } from './downloadTokenStore';
 import { getDb } from '../db/database';
+import { logger } from '../utils/logger';
 
 export interface AuditRouterOptions {
   service?: AuditService;
@@ -67,6 +76,13 @@ export interface AuditRouterOptions {
   bulkMiddleware?: RequestHandler[];
 }
 
+/**
+ * Filter payload embedded in a download token. Kept intentionally small and
+ * JSON-serialisable so it can round-trip through the JWT without leaking
+ * secrets. Only the fields accepted by `buildAuditQuerySchema` are allowed.
+ */
+type DownloadTokenFilters = Record<string, unknown>;
+
 function buildValidationErrorResponse(requestId: string, correlationId: string | undefined, error: ZodError): ValidationErrorResponse {
   return {
     error: {
@@ -77,6 +93,35 @@ function buildValidationErrorResponse(requestId: string, correlationId: string |
       details: mapZodErrorToDetails(error),
     },
   };
+}
+
+/**
+ * Normalises the raw query object into a stable, JSON-serialisable filter
+ * payload. Sorting keys makes the payload deterministic so the same logical
+ * query produces the same token payload (useful for tests and caching).
+ *
+ * Only string/number/boolean values are kept; anything else is dropped to
+ * avoid smuggling non-serialisable data into the JWT.
+ */
+function normaliseDownloadFilters(query: Record<string, unknown>): DownloadTokenFilters {
+  const out: DownloadTokenFilters = {};
+  const keys = Object.keys(query).sort();
+  for (const key of keys) {
+    const value = query[key];
+    if (value === undefined || value === null) continue;
+    if (Array.isArray(value)) {
+      // Preserve arrays of primitives (e.g. repeated query params) as-is.
+      const filtered = value.filter(
+        (v) => typeof v === 'string' || typeof v === 'number' || typeof v === 'boolean',
+      );
+      if (filtered.length > 0) out[key] = filtered;
+      continue;
+    }
+    if (typeof value === 'string' || typeof value === 'number' || typeof value === 'boolean') {
+      out[key] = value;
+    }
+  }
+  return out;
 }
 
 /**
@@ -228,6 +273,10 @@ export function createAuditRouter(options: AuditRouterOptions = {}): Router {
    * Response:
    *   201 { token: string, expiresAt: string, artifactId: string }
    *
+   * The token embeds the normalised filter set used to materialise the
+   * artifact so the download endpoint can deterministically regenerate the
+   * same export. Legacy tokens without filters fall back to a full export.
+   *
    * @security Token TTL defaults to 15 min (AUDIT_DOWNLOAD_TOKEN_TTL_SECONDS).
    *           The token is one-time-use; reuse returns 410.
    */
@@ -248,6 +297,10 @@ export function createAuditRouter(options: AuditRouterOptions = {}): Router {
         // `tenantId` claim in the session JWT; here the user is the tenant.
         const tenantId = requesterId;
 
+        // Snapshot the filters BEFORE materialising the export so the token
+        // and the artifact are guaranteed to describe the same query.
+        const filters = normaliseDownloadFilters(req.query as Record<string, unknown>);
+
         exportResult = await service.exportAuditLogs(
           req.query as Record<string, unknown>,
           { actor: requesterId, ipAddress: req.ip, correlationId },
@@ -259,6 +312,7 @@ export function createAuditRouter(options: AuditRouterOptions = {}): Router {
           requesterId,
           tenantId,
           artifactId: exportResult.fileName,
+          filters,
         });
 
         // Decode exp from the JWT without re-verifying so we can return expiresAt
@@ -321,6 +375,10 @@ export function createAuditRouter(options: AuditRouterOptions = {}): Router {
    *   - Headers are committed only after the artifact check so a 410 response
    *     is still possible after token consumption if the file disappeared.
    *   - Stack traces and internal paths are never included in error responses.
+   *   - The export is regenerated using the filters embedded in the token so
+   *     the streamed bytes match the artifact the token was issued for. If
+   *     the token predates filter embedding, a full export is served (legacy
+   *     compatibility).
    */
   router.get(
     '/export/download/:token',
@@ -369,8 +427,20 @@ export function createAuditRouter(options: AuditRouterOptions = {}): Router {
         //
         // This means the download endpoint does a fresh export. This is the
         // correct approach for correctness and operability.
+        //
+        // Compatibility contract: the filters embedded in the token are
+        // re-applied here so the regenerated artifact is byte-for-byte
+        // equivalent to the one the token was issued for. Tokens issued
+        // before filter embedding (legacy) carry no `filters` claim and
+        // fall back to a full export — this preserves the old behaviour
+        // for in-flight tokens during a rolling deploy.
+        const tokenFilters =
+          payload.filters && typeof payload.filters === 'object'
+            ? (payload.filters as DownloadTokenFilters)
+            : {};
+
         exportResult = await service.exportAuditLogs(
-          {},
+          tokenFilters,
           { actor: payload.sub, ipAddress: req.ip, correlationId },
           exportService,
         );

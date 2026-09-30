@@ -355,7 +355,7 @@ export class BoundedPaginationService {
       rawEvents.push({
         ledger: event.ledger,
         timestampMs: eventTs,
-        contractId: event.contractId ?? '',
+        contractId: typeof event.contractId === 'string' ? event.contractId : String(event.contractId ?? ''),
         type: event.type,
         value: event.value,
         pagingToken,

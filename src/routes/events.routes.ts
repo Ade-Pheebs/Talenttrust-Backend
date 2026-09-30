@@ -167,7 +167,7 @@ export function createEventsRouter(
       );
     }
 
-    const admission = backpressure.tryAdmit(boundary.event as ContractEvent);
+    const admission = backpressure.tryAdmit(boundary.event as unknown as import('../events/types').ContractEvent);
     if (!admission.admitted) {
       res.setHeader('Retry-After', '1');
       return fail(

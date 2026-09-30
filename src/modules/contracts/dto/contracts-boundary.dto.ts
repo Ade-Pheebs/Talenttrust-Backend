@@ -112,7 +112,7 @@ export function toUpdateContractDto(
 export function toContractResponseDto(contract: Contract): ContractResponseDto {
   const createdAtStr =
     (contract.createdAt as unknown) instanceof Date
-      ? (contract.createdAt as Date).toISOString()
+      ? (contract.createdAt as unknown as Date).toISOString()
       : typeof contract.createdAt === "string"
         ? contract.createdAt
         : new Date((contract.createdAt as unknown as number) ?? Date.now()).toISOString();

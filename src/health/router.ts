@@ -23,7 +23,7 @@
 
 import { Router, Request, Response } from "express";
 import { runHealthCheck } from "./checker";
-import { Probe, HealthResponse, ProbeResult } from "./types";
+import { Probe, HealthResponse, ProbeResult, PaginatedHealthResponse } from "./types";
 import { logger as rootLogger, Logger } from "../logger";
 import type { MetricsServiceLike } from "../observability/metrics-service";
 import { validateQuery } from "../middleware/validation";

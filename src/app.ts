@@ -33,7 +33,21 @@ interface AppFactoryOptions {
   includeTerminalHandlers?: boolean;
 }
 
+/**
+ * Marker attached to an Express app once its terminal (not-found / error)
+ * handlers have been installed. This makes attachment idempotent: repeated
+
+ * calls to `attachTerminalHandlers` are no-ops, so a retry or concurrent
+ * initialization path cannot accidentally double-register the error handler
+ * (which would change response shaping and log noise).
+ */
+const TERMINAL_HANDLERS_ATTACHED_SYMBOL = Symbol.for('talenttrust.terminalHandlersAttached');
+
 export function attachTerminalHandlers(app: express.Application): void {
+  if ((app as unknown as Record<symbol, unknown>)[TERMINAL_HANDLERS_ATTACHED_SYMBOL]) {
+    return;
+  }
+  (app as unknown as Record<symbol, unknown>)[TERMINAL_HANDLERS_ATTACHED_SYMBOL] = true;
   app.use(notFoundHandler);
   app.use(errorHandler);
 }

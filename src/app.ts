@@ -56,6 +56,10 @@ export interface AppFactoryOptions {
  * @param app - Express application instance
  */
 export function attachTerminalHandlers(app: express.Application): void {
+  if ((app as unknown as Record<symbol, unknown>)[TERMINAL_HANDLERS_ATTACHED_SYMBOL]) {
+    return;
+  }
+  (app as unknown as Record<symbol, unknown>)[TERMINAL_HANDLERS_ATTACHED_SYMBOL] = true;
   app.use(notFoundHandler);
   app.use(errorHandler);
 }
@@ -97,26 +101,26 @@ export function createApp(options?: AppFactoryOptions): express.Application {
     res.status(200).send(await metricsService.getMetrics());
   });
 
-  app.use('/health', legacyHealthRouter);
-  app.use('/health', readinessHealthRouter);
-  app.use('/api/config', configRouter);
-  app.use('/api/v1', eventsRouter);
-  app.use('/api/v1/auth', metricsService.trackAuthRequest.bind(metricsService));
-  app.use('/api/v1/auth', authRouter);
-  app.use('/api/v1/api-keys', metricsService.trackApiKeysRequest.bind(metricsService));
-  app.use('/api/v1', apiKeysRouter);
-  app.use('/api/v1/contracts', createContractsRouter(metricsService));
-  app.use('/api/v1/disputes', createDisputesRouter({ metricsService }));
-  app.use('/api/v1/reputation', reputationRouter);
-  app.use('/api/v1/dependency-scan', dependencyScanRouter);
-  app.use('/api/v1', apiKeysRouter);
-  app.use('/api/v1/admin', adminRouter);
-  app.use('/api/v1/admin/deploy', deployRouter);
-  app.use('/api/v1', rpcEventsRouter);
+  mountRouter(app, '/health', legacyHealthRouter);
+  mountRouter(app, '/health', readinessHealthRouter);
+  mountRouter(app, '/api/config', configRouter);
+  mountRouter(app, '/api/v1', eventsRouter);
+  mountRouter(app, '/api/v1/auth', metricsService.trackAuthRequest.bind(metricsService));
+  mountRouter(app, '/api/v1/auth', authRouter);
+  mountRouter(app, '/api/v1/api-keys', metricsService.trackApiKeysRequest.bind(metricsService));
+  mountRouter(app, '/api/v1', apiKeysRouter);
+  mountRouter(app, '/api/v1/contracts', createContractsRouter(metricsService));
+  mountRouter(app, '/api/v1/disputes', createDisputesRouter({ metricsService }));
+  mountRouter(app, '/api/v1/reputation', reputationRouter);
+  mountRouter(app, '/api/v1/dependency-scan', dependencyScanRouter);
+  mountRouter(app, '/api/v1', apiKeysRouter);
+  mountRouter(app, '/api/v1/admin', adminRouter);
+  mountRouter(app, '/api/v1/admin/deploy', deployRouter);
+  mountRouter(app, '/api/v1', rpcEventsRouter);
   if (features.webhooksEnabled) {
-    app.use('/api/v1/webhook-subscriptions', webhookSubscriptionRouter);
+    mountRouter(app, '/api/v1/webhook-subscriptions', webhookSubscriptionRouter);
   }
-  app.use('/api/v1/metrics', metricsAuthMiddleware, createMetricsRouter(metricsService));
+  mountRouter(app, '/api/v1/metrics', metricsAuthMiddleware, createMetricsRouter(metricsService));
 
   if (includeTerminalHandlers) {
     attachTerminalHandlers(app);

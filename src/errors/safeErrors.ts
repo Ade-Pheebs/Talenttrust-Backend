@@ -57,6 +57,8 @@ export const SAFE_ERROR_MESSAGES: Readonly<Record<string, string>> = {
   // Dispute-specific error codes
   dispute_not_found: 'The requested dispute was not found',
   invalid_state_transition: 'The requested state transition is not allowed',
+  // Recovery-specific error codes
+  recovery_failed: 'The operation could not be completed and was rolled back',
 };
 
 /**
@@ -77,6 +79,7 @@ const UNSAFE_PATTERNS: ReadonlyArray<RegExp> = [
   /ECONNREFUSED|ENOTFOUND|ETIMEDOUT/,   // raw syscall errors
   /\b(SELECT|INSERT|UPDATE|DELETE)\b/i, // SQL fragments
   /password|secret|token|apikey/i,       // credential field names in messages
+  /stack\s*:\s*/i,                       // serialized stack traces
 ];
 
 /**
@@ -115,9 +118,25 @@ export function safeMessageForCode(code: string): string {
  *    callers relying on exact-match messages remain compatible.
  */
 export function sanitizeErrorMessage(message: string, code: string): string {
+  // Deterministic handling of non-string / empty inputs: never throw, never
+  // return an empty string, so callers in failure paths cannot introduce a
+  // secondary failure while recovering from a primary one.
+  if (typeof message !== 'string' || message.length === 0) {
+    return safeMessageForCode(code);
+  }
+
   if (containsUnsafeContent(message)) {
     return safeMessageForCode(code);
   }
+
+  // Idempotence guard: if the message already equals the canonical safe
+  // message for this code, return it as-is. This keeps repeated sanitization
+  // (e.g. across retries) stable and prevents drift.
+  const canonical = safeMessageForCode(code);
+  if (message === canonical) {
+    return canonical;
+  }
+
   return message;
 }
 

@@ -67,10 +67,11 @@ function describeRaw(key: string, raw: string): string {
  * strings as undefined.
  *
  * @param key - Environment variable name
+ * @param env - Optional source; existing callers continue to use process.env
  * @returns The trimmed value, or undefined if missing/empty
  */
-export function getEnv(key: string): string | undefined {
-  const value = process.env[key];
+export function getEnv(key: string, env: NodeJS.ProcessEnv = process.env): string | undefined {
+  const value = env[key];
   if (value === undefined || value.trim() === '') {
     return undefined;
   }
@@ -138,11 +139,16 @@ export function parseIntEnv(key: string, defaultValue: number): number {
  *
  * @param key - Environment variable name
  * @param defaultValue - Value to return if the variable is not set
+ * @param env - Optional source; defaults to process.env for existing callers
  * @returns The parsed boolean value
  * @throws {Error} If the value is not a recognized boolean string
  */
-export function parseBoolEnv(key: string, defaultValue: boolean): boolean {
-  const raw = getEnv(key);
+export function parseBoolEnv(
+  key: string,
+  defaultValue: boolean,
+  env: NodeJS.ProcessEnv = process.env,
+): boolean {
+  const raw = getEnv(key, env);
   if (raw === undefined) {
     return defaultValue;
   }

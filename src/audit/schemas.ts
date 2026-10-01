@@ -10,81 +10,57 @@
  *   - the response shapes are documented and can be asserted against in
  *     tests, catching drift between the service layer and the API contract
  *
- * Validation boundaries (issue: Define validation boundaries for
- * src/audit/service.ts):
- *   - Request schemas are the single source of truth for accepted input.
- *   - `buildAuditQuerySchema` enforces deterministic handling of empty,
- *     duplicate, and boundary values (limit/offset/from/to/cursor).
- *   - Response schemas are the contract asserted against in tests.
+ * ## Invariants owned by this module
+ *
+ * The audit log is append-only and hash-chained, so anything this module lets
+ * through is permanent. The schemas below are the HTTP-facing guard and must
+ * uphold the following invariants. They are enforced by construction (shared
+ * sources) rather than by convention, and are pinned by `schemas.test.ts`.
+ *
+ * 1. **Enum parity with the domain.** The accepted `action` / `severity` sets
+ *    are imported from `./types` (`AUDIT_ACTIONS`, `AUDIT_SEVERITIES`) — the
+ *    same arrays used by the domain `AuditAction` / `AuditSeverity` types and
+ *    by the strict write-path validator (`./inputValidation`). A local copy
+ *    cannot drift out of sync and silently reject an action the domain
+ *    supports (the exact regression this module previously had for
+ *    `REPUTATION_CORRECTED`).
+ * 2. **Field rules are shared, not re-declared.** Identifiers, `ipAddress`,
+ *    `correlationId` and `metadata` are composed from the exported field
+ *    schemas in `./inputValidation`, so the declarative API surface and the
+ *    strict write-path validator can never disagree on a field's bounds.
+ * 3. **Metadata is structurally safe.** `metadata` enforces the full
+ *    `validateMetadata` rule set: JSON-object only, depth / key-count /
+ *    array-length / string-length / byte-size bounds, finite numbers, no
+ *    circular references, and denial of prototype-pollution keys
+ *    (`__proto__`, `constructor`, `prototype`).
+ * 4. **Required/local defaults are stable.** `metadata` defaults to `{}`
+ *    (strictly safer than the old `undefined` passthrough) and identifier
+ *    fields must be non-empty, non-blank and control-character free.
+ * 5. **Response contracts mirror the domain types.** Response schemas assert
+ *    hash format, ISO timestamps and non-negative integer counters so a
+ *    contract change in the service layer is caught here rather than in
+ *    production.
+ * 6. **The empty-string query quirk is preserved deliberately.** The legacy
+ *    parser used truthy checks for the filter fields, so `?cursor=` was
+ *    treated as "not provided" — see {@link emptyStringToUndefined}. That
+ *    behaviour is pinned by tests rather than "fixed", keeping the refactor
+ *    behaviour-neutral for existing callers.
  */
 
 import { z } from 'zod';
-import { AUDIT_ACTIONS, AUDIT_SEVERITIES, decodeCursor } from './types';
+import { decodeCursor } from './types';
+import { AUDIT_ACTIONS, AUDIT_SEVERITIES } from './types';
+import {
+  MAX_ID_LENGTH,
+  identifierSchema,
+  auditMetadataSchema,
+  ipAddressSchema,
+  correlationIdSchema,
+} from './inputValidation';
 
-/**
- * Maximum length allowed for free-form string identifiers (actor, resource,
- * resourceId, correlationId, ipAddress). Bounds the amount of data accepted
- * from a single request so oversized payloads are rejected deterministically
- * instead of being silently persisted or truncated downstream.
- */
-export const MAX_IDENTIFIER_LENGTH = 256;
-
-/**
- * Maximum number of keys permitted in an audit entry's `metadata` object.
- * Prevents unbounded metadata from being accepted, which would otherwise
- * allow a single request to bloat storage and downstream serialization.
- */
-export const MAX_METADATA_KEYS = 64;
-
-/**
- * Maximum serialized size (in characters) of the `metadata` object. Combined
- * with `MAX_METADATA_KEYS`, this bounds both the shape and the total size of
- * user-supplied metadata so validation is deterministic for boundary inputs.
- */
-export const MAX_METADATA_BYTES = 16 * 1024;
-
-/**
- * Maximum number of entries a single page may request. Used as the hard
- * ceiling for `buildAuditQuerySchema` callers so no route can accidentally
- * accept an unbounded `limit`.
- */
-export const MAX_PAGE_LIMIT = 1000;
-
-/**
- * Maximum offset accepted for offset-paginated queries. Bounds the amount of
- * work a single request can force the repository to skip, keeping the
- * endpoint deterministic under adverse input.
- */
-export const MAX_PAGE_OFFSET = 1_000_000;
-
-/**
- * Maximum length of a cursor string. Cursors are opaque base64 payloads; a
- * hard cap rejects pathological inputs before they reach `decodeCursor`.
- */
-export const MAX_CURSOR_LENGTH = 512;
-
-/**
- * Maximum length of an ISO date string accepted for `from`/`to`. ISO-8601
- * timestamps are well under this bound; anything longer is rejected as
- * invalid rather than parsed.
- */
-export const MAX_ISO_DATE_LENGTH = 64;
-
-/** Mirrors the `AuditAction` union in `./types.ts`. Keep these in sync. */
-export const AUDIT_ACTIONS = [
-  'CONTRACT_CREATED', 'CONTRACT_UPDATED', 'CONTRACT_CANCELLED', 'CONTRACT_COMPLETED',
-  'PAYMENT_INITIATED', 'PAYMENT_RELEASED', 'PAYMENT_DISPUTED',
-  'REPUTATION_UPDATED',
-  'USER_CREATED', 'USER_UPDATED', 'USER_DELETED',
-  'AUTH_LOGIN', 'AUTH_LOGOUT', 'AUTH_FAILED',
-  'AUTH_LOCKOUT_TRIGGERED', 'AUTH_LOCKOUT_RELEASED',
-  'ADMIN_ACTION',
-  'ENDPOINT_ACCESS', 'ENDPOINT_MUTATION',
-  'DEPLOYMENT_PROMOTED', 'DEPLOYMENT_ROLLED_BACK',
-] as const;
-
-/** Mirrors the `AuditSeverity` union in `./types.ts`. */
-export const AUDIT_SEVERITIES = ['INFO', 'WARNING', 'CRITICAL'] as const;
+// Re-exported so existing consumers of `./schemas` keep working unchanged, but
+// now sourced from `./types` — see invariant 1 above.
+export { AUDIT_ACTIONS, AUDIT_SEVERITIES };
 
 export const auditActionSchema = z.enum(AUDIT_ACTIONS);
 export const auditSeveritySchema = z.enum(AUDIT_SEVERITIES);
@@ -95,9 +71,11 @@ export const auditSeveritySchema = z.enum(AUDIT_SEVERITIES);
 
 /**
  * `POST /api/v1/audit` request body.
- * `metadata` defaults to `{}` when omitted (previously an omitted metadata
- * field silently passed `undefined` through to the repository; defaulting
- * to an empty object is a strictly safer, additive change).
+ *
+ * Shares every field rule with the strict write-path schema in
+ * `./inputValidation` (invariant 2). Unknown top-level fields are stripped
+ * rather than rejected — a deliberate behaviour preserved from the previous
+ * implementation to keep existing callers compatible.
  */
 const metadataSchema = z
   .record(z.unknown())
@@ -118,12 +96,12 @@ const metadataSchema = z
 export const createAuditEntryBodySchema = z.object({
   action: auditActionSchema,
   severity: auditSeveritySchema,
-  actor: identifierSchema('actor'),
-  resource: identifierSchema('resource'),
-  resourceId: identifierSchema('resourceId'),
-  metadata: metadataSchema.optional().default({}),
-  ipAddress: identifierSchema('ipAddress').optional(),
-  correlationId: identifierSchema('correlationId').optional(),
+  actor: identifierSchema('actor', MAX_ID_LENGTH),
+  resource: identifierSchema('resource', MAX_ID_LENGTH),
+  resourceId: identifierSchema('resourceId', MAX_ID_LENGTH),
+  metadata: auditMetadataSchema,
+  ipAddress: ipAddressSchema,
+  correlationId: correlationIdSchema,
 });
 
 export type CreateAuditEntryBody = z.infer<typeof createAuditEntryBodySchema>;
@@ -171,7 +149,7 @@ const cursorSchema = z
   );
 
 /**
- * The old ad hoc parser used truthy checks (`if (action && ...)`) for
+ * The legacy ad hoc parser used truthy checks (`if (action && ...)`) for
  * action/severity/actor/resource/resourceId/cursor, so `?cursor=` (an empty
  * string) was silently treated as "not provided" for those fields — but NOT
  * for limit/offset/from/to, which used explicit `=== undefined` checks and
@@ -238,45 +216,68 @@ export type AuditQueryParams = z.infer<ReturnType<typeof buildAuditQuerySchema>>
 // Response schemas
 // ----------------------------------------------------------------------------
 
+/** An ISO-8601 timestamp produced by `new Date(...).toISOString()`. */
+const isoTimestampSchema = z
+  .string()
+  .refine((value) => !Number.isNaN(Date.parse(value)), {
+    message: 'must be an ISO-8601 timestamp',
+  });
+
+/** A SHA-256 hex digest as produced by `computeEntryHash()`. */
+const sha256HexSchema = z
+  .string()
+  .regex(/^[0-9a-f]{64}$/, 'must be a 64-character lowercase hex SHA-256 digest');
+
+/** The genesis sentinel (`'GENESIS'`) or a SHA-256 hex digest. */
+const previousHashSchema = z
+  .string()
+  .regex(
+    /^(GENESIS|[0-9a-f]{64})$/,
+    'must be GENESIS or a 64-character lowercase hex SHA-256 digest',
+  );
+
+/** A non-negative integer (counts, indexes and limits). */
+const nonNegativeIntSchema = z.number().int().nonnegative();
+
 /** Mirrors `AuditEntry` in `./types.ts`. */
 export const auditEntryResponseSchema = z.object({
-  id: z.string(),
-  timestamp: z.string(),
+  id: z.string().min(1),
+  timestamp: isoTimestampSchema,
   action: auditActionSchema,
   severity: auditSeveritySchema,
-  actor: z.string(),
-  resource: z.string(),
-  resourceId: z.string(),
+  actor: z.string().min(1),
+  resource: z.string().min(1),
+  resourceId: z.string().min(1),
   metadata: z.record(z.unknown()),
-  ipAddress: z.string().optional(),
-  correlationId: z.string().optional(),
-  hash: z.string(),
-  previousHash: z.string(),
+  ipAddress: z.string().min(1).optional(),
+  correlationId: z.string().min(1).optional(),
+  hash: sha256HexSchema,
+  previousHash: previousHashSchema,
 });
 
 /** Mirrors `AuditQueryResult` in `./types.ts` (the cursor-paginated shape). */
 export const auditQueryResultResponseSchema = z.object({
   entries: z.array(auditEntryResponseSchema),
-  count: z.number(),
-  limit: z.number(),
+  count: nonNegativeIntSchema,
+  limit: z.number().int().positive(),
   nextCursor: z.string().optional(),
 });
 
 /** Mirrors the legacy offset-paginated `GET /` response shape. */
 export const auditLegacyQueryResponseSchema = z.object({
   entries: z.array(auditEntryResponseSchema),
-  count: z.number(),
-  limit: z.number(),
-  offset: z.number(),
+  count: nonNegativeIntSchema,
+  limit: nonNegativeIntSchema,
+  offset: nonNegativeIntSchema,
 });
 
 /** Mirrors `IntegrityReport` in `./types.ts`. */
 export const integrityReportResponseSchema = z.object({
   valid: z.boolean(),
-  totalEntries: z.number(),
-  firstCorruptedIndex: z.number().optional(),
-  firstCorruptedId: z.string().optional(),
-  checkedAt: z.string(),
+  totalEntries: nonNegativeIntSchema,
+  firstCorruptedIndex: nonNegativeIntSchema.optional(),
+  firstCorruptedId: z.string().min(1).optional(),
+  checkedAt: isoTimestampSchema,
 });
 
 /**

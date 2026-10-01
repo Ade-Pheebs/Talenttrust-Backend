@@ -59,4 +59,23 @@ pub enum Error {
     /// would wrap and record a negative total.  The batch is rejected
     /// instead, and the same key stays reusable.
     BatchAmountOverflow = 6,
+
+    /// The `idempotency_key` was already used in a previous `place_bets`
+    /// call, but for a **different batch**.
+    ///
+    /// Reported instead of [`Error::IdempotentBatchAlreadyApplied`] so a
+    /// client can tell a harmless duplicate from a token collision — the
+    /// difference between retrying and losing a batch silently. Two
+    /// causes are indistinguishable here, and both mean "this token is
+    /// spent":
+    ///
+    /// - concurrent submissions, where one batch won the token and this
+    ///   one did not, and
+    /// - a client that reused a token it had already spent on a
+    ///   different batch.
+    ///
+    /// Neither batch was applied and the winning batch is untouched. The
+    /// caller must generate a fresh `BytesN<32>` token; retrying with this
+    /// one will keep failing until the receipt expires.
+    IdempotencyKeyReusedWithDifferentBatch = 7,
 }

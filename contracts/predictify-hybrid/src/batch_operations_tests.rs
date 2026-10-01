@@ -153,9 +153,11 @@ mod batch_operations_tests {
         client.place_bets(&user, &one_bet(&env), &idem);
     }
 
-    /// Same key but different payload (different bets vector): the payload
-    /// difference is irrelevant — the key alone governs idempotency, so the
-    /// second call is still rejected.
+    /// Same key but different payload (different bets vector): the key still
+    /// governs idempotency, so the second call is rejected — but it is
+    /// rejected as a *token collision* rather than as a duplicate, so a
+    /// client can tell that its batch was never applied and needs a fresh
+    /// token. See I8 in `bets`.
     #[test]
     fn same_key_different_payload_rejected() {
         let env = fresh_env();
@@ -176,8 +178,8 @@ mod batch_operations_tests {
         let result = client.try_place_bets(&user, &bets_b, &idem);
         assert_eq!(
             result,
-            Err(Ok(Error::IdempotentBatchAlreadyApplied)),
-            "duplicate key with different payload must still be rejected"
+            Err(Ok(Error::IdempotencyKeyReusedWithDifferentBatch)),
+            "duplicate key with different payload must be reported as a token collision"
         );
     }
 

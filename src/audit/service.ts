@@ -199,10 +199,9 @@ export class AuditService {
 
       return entry;
     } catch (err) {
-      // Be conservative even if a custom repository reports an ambiguous
-      // failure after committing. Never serve a stale pre-write snapshot.
-      this.useCache(cache => cache.invalidate());
-      this.reportFailure('Failed to persist audit entry');
+      // Repository errors may include request or credential values. Keep the
+      // signal while leaving the original error available to the caller.
+      console.error('[AuditService] Failed to persist audit entry');
       throw err;
     }
     // An append changes unfiltered, actor/action and cursor queries too.

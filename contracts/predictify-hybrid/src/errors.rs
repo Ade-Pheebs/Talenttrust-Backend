@@ -39,3 +39,16 @@ pub enum Error {
     /// normal operation.
     InvariantViolated = 7,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Ensures that the error discriminants remain stable, protecting the
+    /// data-integrity invariant for on-chain consumers.
+    #[test]
+    fn test_error_discriminants_are_stable() {
+        assert_eq!(Error::IdempotentBatchAlreadyApplied as u32, 1);
+        assert_eq!(Error::EmptyBatch as u32, 2);
+    }
+}

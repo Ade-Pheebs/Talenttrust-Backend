@@ -188,6 +188,67 @@ describe('SqliteAuditRepository', () => {
     const ids = Array.from({ length: 25 }, () => repository.append(makeInput()).id);
     expect(new Set(ids).size).toBe(25);
   });
+
+  it('treats identical payloads as separate events and preserves the chain', () => {
+    const input = makeInput();
+    const first = repository.append(input);
+    const second = repository.append(input);
+
+    expect(second.id).not.toBe(first.id);
+    expect(second.previousHash).toBe(first.hash);
+    expect(repository.count()).toBe(2);
+    expect(repository.verifyIntegrity().valid).toBe(true);
+  });
+});
+
+describe('SqliteAuditRepository — concurrent writer recovery', () => {
+  it('rejects a competing writer atomically and retries from the committed tip', () => {
+    const directory = mkdtempSync(join(tmpdir(), 'audit-repository-'));
+    const dbPath = join(directory, 'audit.db');
+    const firstDb = new Database(dbPath);
+    const secondDb = new Database(dbPath);
+    const firstRepository = new SqliteAuditRepository(firstDb);
+    const secondRepository = new SqliteAuditRepository(secondDb);
+
+    try {
+      secondDb.pragma('busy_timeout = 0');
+      let tipReads = 0;
+      const originalPrepare = secondDb.prepare.bind(secondDb);
+      const tipReadSpy = jest.spyOn(secondDb, 'prepare').mockImplementation(((sql: string) => {
+        if (sql.includes('SELECT hash FROM audit_log_entries')) {
+          tipReads += 1;
+        }
+        return originalPrepare(sql);
+      }) as typeof secondDb.prepare);
+
+      let committedHash = '';
+      try {
+        const writer = firstDb.transaction(() => {
+          committedHash = firstRepository.append(makeInput({ actor: 'winner' })).hash;
+          expect(() => secondRepository.append(makeInput({ actor: 'contender' }))).toThrow();
+          expect(tipReads).toBe(0);
+          expect(secondRepository.count()).toBe(0);
+        });
+        const immediate = (writer as typeof writer & { immediate?: () => void }).immediate;
+
+        if (typeof immediate !== 'function') {
+          throw new Error('SQLite immediate transactions are required for this concurrency test');
+        }
+        immediate();
+      } finally {
+        tipReadSpy.mockRestore();
+      }
+
+      const retried = secondRepository.append(makeInput({ actor: 'contender' }));
+      expect(retried.previousHash).toBe(committedHash);
+      expect(secondRepository.count()).toBe(2);
+      expect(secondRepository.verifyIntegrity().valid).toBe(true);
+    } finally {
+      firstDb.close();
+      secondDb.close();
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
 });
 
 // ─── Append() — deterministic failure recovery ─────────────────────────────

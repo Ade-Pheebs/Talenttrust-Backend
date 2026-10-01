@@ -28,7 +28,9 @@ mod bets;
 mod errors;
 mod storage;
 
-/// Re-exported public types and constants.
+#[cfg(test)]
+mod batch_operations_tests;
+
 pub use bets::Bet;
 pub use errors::Error;
 pub use storage::{DataKey, IDEM_KEY_TTL_LEDGERS, MAX_BATCH_SIZE};

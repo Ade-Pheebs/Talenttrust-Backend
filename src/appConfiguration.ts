@@ -54,6 +54,8 @@ export interface AppConfig {
   milestonesEnabled: boolean;
 }
 
+export const DEFAULT_ALLOWED_ASSETS: readonly string[] = Object.freeze(['USDC', 'XLM', 'BTC', 'ETH']);
+
 const MAX_TIMEOUT_MS = 10_000;
 const MIN_TIMEOUT_MS = 100;
 
@@ -97,40 +99,152 @@ function parseTargets(value: string | undefined): string[] {
     .filter(Boolean);
 }
 
-function _parseAssets(value: string | undefined): string[] {
+function parseAssets(value: string | undefined): string[] {
   if (!value) {
-    return ['USDC', 'XLM', 'BTC', 'ETH']; // Default assets
+    return [...DEFAULT_ALLOWED_ASSETS];
   }
 
-  return value
+  const parsed = value
     .split(',')
     .map((item) => item.trim().toUpperCase())
     .filter(Boolean);
+
+  // Deduplicate while preserving order to keep behavior deterministic.
+  return Array.from(new Set(parsed));
 }
 
-export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
+function resolveUpstreamContractsUrl(value: string | undefined): string {
+  const url = value ?? 'https://example.invalid/contracts';
+  if (!isSafeUrl(url)) {
+    throw new Error(
+      `Invalid UPSTREAM_CONTRACTS_URL: SSRF protection blocked access to internal resource "${url}" `,
+    );
+  }
+  return url;
+}
+
+/**
+ * The canonical environment keys that influence a loaded configuration.
+ * Used to determine whether a cached entry is still valid.
+ */
+const CONFIG_ENV_KEYS = [
+  'PORT',
+  'GRACEFUL_DEGRADATION_ENABLED',
+  'UPSTREAM_CONTRACTS_URL',
+  'UPSTREAM_TIMEOUT_MS',
+  'CHAOS_MODE',
+  'CHAOS_TARGETS',
+  'CHAOS_PROBABILITY',
+  'CB_FAILURE_THRESHOLD',
+  'CB_SUCCESS_THRESHOLD',
+  'CB_TIMEOUT_MS',
+  'WEBHOOK_RETRY_MAX_ATTEMPTS',
+  'WEBHOOK_RETRY_INITIAL_DELAY_MS',
+  'WEBHOOK_RETRY_MAX_DELAY_MS',
+  'WEBHOOK_RETRY_MULTIPLIER',
+  'WEBHOOK_RETRY_JITTER_FACTOR',
+  'WEBHOOK_CB_FAILURE_THRESHOLD',
+  'WEBHOOK_CB_SUCCESS_THRESHOLD',
+  'WEBHOOK_CB_TIMEOUT_MS',
+  'QUEUE_FAILED_THRESHOLD',
+  'QUEUE_BACKLOG_THRESHOLD',
+  'QUEUE_PROBE_TIMEOUT_MS',
+  'IDEMPLOTENCY_TTL_MS',
+  'ALLOWED_ASSETS',
+  'MILESTONES_ENABLED',
+] as const;
+
+export type ConfigEnvKey = (typeof CONFIG_ENV_KEYS)[number];
+
+export interface LoadConfigOptions {
+  /**
+   * When `true`, bypasses the module-level cache and re-parses the environment.
+   * This is intended for tests and admin reload paths that must observe
+   * mutations to `process.env` within the same process.
+   */
+  forceReload?: boolean;
+}
+
+interface CacheEntry {
+  config: AppConfig;
+  snapshot: Record<ConfigEnvKey, string | undefined>;
+}
+
+/**
+ * Module-level cache for the default environment.
+ *
+ * Invariants:
+ *   - The cache is only used when the caller does not pass an explicit env
+ *     object and does not request `forceReload`.
+ *   - The cache is invalidated whenever any config-relevant environment
+ *     variable changes, so concurrent callers cannot observe stale values.
+ *   - The cache is synchronous and single-threaded in Node.js, so no lock is
+  *     required; however, any future async reload must preserve the atomic
+ *     swap semantics used here.
+ */
+let cache: CacheEntry | undefined;
+
+function snapshotEnv(source: NodeJS.ProcessEnv): Record<ConfigEnvKey, string | undefined> {
+  const snapshot = {} as Record<ConfigEnvKey, string | undefined>;
+  for (const key of CONFIG_ENV_KEYS) {
+    snapshot[key] = source[key];
+  }
+  return snapshot;
+}
+
+function snapshotsEqual(
+  a: Record<ConfigEnvKey, string | undefined>,
+  b: Record<ConfigEnvKey, string | undefined>,
+): boolean {
+  for (const key of CONFIG_ENV_KEYS) {
+    if (a[key] !== b[key]) {
+      return false;
+    }
+  }
+  return true;
+}
+
+/**
+ * Resets the module-level configuration cache.
+ * Intended for tests and admin reload paths.
+ */
+export function resetConfigCache(): void {
+  cache = undefined;
+}
+
+function buildConfig(env: NodeJS.ProcessEnv): AppConfig {
   const port = clamp(toNumber(env.PORT, 3001), 1, 65535);
-  const upstreamTimeoutMs = clamp(toNumber(env.UPSTREAM_TIMEOUT_MS, 1200), MIN_TIMEOUT_MS, MAX_TIMEOUT_MS);
+  const upstreamTimeoutMs = clamp(
+    toNumber(env.UPSTREAM_TIMEOUT_MS, 1200),
+    MIN_TIMEOUT_MS,
+    MAX_TIMEOUT_MS,
+  );
   const chaosProbability = clamp(toNumber(env.CHAOS_PROBABILITY, 0), 0, 1);
-  const idempotencyTtlMs = clamp(toNumber(env.IDEMPOTENCY_TTL_MS, 3_600_000), 0, 7 * 24 * 60 * 60 * 1000);
+  const idempotencyTtlMs = clamp(
+    toNumber(env.IDEMPOTENCY_TTL_MS, 3_600_000),
+    0,
+    7 * 24 * 60 * 60 * 1000,
+  );
+
+  const upstreamContractsUrl = (() => {
+    const url = env.UPSTREAM_CONTRACTS_URL ?? 'https://example.invalid/contracts';
+    if (!isSafeUrl(url)) {
+      throw new Error(`Invalid UPSTREAM_CONTRACTS_URL: SSRF protection blocked access to internal resource "${url}"`);
+    }
+    return url;
+  })();
 
   return {
     port,
     gracefulDegradationEnabled: parseBoolean(env.GRACEFUL_DEGRADATION_ENABLED, true),
-    upstreamContractsUrl: (() => {
-      const url = env.UPSTREAM_CONTRACTS_URL ?? 'https://example.invalid/contracts';
-      if (!isSafeUrl(url)) {
-        throw new Error(`Invalid UPSTREAM_CONTRACTS_URL: SSRF protection blocked access to internal resource "${url}"`);
-      }
-      return url;
-    })(),
+    upstreamContractsUrl,
     upstreamTimeoutMs,
     chaosMode: parseChaosMode(env.CHAOS_MODE),
     chaosTargets: parseTargets(env.CHAOS_TARGETS),
     chaosProbability,
     circuitBreaker: {
-      failureThreshold: clamp(toNumber(env.CB_FAILURE_THRESHOLD, 5), 1, 100),
-      successThreshold: clamp(toNumber(env.CB_SUCCESS_THRESHOLD, 1), 1, 20),
+      failureThreshold: clamp(toNumber(env.CB2FAILURE_THRESHOLD, 5), 1, 100),
+      successThreshold: clamp(toNumber(env.CB2SUCCESS_THRESHOLD, 1), 1, 20),
       timeoutMs: clamp(toNumber(env.CB_TIMEOUT_MS, 30_000), 1_000, 300_000),
     },
     webhookRetry: {
@@ -151,7 +265,46 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
       queueProbeTimeoutMs: clamp(toNumber(env.QUEUE_PROBE_TIMEOUT_MS, 3_000), 100, 30_000),
     },
     idempotencyTtlMs,
-    allowedAssets: _parseAssets(env.ALLOWED_ASSETS),
+    allowedAssets: parseAssets(env.ALLOWED_ASSETS),
     milestonesEnabled: parseBoolean(env.MILESTONES_ENABLED, true),
   };
+}
+
+/**
+ * Loads the application configuration from the provided environment.
+ *
+ * Concurrency / idempotency guarantees:
+ *   - When no explicit env is passed and `forceReload` is false, the result is
+  *     cached and returned by reference. Callers must treat the returned
+ *     object as immutable.
+   - The cache is invalidated automatically when any config-relevant
+  *     environment variable changes, so concurrent callers never observe
+ *     stale values.
+ *   - Parsing is synchronous; a concurrent caller either observes the
+ *     previous consistent cache or the newly built one, never a partially
+ *     constructed object.
+ *   - Invalid configuration (e.g. SSRF blocked URL) throws before the cache
+  *     is updated, so a failed reload never corrupts a previously valid
+ *     cache.
+ */
+export function loadConfig(
+  env: NodeJS.ProcessEnv = process.env,
+  options: LoadConfigOptions = {},
+): AppConfig {
+  const useCache = env === process.env && !options.forceReload;
+
+  if (useCache) {
+    const snapshot = snapshotEnv(env);
+    if (cache && snapshotsEqual(cache.snapshot, snapshot)) {
+      return cache.config;
+    }
+
+    // Build first, then swap atomically. If building throws, the existing
+    // cache remains untouched.
+    const next = buildConfig(env);
+    cache = { config: next, snapshot };
+    return next;
+  }
+
+  return buildConfig(env);
 }

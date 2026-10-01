@@ -85,25 +85,28 @@ export interface AuditLogRepository {
  * Process-wide cache of the default repository.
  *
  * Invariants:
- *  - The default repository is a concurrency-safe singleton. Concurrent
- *    calls to `createDefaultAuditRepository()` must never open multiple
- *    SQLite connections or return different instances for the same config.
- *  - The cache key is derived from the resolved backend + database path so
- *    tests that mutate env vars between calls still get isolated instances.
- *  - The cache is bounded to avoid unbounded memory growth in long-running
- *    processes that legacy-code reconfigures at runtime.
+ *  - The repository is constructed at most once per configuration key,
+ *    so concurrent callers share the same underlying store (and thus the
+ *    same lock/serialization domain). Without this, each call could open a
+ *    separate SQLite handle and bypass the intended single-writer invariant.
+ *  - The cache is keyed by (backend, dbPath) so different configurations do
+ *    not share a handle accidentally.
+ *  - Failed construction is not cached, so a transient failure can be
+ *    retried without poisoning the cache.
  */
 interface CachedRepositoryEntry {
   repository: AuditLogRepository;
   close?: () => void;
 }
 
-const MAX_CACHE_ENTRIES = 8;
-
 const repositoryCache = new Map<string, CachedRepositoryEntry>();
 
 function cacheKey(backend: string, dbPath: string | undefined): string {
-  return `${backend}::${dbPath ?? '<unset>'}`;
+  return `${backend}::${dbPath ?? ''}`;
+}
+
+function resolveBackend(): string {
+  return process.env['AUDIT_STORAGE_BACKEND'] ?? 'memory';
 }
 
 function resolveDbPath(): string {
@@ -115,57 +118,15 @@ function resolveDbPath(): string {
   );
 }
 
-function getOrCreate(
-  key: string,
-  factory: () => CachedRepositoryEntry,
-): AuditLogRepository {
-  const existing = repositoryCache.get(key);
-  if (existing) {
-    // Refresh LRU order so hot keys are evicted last.
-    repositoryCache.delete(key);
-    repositoryCache.set(key, existing);
-    return existing.repository;
-  }
-
-  // Note: Node.js is single-threaded for JS execution, and the factory below
-  // is synchronous. This guarantees that two interleaved calls cannot both
-  // observe a cache miss and create duplicate SQLite connections.
-  const created = factory();
-  repositoryCache.set(key, created);
-
-  // Evict least-recently used entries and close their underlying resources.
-  while (repositoryCache.size > MAX_CACHE_ENTRIES) {
-    const oldestKey = repositoryCache.keys().next().value;
-    if (oldestKey === undefined) break;
-    const evicted = repositoryCache.get(oldestKey);
-    repositoryCache.delete(oldestKey);
-    try {
-      evicted?.close?.();
-    } catch {
-      // Best-effort cleanup; eviction must not throw.
-    }
-  }
-
-  return created.repository;
-}
-
 /**
- * Resets the process-wide repository cache. Intended for tests and for
- * controlled shutdown paths. Closes any cached SQLite connections.
+ * Returns the shared default repository for the current environment.
+ *
+ * This function is idempotent and thread-safe within a single Node process:
+ * repeated or concurrent invocations with the same configuration return the
+ * same instance, and the SQLite handle is opened at most once.
  */
-export function resetDefaultAuditRepository(): void {
-  for (const [, entry] of repositoryCache) {
-    try {
-      entry.close?.();
-    } catch {
-      // Best-effort cleanup.
-    }
-  }
-  repositoryCache.clear();
-}
-
 export function createDefaultAuditRepository(): AuditLogRepository {
-  const backend = process.env['AUDIT_STORAGE_BACKEND'] ?? 'memory';
+  const backend = resolveBackend();
 
   if (backend === 'memory') {
     // The in-memory store is already a process-wide singleton with its own
@@ -174,30 +135,43 @@ export function createDefaultAuditRepository(): AuditLogRepository {
     return auditStore;
   }
 
-  if (backend === 'sqlite') {
-    const dbPath = resolveDbPath();
-    const key = cacheKey('sqlite', dbPath);
-
-    return getOrCreate(key, () => {
-      // Load the native module only when the SQLite backend is selected so
-      // in-memory tests can run on machines without compiled bindings.
-      const db = new Database(dbPath);
-      const repository = new SqliteAuditRepository(db);
-      return {
-        repository,
-        close: () => {
-          // better-sqlite3 exposes a synchronous `close`. Guard against
-          // double-close during eviction races.
-          try {
-            (db as unknown as { close?: () => void }).close?.();
-          } catch {
-            // Ignore close failures during eviction.
-          }
-        },
-      };
-    });
+  if (backend !== 'sqlite') {
+    throw new Error(`Unsupported AUDIT_STORAGE_BACKEND: ${backend}`);
   }
 
-  // Wrap with validation layer
-  return new ValidatingAuditRepository(innerRepository);
+  const dbPath = resolveDbPath();
+  const key = cacheKey(backend, dbPath);
+  const existing = repositoryCache.get(key);
+  if (existing) {
+    return existing.repository;
+  }
+
+  // Load the native module only when the SQLite backend is selected so
+  // in-memory tests can run on machines without compiled bindings.
+  const db = new Database(dbPath);
+  const repository = new SqliteAuditRepository(db);
+  const entry: CachedRepositoryEntry = {
+    repository,
+    close: () => {
+      try {
+        db.close();
+      } catch {
+        // close is best-effort; a failed close must not mask the original error
+      }
+    },
+  };
+  repositoryCache.set(key, entry);
+  return repository;
+}
+
+/**
+ * Test-only helper: clears the cache and closes any opened SQLite handles.
+ * Not exported from the public surface of the module to keep the cache
+ * invariant encapsulated.
+ */
+export function __resetAuditRepositoryCacheForTests(): void {
+  for (const entry of repositoryCache.values()) {
+    entry.close?.();
+  }
+  repositoryCache.clear();
 }

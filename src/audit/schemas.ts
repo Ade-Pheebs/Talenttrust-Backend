@@ -89,21 +89,9 @@ export const AUDIT_SEVERITIES = ['INFO', 'WARNING', 'CRITICAL'] as const;
 export const auditActionSchema = z.enum(AUDIT_ACTIONS);
 export const auditSeveritySchema = z.enum(AUDIT_SEVERITIES);
 
-/**
- * Bounded identifier schema shared by all free-form string fields. Enforces
- * non-empty, trimmed, and length-bounded values so duplicate/whitespace-only
- * inputs are rejected deterministically.
- */
-const identifierSchema = (fieldName: string) =>
-  z
-    .string()
-    .min(1, `${fieldName} must not be empty`)
-    .max(MAX_IDENTIFIER_LENGTH, `${fieldName} must be at most ${MAX_IDENTIFIER_LENGTH} characters`)
-    .refine((value) => value.trim().length > 0, { message: `${fieldName} must not be blank` });
-
-// ---------------------------------------------------------------------------
+// ----------------------------------------------------------------------------
 // Request schemas
-// ---------------------------------------------------------------------------
+// ----------------------------------------------------------------------------
 
 /**
  * `POST /api/v1/audit` request body.
@@ -246,9 +234,9 @@ export function buildAuditQuerySchema(options: { maxLimit: number; defaultLimit?
 
 export type AuditQueryParams = z.infer<ReturnType<typeof buildAuditQuerySchema>>;
 
-// ---------------------------------------------------------------------------
+// ----------------------------------------------------------------------------
 // Response schemas
-// ---------------------------------------------------------------------------
+// ----------------------------------------------------------------------------
 
 /** Mirrors `AuditEntry` in `./types.ts`. */
 export const auditEntryResponseSchema = z.object({

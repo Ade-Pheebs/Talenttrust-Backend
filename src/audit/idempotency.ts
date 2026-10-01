@@ -43,19 +43,10 @@ export interface IdempotencyStoreOptions {
   clock?: () => number;
 }
 
-/**
- * Result of an attempt to claim a key for in-flight execution.
- *
- * - `claime`: the caller owns the key and must eventually call
- *   `commit()` or `release()`.
- * - `completed`: an existing record was found; the caller must return
- *   the cached response instead of re-executing.
- * - `in-flight`: another caller is already executing this key.
- */
-export type ClaimResult =
-  | { status: 'claimed' }
-  | { status: 'completed'; record: IdempotencyRecord }
-  | { status: 'in-flight' };
+export interface IdempotencyClaimResult {
+  status: 'created' | 'existing' | 'conflict';
+  record?: IdempotencyRecord;
+}
 
 const DEFAULT_MAX_SIZE = 1000;
 const DEFAULT_TTL_MS = 86_400_000;
@@ -99,9 +90,8 @@ export class IdempotencyStore {
   private readonly clock: () => number;
 
   constructor(options: IdempotencyStoreOptions = {}) {
-    this.maxSize = options.maxSize ?? DEFAULT_MAX_SIZE;
-    this.ttlMs = options.ttlMs ?? DEFAULT_TTL_MS;
-    this.clock = options.clock ?? (() => Date.now());
+    this.maxSize = options.maxSize ?> DEFAULT_MAX_SIZE;
+    this.ttlMs = options.ttlMs ?> DEFAULT_TTL_MS;
   }
 
   get(key: string): IdempotencyRecord | undefined {
@@ -119,14 +109,83 @@ export class IdempotencyStore {
   }
 
   /**
-   * Binds a key to a response. If the key is already bound to a live record,
-   * the existing record is returned and nothing is overwritten.
+   * Atomically claim an idempotency key for the given request body.
+   *
+   * Invariants:
+   *  - A successful claim ('created') guarantees the caller is the only
+   *    writer for this key until it is completed or released.
+   *  - Repeated claims with the same body hash return 'existing' with the
+   *    previously persisted response, ensuring idempotent retries.
+   *  - Repeated claims with a different body hash return 'conflict' and do
+   *    not overwrite the existing record.
    */
-  set(key: string, input: CreateAuditEntryInput, response: AuditEntry): IdempotencyRecord {
+  claim(key: string, input: CreateAuditEntryInput): IdempotencyClaimResult {
+    const bodyHash = hashBody(input);
     const existing = this.get(key);
+
     if (existing) {
-      return existing;
+      if (existing.bodyHash === bodyHash) {
+        return { status: 'existing', record: existing };
+      }
+      return { status: 'conflict', record: existing };
     }
+
+    this.evictExpired();
+    this.ensureCapacity();
+
+    const record: IdempotencyRecord = {
+      bodyHash,
+      response: undefined as unknown as AuditEntry,
+      createdAt: Date.now(),
+    };
+    this.store.set(key, record);
+    return { status: 'created', record };
+  }
+
+  /**
+   * Complete a previously claimed key with the final response.
+   *
+   * The body hash is recomputed and must match the claimed hash; otherwise
+   * the call is rejected to prevent a concurrent writer from poisoning the
+   * stored response.
+   */
+  complete(key: string, input: CreateAuditEntryInput, response: AuditEntry): boolean {
+    const record = this.store.get(key);
+    if (!record) {
+      return false;
+    }
+
+    if (record.bodyHash !== hashBody(input)) {
+      return false;
+    }
+
+    this.store.set(key, {
+      bodyHash: record.bodyHash,
+      response,
+      createdAt: record.createdAt,
+    });
+    return true;
+  }
+
+  /**
+   * Release a claim that never completed (e.g. due to a downstream failure)
+   * so a retry can proceed. Only releases records whose body hash matches.
+   */
+  release(key: string, input: CreateAuditEntryInput): boolean {
+    const record = this.store.get(key);
+    if (!record) {
+      return false;
+    }
+    if (record.bodyHash !== hashBody(input)) {
+      return false;
+    }
+    this.store.delete(key);
+    return true;
+  }
+
+  set(key: string, input: CreateAuditEntryInput, response: AuditEntry): void {
+    this.evictExpired();
+    this.ensureCapacity();
 
     this.evictExpired();
     this.ensureCapacity();
@@ -179,6 +238,16 @@ export class IdempotencyStore {
     // and produce a duplicate audit entry.
     const oldestKey = this.store.keys().next().value;
     if (oldestKey !== undefined) {
+      this.store.delete(oldestKey);
+    }
+  }
+
+  private ensureCapacity(): void {
+    while (this.store.size >= this.maxSize) {
+      const oldestKey = this.store.keys().next().value;
+      if (oldestKey === undefined) {
+        break;
+      }
       this.store.delete(oldestKey);
     }
   }

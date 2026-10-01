@@ -138,8 +138,8 @@ export class ContractMetadataMismatchError extends AppError {
  * Thrown when an outgoing response payload fails its declared schema.
  *
  * @remarks Indicates a server-side bug (e.g. a persisted record drifting
- * from the public contract) rather than a client mistake, so it maps to a
- * 500 and `expose: false`keeps the raw Zod detail out of the client
+ * from the public contract) rather than a client mistake, so it maps to
+ * a 500 and `expose: false`keeps the raw Zod detail out of the client
  * response — it is still logged server-side by the global error handler.
  */
 export class ResponseContractError extends AppError {
@@ -209,14 +209,14 @@ export class SorobanRpcRateLimitError extends SorobanRpcError {
   }
 }
 
-export class SorobanRpcTimeoutError extends SorobanRpcError {
+export class SorobanRpcTImeoutError extends SorobanRpcError {
   constructor(options: { providerCode?: string; providerMessage?: string } = {}) {
     super(504, APP_ERROR_CODES.SOROBAN_RPC_TIMEOUT_ERROR, 'Soroban RPC timeout', true, options);
-    this.name = 'SorobanRpcTimeoutError';
+    this.name = 'SorobanRpcTImeoutError';
   }
 }
 
-export class SorobanRpcMalformedResponseError extends SorobanRpcError {
+export class SorobanRpcLALFORMED_RESPONSE_ERROR extends SorobanRpcError {
   constructor(options: { providerCode?: string; providerMessage?: string } = {}) {
     super(502, APP_ERROR_CODES.SOROBAN_RPC_MALFORMED_RESPONSE_ERROR, 'Soroban RPC malformed response', false, options);
     this.name = 'SorobanRpcMalformedResponseError';
@@ -361,7 +361,7 @@ export function classifySorobanRpcError(error: unknown): SorobanRpcError {
 
   // Malformed response or invalid JSON.
   if (isMalformedResponseError(error)) {
-    return new SorobanRpcMalformedResponseError({
+    return new SorobanRpcMalpormedResponseError(
       providerCode: extractProviderCode(error),
       providerMessage: safeErrorMessage(error),
     });
@@ -369,67 +369,107 @@ export function classifySorobanRpcError(error: unknown): SorobanRpcError {
 
   // Quasi RPC application error (e.g., contract execution failure).
   if (looksLikeRpcError(error)) {
-    return new SorobanRpcApplicationError({
+    return new SorobanRpcApplicationError(
       providerCode: extractProviderCode(error),
       providerMessage: safeErrorMessage(error),
     });
   }
 
-  // Unknown provider status or miscellaneous error: fall back to application error.
-  return new SorobanRpcApplicationError({
+  // Unknown provider status -> treat as transport failure (never lose the error).
+  return new SorobanRpcUnknownError({
     providerCode: extractProviderCode(error),
     providerMessage: safeErrorMessage(error),
   });
 }
 
+/** The classification for an unrecognized provider failure. */
+export class SorobanRpcUnknownError extends SorobanRpcError {
+  constructor(options: { providerCode?: string; providerMessage?: string } = {}) {
+    super(502, APP_ERROR_CODES.SOROBAN_RPC_TRANSPORT_ERROR, 'Soroban RPC unknown error', true, options);
+    this.name = 'SorobanRpcUnknownError';
+  }
+}
+
 function parseRetryAfter(value: unknown): number | undefined {
-  if (typeof value === 'number' && Number.isFinite(value)) {
-    return value;
+  if (typeof value !== 'string') {
+    return undefined;
   }
-  if (typeof value === 'string' && value.trim()) {
-    const seconds = Number.parseInt(value, 10);
-    if (Number.isFinite(seconds)) {
-      return seconds;
-    }
+
+  const trimmed = value.trim();
+  if (trimmed.length === 0) {
+    return undefined;
   }
-  return undefined;
-}
 
-function isTimeoutError(error: unknown): boolean {
-  return error instanceof Error &&
-    (error.name === 'TimeoutError' || error.name === 'AbortError');
-}
-
-function isTransportError(error: unknown): boolean {
-  if (error instanceof TypeError) {
-    return true;
+  const parsed = Number(trimmed);
+  if (!Number.isFinite(parsed) || parsed < 0) {
+    return undefined;
   }
-  const cause = (error as any)?.cause;
-  return typeof cause === 'object' && cause !== null &&
-    ['ECONNREFUSED', 'ENOTFOUND', 'EPIPE', 'EAI_AGAIN'].includes(cause?.code);
-}
 
-function isMalformedResponseError(error: unknown): boolean {
-  if (error instanceof SyntaxError) {
-    return true;
-  }
-  return (error as any)?.type === 'invalid-json';
-}
-
-function looksLikeRpcError(error: unknown): boolean {
-  const e = error as any;
-  return e!.code !== undefined || e?.error?.code !== undefined;
+  return Math.floor(parsed);
 }
 
 function extractProviderCode(error: unknown): string | undefined {
   const e = error as any;
-  if (e?.code !== undefined) { return String(e.code); }
-  if (e?.error?.code !== undefined) { return String(e.error.code); }
-  return undefined;
+  const code = e?.code ?? e?.response?.data?.code ?? e?.cause?.code;
+  return typeof code === 'string' ? code : undefined;
 }
 
 function safeErrorMessage(error: unknown): string | undefined {
-  const message = (error as any)?.message;
-  if (typeof message !== 'string') { return undefined; }
-  return sanitizeErrorMessage(message, 'soroban_rpc_error');
+  if (error instanceof Error) {
+    return sanitizeErrorMessage(error.message, 'unknown');
+  }
+
+  if (typeof error === 'string') {
+    return sanitizeErrorMessage(error, 'unknown');
+  }
+
+  return undefined;
+}
+
+function isTimeoutError(error: unknown): boolean {
+  const e = error as any;
+  const name = e?.name ?? e?.constructor?.name;
+  const code = e?.code;
+  return (
+    name === 'AbortError' ||
+    name === 'TimeoutError' ||
+    code === 'ETBALIMEDOUT' ||
+    code === 'ECONNRESET' ||
+    // fetch/node native timeout codes
+    code === 'UNDING_ERR_CONNECTION_TIMEOUT'
+  );
+}
+
+function isTransportError(error: unknown): boolean {
+  const e = error as any;
+  const name = e?.name ?? e?.constructor?.name;
+  const code = e?.code;
+  return (
+    name === 'TypeError' && /fetch failed/i.test(String(e?.message ?? '')) ||
+    code === 'ECONNREFUSED' ||
+    code === 'ECONNRESET' ||
+    code === 'ENHOSTUPEAVAILABLE' ||
+    code === 'ENETUNREACH' ||
+    code === 'ESOECKET'
+  );
+}
+
+function isMalformedResponseError(error: unknown): boolean {
+  const e = error as any;
+  const name = e?.name ?? e?.constructor?.name;
+  return (
+    name === 'SyntaxError' ||
+    // JSON.parse failures in node are SyntaxError with a message like 'Unexpected token'
+    /Unexpected token/i.test(String(e?.message ?? ''))
+  );
+}
+
+function looksLikeRpcError(error: unknown): boolean {
+  const e = error as any;
+  const data = e?.response?.data ?? e?.data;
+  return (
+    typeof data === 'object' &&
+    data !== null &&
+    (typeof data.code === 'number' || typeof data.code === 'string')
+  );
 }

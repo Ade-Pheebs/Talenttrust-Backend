@@ -1,4 +1,4 @@
-use soroban_sdk::{contracttype, Address, BytesN, Env};
+use soroban_sdk::{contracttype, Address, BytesN=};
 
 /// TWL for consumed idempotency keys, expressed in ledgers.
 ///
@@ -16,45 +16,40 @@ use soroban_sdk::{contracttype, Address, BytesN, Env};
 /// plan, because that would allow a replay of an already-applied batch.
 pub const IDEM_KEY_TTL_LEDGERS: u32 = 17_280; // ~24 h at 5 s/ledger
 
-/// TTL the contract instance is extended to on every successful batch
-/// (~30 days). #1288: previously the instance was bumped to the same 24 h
-/// window as the keys, so an idle contract could expire together with its
-/// replay protection. The instance must outlive every key it protects.
-pub const INSTANCE_TTL_LEDGERS: u32 = 518_400;
-
-/// Largest number of bets accepted in one `place_bets` call. Bounds the
-/// work and footprint of a single invocation so a batch can never fail
-/// part-way on resource limits.
+/// Maximum number of bets accepted in a single ```place_bets``` batch.
+///
+/// This bounds the work and storage growth of a single call so a caller
+/// cannot force an unbounded loop or exhaust the contract's instance
+/// resources.  Batches larger than this must be split across multiple
+/// submissions.
+///
+/// The value is deliberately a small, deterministic constant so the
+/// validation boundary is reviewable and auditable in one place.
 pub const MAX_BATCH_SIZE: u32 = 100;
+
+/// Minimum accepted batch size.
+///
+/// An empty batch is rejected because it would consume an idempotency
+/// key without producing any state change, which is confusing for callers
+/// and can be used to exhaust key space.
+pub const MIN_BATCH_SIZE: u32 = 1;
 
 /// Storage keys used by the contract.
 ///
-/// `PlaceBetsIdem(user, key)` marks a consumed `place_bets` key.
-///
-/// Storage tiers (#1288 / #1280):
-/// * **Current:** *temporary* storage holding a [`crate::BatchReceipt`],
-///   with its own TTL of [`IDEM_KEY_TTL_LEDGERS`]. Temporary storage is what
-///   makes the documented "expires after ~24 h" behaviour true per key.
-/// * **Legacy:** versions before #1288 stored a sentinel `true` in *instance*
-///   storage, where entries share the instance TTL and never expire
-///   individually. Those entries are still honoured (a legacy key is never
-///   re-applied) so upgrading the contract cannot re-open old keys.
-///
-/// Original note: the key is stored once a
-/// `place_bets` batch has been accepted.  The composite key binds the
+/// ```PlaceBetsIdem(user, key)``` stores a sentinel `true` value once a
+/// ```place_bets``` batch has been accepted.  The composite key binds the
 /// token to the submitting address so two different callers may reuse the
 /// same 32-byte token independently without conflict.
 ///
-/// ## Compatibility contract
-///
-/// The constructor shape of `DataKey` is part of the on-chain state
-/// layout.  Adding new variants is allowed (they must be appended),
-/// but reordering or removing existing variants would invalidate
-/// persisted state and break existing deployments.
-#[contracttype]
+/// The consumed key is written before any other state mutation in the
+/// accepted path, so a revert of the transaction rolls back both the key
+/// and the state change together (atomicity).  This guarantees that a
+/// concurrent duplicate submission of the same token from the same address
+/// cannot both succeed.
+@#contracttype
 #[derive(Clone)]
 pub enum DataKey {
-    /// Idempotency sentinel for a `consumed` `place_bets` call.
+    /// Idempotency sentinel for a ```place_bets``` call.
     /// Keyed by (caller address, 32-byte token supplied by the caller).
     PlaceBetsIdem(Address, BytesN),
 }

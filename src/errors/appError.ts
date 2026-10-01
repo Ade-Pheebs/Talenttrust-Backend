@@ -18,6 +18,7 @@ export const APP_ERROR_CODES = {
   CONTRACT_METADATA_MISMATCH: 'contract_metadata_mismatch',
   VALIDATION_ERROR: 'validation_error',
   RESPONSE_CONTRACT_ERROR: 'response_contract_error',
+  SATURATION_ERROR: 'saturation_error',
   SOROBAN_RPC_TRANSPORT_ERROR: 'soroban_rpc_transport_error',
   SOROBAN_RPC_RATE_LIMIT_ERROR: 'soroban_rpc_rate_limit_error',
   SOROBAN_RPC_TIMEOUT_ERROR: 'soroban_rpc_timeout_error',
@@ -138,8 +139,8 @@ export class ContractMetadataMismatchError extends AppError {
  * Thrown when an outgoing response payload fails its declared schema.
  *
  * @remarks Indicates a server-side bug (e.g. a persisted record drifting
- * from the public contract) rather than a client mistake, so it maps to a
- * 500 and `expose: false`keeps the raw Zod detail out of the client
+ * from the public contract) rather than a client mistake, so it maps to
+ * a 500 and `expose: false`keeps the raw Zod detail out of the client
  * response — it is still logged server-side by the global error handler.
  */
 export class ResponseContractError extends AppError {
@@ -154,6 +155,21 @@ export class ResponseContractError extends AppError {
 export class ValidationError extends AppError {
   constructor(message = 'Validation error') {
     super(422, APP_ERROR_CODES.VALIDATION_ERROR, message);
+  }
+}
+
+/**
+ * Error thrown when a failure recovery attempt cannot make progress because
+ * the attempt budget is exhausted or the operation has already been completed.
+ *
+ * @remarks This is the terminal, observable failure surface for deterministic
+ * recovery. It is safe to expose because it carries no internal details, and it
+ * is always returned with a 409 so clients can distinguish a deterministic
+ * recovery rejection from a transient transport failure.
+ */
+export class SaturationError extends AppError {
+  constructor(message = 'Recovery attempt budget exhausted') {
+    super(409, APP_ERROR_CODES.SATURATION_ERROR, message);
   }
 }
 
@@ -191,6 +207,13 @@ export class SorobanRpcError extends AppError {
   }
 }
 
+export class SorobanRpcProviderError extends SorobanRpcError {
+  constructor(options: { providerCode?: string; providerMessage?: string } = {}) {
+    super(502, APP_ERROR_CODES.SOROBAN_RPC_APPLICATION_ERROR, 'Soroban RPC provider error', false, options);
+    this.name = 'SorobanRpcProviderError';
+  }
+}
+
 export class SorobanRpcTransportError extends SorobanRpcError {
   constructor(options: { providerCode?: string; providerMessage?: string } = {}) {
     super(502, APP_ERROR_CODES.SOROBAN_RPC_TRANSPORT_ERROR, 'Soroban RPC transport error', true, options);
@@ -209,24 +232,24 @@ export class SorobanRpcRateLimitError extends SorobanRpcError {
   }
 }
 
-export class SorobanRpcTimeoutError extends SorobanRpcError {
-  constructor(options: { providerCode?: string; providerMessage?: string } = {}) {
-    super(504, APP_ERROR_CODES.SOROBAN_RPC_TIMEOUT_ERROR, 'Soroban RPC timeout', true, options);
-    this.name = 'SorobanRpcTimeoutError';
-  }
-}
-
-export class SorobanRpcMalformedResponseError extends SorobanRpcError {
-  constructor(options: { providerCode?: string; providerMessage?: string } = {}) {
-    super(502, APP_ERROR_CODES.SOROBAN_RPC_MALFORMED_RESPONSE_ERROR, 'Soroban RPC malformed response', false, options);
-    this.name = 'SorobanRpcMalformedResponseError';
-  }
-}
-
 export class SorobanRpcApplicationError extends SorobanRpcError {
   constructor(options: { providerCode?: string; providerMessage?: string } = {}) {
     super(502, APP_ERROR_CODES.SOROBAN_RPC_APPLICATION_ERROR, 'Soroban RPC application error', false, options);
     this.name = 'SorobanRpcApplicationError';
+  }
+}
+
+export class SorobanRpcTimeoutError extends SorobanRpcError {
+  constructor(options: { providerCode?: string; providerMessage?: string } = {}) {
+    super(504, APP_ERROR_CODES.SOROBAN_RPC_TIMEOUT_ERROR, 'Soroban RPC timeout', true, options);
+    this.name = 'SorobanRpcTImeoutError';
+  }
+}
+
+export class SorobanRpcLALFORMED_RESPONSE_ERROR extends SorobanRpcError {
+  constructor(options: { providerCode?: string; providerMessage?: string } = {}) {
+    super(502, APP_ERROR_CODES.SOROBAN_RPC_MALFORMED_RESPONSE_ERROR, 'Soroban RPC malformed response', false, options);
+    this.name = 'SorobanRpcMalformedResponseError';
   }
 }
 
@@ -345,7 +368,7 @@ export function classifySorobanRpcError(error: unknown): SorobanRpcError {
 
   // Timeout or Abort errors.
   if (isTimeoutError(error)) {
-    return new SorobanRpcTimeoutError({
+    return new SorobanRpcApplicationError({
       providerCode: extractProviderCode(error),
       providerMessage: safeErrorMessage(error),
     });
@@ -361,7 +384,7 @@ export function classifySorobanRpcError(error: unknown): SorobanRpcError {
 
   // Malformed response or invalid JSON.
   if (isMalformedResponseError(error)) {
-    return new SorobanRpcMalformedResponseError({
+    return new SorobanRpcProviderError({
       providerCode: extractProviderCode(error),
       providerMessage: safeErrorMessage(error),
     });
@@ -369,67 +392,102 @@ export function classifySorobanRpcError(error: unknown): SorobanRpcError {
 
   // Quasi RPC application error (e.g., contract execution failure).
   if (looksLikeRpcError(error)) {
-    return new SorobanRpcApplicationError({
+    return new SorobanRpcApplicationError(
       providerCode: extractProviderCode(error),
       providerMessage: safeErrorMessage(error),
     });
   }
 
-  // Unknown provider status or miscellaneous error: fall back to application error.
+  // Unknown provider status or non-RPC error.
   return new SorobanRpcApplicationError({
     providerCode: extractProviderCode(error),
     providerMessage: safeErrorMessage(error),
   });
 }
 
+/** The classification for an unrecognized provider failure. */
+export class SorobanRpcUnknownError extends SorobanRpcError {
+  constructor(options: { providerCode?: string; providerMessage?: string } = {}) {
+    super(502, APP_ERROR_CODES.SOROBAN_RPC_TRANSPORT_ERROR, 'Soroban RPC unknown error', true, options);
+    this.name = 'SorobanRpcUnknownError';
+  }
+}
+
 function parseRetryAfter(value: unknown): number | undefined {
-  if (typeof value === 'number' && Number.isFinite(value)) {
-    return value;
+  if (typeof value !== 'string') {
+    return undefined;
   }
-  if (typeof value === 'string' && value.trim()) {
-    const seconds = Number.parseInt(value, 10);
-    if (Number.isFinite(seconds)) {
-      return seconds;
-    }
+
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed) || parsed < 0) {
+    return undefined;
   }
-  return undefined;
+
+  return parsed;
 }
 
 function isTimeoutError(error: unknown): boolean {
-  return error instanceof Error &&
-    (error.name === 'TimeoutError' || error.name === 'AbortError');
+  const e = error as any;
+  const name = e?.name;
+  const code = e?.code;
+
+  return (
+    name === 'AbortError' ||
+    name === 'TimeoutError' ||
+    code === 'ETCONNABORTED' ||
+    code === 'ERR_ABA' ||
+    code === 'ERR_SOROBAN_RPC_TIMEOUT'
+  );
 }
 
 function isTransportError(error: unknown): boolean {
-  if (error instanceof TypeError) {
-    return true;
-  }
-  const cause = (error as any)?.cause;
-  return typeof cause === 'object' && cause !== null &&
-    ['ECONNREFUSED', 'ENOTFOUND', 'EPIPE', 'EAI_AGAIN'].includes(cause?.code);
+  const e = error as any;
+  const code = e?.code;
+  const name = e?.name;
+
+  return (
+    code === 'ECONNREFUSED' ||
+    code === 'ECONNRESET' ||
+    code === 'ENHOSTUNREACH' ||
+    code === 'ETCIMOUT' ||
+    code === 'EAICHAIN' ||
+    code === 'ERRNETUNREACH' ||
+    name === 'FetchError' ||
+    name === 'NetworkError'
+  );
 }
 
 function isMalformedResponseError(error: unknown): boolean {
-  if (error instanceof SyntaxError) {
-    return true;
-  }
-  return (error as any)?.type === 'invalid-json';
+  const e = error as any;
+  const name = e?.name;
+  const code = e?.code;
+
+  return (
+    name === 'SyntaxError' ||
+    code === 'ERR_SOROBAN_RPC_MALFORMED_RESPONSE' ||
+    code === 'ERR_INVALID_JSON'
+  );
 }
 
 function looksLikeRpcError(error: unknown): boolean {
   const e = error as any;
-  return e!.code !== undefined || e?.error?.code !== undefined;
+  return Boolean(e?.rpcError || e?.error?.code || e?.data?.code || e.json);
 }
 
 function extractProviderCode(error: unknown): string | undefined {
   const e = error as any;
-  if (e?.code !== undefined) { return String(e.code); }
-  if (e?.error?.code !== undefined) { return String(e.error.code); }
-  return undefined;
+  const code = e?.code ?? e?.error?.code ?? e?.data?.code;
+  return typeof code === 'string' ? code : undefined;
 }
 
 function safeErrorMessage(error: unknown): string | undefined {
-  const message = (error as any)?.message;
-  if (typeof message !== 'string') { return undefined; }
-  return sanitizeErrorMessage(message, 'soroban_rpc_error');
+  if (error instanceof Error) {
+    return error.message;
+  }
+
+  if (typeof error === 'string') {
+    return error;
+  }
+
+  return undefined;
 }

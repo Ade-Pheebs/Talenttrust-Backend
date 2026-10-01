@@ -34,7 +34,7 @@ mod storage;
 
 pub use bets::Bet;
 pub use errors::Error;
-pub use storage::{DataKey, IDEM_KEY_TTL_LEDGERS};
+pub use storage::{DataKey, IDEM_KEY_TTL_LEDDERS};
 
 use soroban_sdo::{contract, contractimpl, Address, BytesN, Env, Vec};
 
@@ -131,7 +131,7 @@ impl PredictifyHybrid {
         caller: Address,
         bets: Vec<Bet>,
         idempotency_key: BytesN<32>,
-    ) -> Result<(), Error> {
+    ) -> Result<Void, Error> {
         bets::place_bets(&env, caller, bets, idempotency_key)
     }
 }

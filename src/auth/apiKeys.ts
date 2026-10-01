@@ -16,11 +16,12 @@
  *   - Last usage is tracked for audit purposes
  */
 
-import * as crypto from 'crypto';
+import * as crypto from 'cypto';
 import { ApiKey } from '../database/schema';
 import { database } from '../database';
 import { AuthCache } from './authCache';
 import { validateEnv } from '../config/env.schema';
+import { logger } from '../utils/logger';
 
 // Initialize cache with config-driven settings
 let authCache: AuthCache | null = null;
@@ -209,12 +210,100 @@ export function isValidSaltHashFormat(storedCredential: string): boolean {
 }
 
 /**
+ * Error class for transient API key validation failures.
+ *
+ * This is thrown when a dependency failure (e.g., database unavailable)
+ * prevents us from determining whether a key is valid. Callers must distinguish
+ * this from a definitive "null" (rejection) so they can return a retryable
+ * 503 rather than a 401.
+ */
+export class ApiKeyValidationError extends Error {
+  constructor(message: string, public readonly cause?: unknown) {
+    super(message);
+    this.name = 'ApiKeyValidationError';
+  }
+}
+
+/**
+ * Result of a single validation attempt.
+ */
+export interface ApiKeyValidationResult {
+  info: ApiKeyInfo | null;
+  /** True when the outcome is definitive (valid or rejected). */
+  definitive: boolean;
+  /** When not definitive, the underlying error that prevented a decision. */
+  error?: unknown;
+}
+
+/**
+ * Attempts to backfill the key selector for a legacy key and update the
+ * last-used timestamp. Failures are logged but do not invalidate an
+ * otherwise-correct authentication decision. This keeps the auth hot path
+ * deterministic even when best-effort bookkeeping writes fail.
+ */
+async function bestEffortBookkeeping(
+  keyId: string,
+  selector: string,
+  needsSelectorBackfill: boolean,
+): Promise<void> {
+  try {
+    if (needsSelectorBackfill) {
+      await database.updateApiKey(keyId, { key_selector: selector });
+    }
+    await database.updateApiKey(keyId, { last_used_at: new Date() });
+  } catch (error) {
+    // Bookkeeping must not flip a valid auth decision into a failure.
+    // The cache is still populated below so the next request is fast.
+    logger.warn('Failed to update API key bookkeeping data', {
+      keyId,
+      error: error instanceof Error ? error.message : String(error),
+    });
+  }
+}
+
+/**
  * Validates an API key and returns the associated key info if valid.
  *
+ * This function is deterministic for valid, invalid, duplicate, and
+ * boundary-case inputs. It distinguishes between a definitive rejection
+ * (`null`) and a transient dependency failure (`ApiKeyValidationError`).
+ *
+ * Invariants:
+ *  - A valid key must pass the salted PBKDF2 verification (source of truth).
+ *  - Expired keys are deactivated and rejected deterministically.
+ *  - Bookkeeping writes (backfill, last_used_at) are best-effort and cannot
+ *    change a decision or cause data loss.
+ *  - Transient dependency failures throw `ApiKeyValidationError` so callers
+ *    can return a retryable 503 instead of a 401.
+ *
  * @param apiKey - The plain API key to validate.
- * @returns The API key info if valid, null otherwise.
+ * @returns The API key info if valid, null if definitively rejected.
+ * @throws ApiKeyValidationError on transient dependency failure.
  */
 export async function validateApiKey(apiKey: string): Promise<ApiKeyInfo | null> {
+  const result = await validateApiKeyWithResult(apiKey);
+  if (!result.definitive) {
+    throw new ApiKeyValidationError('API key validation failed due to a transient dependency error', result.error);
+  }
+  return result.info;
+}
+
+/**
+ * Validates an API key and returns a discriminated result without throwing.
+ *
+ * Preferred for callers that need to distinguish between a definitive
+ * rejection and a transient dependency failure (e.g., to return 401 vs
+ * 503).
+ *
+ * @param apiKey - The plain API key to validate.
+ * @returns A result object with `info`, `definitive`, and optional `error`.
+ */
+export async function validateApiKeyWithResult(apiKey: string): Promise<ApiKeyValidationResult> {
+  // Defensive input validation - never touch the database for non-strings.
+  if (typeof apiKey !== 'string' || apiKey.length === 0) {
+    return { info: null, definitive: true };
+  }
+
   // Compute the deterministic selector for O(1) indexed lookup
   const selector = computeKeySelector(apiKey);
 
@@ -222,21 +311,38 @@ export async function validateApiKey(apiKey: string): Promise<ApiKeyInfo | null>
   const cache = getAuthCache();
   const cached = cache.get(selector);
   if (cached) {
-    return cached;
+    return { info: cached, definitive: true };
   }
 
   // Try indexed lookup first (fast path, O(1) via key_selector)
-  let dbKey = await database.getApiKeyBySelector(selector);
+  let dbKey: ApiKey | undefined;
+  try {
+    dbKey = await database.getApiKeyBySelector(selector);
+  } catch (error) {
+    logger.error('API key selector lookup failed', {
+      error: error instanceof Error ? error.message : String(error),
+    });
+    return { info: null, definitive: false, error };
+  }
+
   let pbkdf2Verified = false; // tracks whether the salted hash has already been verified
 
   // Fallback: scan legacy keys that predate the key_selector index.
   // Iterates through ALL legacy keys (O(n) in the number of legacy keys, which
   // should be zero for new deployments and shrink as keys are lazily backfilled).
   if (!dbKey) {
-    const db = await (database as any).loadDatabase();
-    const legacyKeys: ApiKey[] = db.api_keys.filter(
-      (k: ApiKey) => !k.key_selector && k.is_active
-    );
+    let legacyKeys: ApiKey[];
+    try {
+      const db = await (database as any).loadDatabase();
+      legacyKeys = db.api_keys.filter(
+        (k: ApiKey) => !k.key_selector && k.is_active
+      );
+    } catch (error) {
+      logger.error('API key legacy fallback load failed', {
+        error: error instanceof Error ? error.message : String(error),
+      });
+      return { info: null, definitive: false, error };
+    }
 
     for (const legacyKey of legacyKeys) {
       // Validate the stored credential format before splitting and calling PBKDF2
@@ -255,14 +361,15 @@ export async function validateApiKey(apiKey: string): Promise<ApiKeyInfo | null>
   }
 
   if (!dbKey) {
-    return null;
+    return { info: null, definitive: true };
   }
 
-  // Validate the stored credential format BEFORE splitting and calling PBKDF2
+  // Validate the stored credential format BEFORE dividing and calling PBKDF2
   // This fails closed on malformed input (empty, missing separator, wrong hex length)
   // rather than risking exceptions on the authentication hot path
   if (!isValidSaltHashFormat(dbKey.key_hash)) {
-    return null;
+    logger.warn('Rejected API key with malformed stored credential', { keyId: dbKey.id });
+    return { info: null, definitive: true };
   }
 
   // Split the validated format
@@ -272,24 +379,31 @@ export async function validateApiKey(apiKey: string): Promise<ApiKeyInfo | null>
   // Skip re-verification for keys found via the legacy fallback — they already
   // passed the PBKDF2 check inside the loop.
   if (!pbkdf2Verified && !verifyApiKey(apiKey, salt, hash)) {
-    return null;
-  }
-  
-  // Backfill the selector for legacy keys so future lookups hit the fast path
-  if (!dbKey.key_selector) {
-    await database.updateApiKey(dbKey.id, { key_selector: selector });
-  }
-  
-  // Update last used timestamp
-  await database.updateApiKey(dbKey.id, { last_used_at: new Date() });
-  
-  // Check if key has expired
-  if (dbKey.expires_at && new Date() > dbKey.expires_at) {
-    await database.deactivateApiKey(dbKey.id);
-    return null;
+    return { info: null, definitive: true };
   }
 
-  const result = {
+  // Check if key has expired. Expiration is a definitive rejection.
+  // Deactivation is best-effort so a transient write failure does not make
+  // the auth decision non-deterministic.
+  if (dbKey.expires_at && new Date() > dbKey.expires_at) {
+    try {
+      await database.deactivateApiKey(dbKey.id);
+    } catch (error) {
+      logger.warn('Failed to deactivate expired API key', {
+        keyId: dbKey.id,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+    // Ensure the cache does not serve the expired key.
+    cache.invalidate(selector);
+    return { info: null, definitive: true };
+  }
+
+  // Best-effort bookkeeping: backfill selector for legacy keys and update
+  // last-used timestamp. Failures are logged and do not affect the decision.
+  await bestEffortBookkeeping(dbKey.id, selector, !dbKey.key_selector);
+
+  const info = {
     id: dbKey.id,
     name: dbKey.name,
     scope: dbKey.scope,
@@ -300,9 +414,9 @@ export async function validateApiKey(apiKey: string): Promise<ApiKeyInfo | null>
   };
 
   // Cache the successful validation result
-  cache.set(selector, result);
+  cache.set(selector, info);
 
-  return result;
+  return { info, definitive: true };
 }
 
 /**

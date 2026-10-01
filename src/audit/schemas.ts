@@ -50,22 +50,7 @@ export const createAuditEntryBodySchema = z.object({
 
 export type CreateAuditEntryBody = z.infer<typeof createAuditEntryBodySchema>;
 
-/**
- * Boundary constants for the audit query surface. Exported so callers and
- * tests share the same numeric limits instead of duplicating magic numbers.
- */
-export const AUDIT_QUERY_BOUNDS = {
-  /** Hard ceiling for `limit` on the cursor-paginated listing route. */
-  MAX_LIMIT: 100,
-  /** Default `limit` when the caller omits it. */
-  DEFAULT_LIMIT: 20,
-  /** Hard ceiling for `limit` on the export route. */
-  EXPORT_MAX_LIMIT: 1000,
-  /** Default `limit` for the export route. */
-  EXPORT_DEFAULT_LIMIT: 100,
-  /** Maximum allowed `offset` (inclusive) to keep pagination bounded. */
-  MAX_OFFSET: 1_000_000,
-} as const;
+const MAX_CURSOR_LENGTH = 4096;
 
 const isoDateStringSchema = (fieldName: string) =>
   z
@@ -93,6 +78,9 @@ const nonNegativeIntStringSchema = (message: string) =>
 
 const cursorSchema = z.string().refine(
   (value) => {
+    if (value.length > MAX_CURSOR_LENGTH) {
+      return false;
+    }
     try {
       decodeCursor(value);
       return true;

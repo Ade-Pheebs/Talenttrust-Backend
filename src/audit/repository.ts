@@ -82,276 +82,120 @@ export interface AuditLogRepository {
 }
 
 /**
- * Resolves the configured audit storage backend.
+ * Process-wide cache of the default repository.
  *
  * Invariants:
- * - The returned repository is fully constructed and ready to use before
- *   this function returns. Callers never observe a partially initialised
- *   backend.
- * - If the SQLLite backend fails to initialise (native binding missing,
- *   corrupt db, permission denied), the failure is surfaced as a
- *   deterministic, diagnosable error rather than a silent fallback to
- *   memory storage that would lose persisted data.
- * - The error message includes the backend name and a stable code so that
- *   operators can alert on it without exposing the database path or other
- *   sensitive details.
+ *  - The default repository is a concurrency-safe singleton. Concurrent
+ *    calls to `createDefaultAuditRepository()` must never open multiple
+ *    SQLite connections or return different instances for the same config.
+ *  - The cache key is derived from the resolved backend + database path so
+ *    tests that mutate env vars between calls still get isolated instances.
+ *  - The cache is bounded to avoid unbounded memory growth in long-running
+ *    processes that legacy-code reconfigures at runtime.
  */
-export class AuditRepositoryInitError extends Error {
-  readonly code = 'AUDIT_REPOSITORY_INIT_FAILED';
-  readonly backend: string;
+interface CachedRepositoryEntry {
+  repository: AuditLogRepository;
+  close?: () => void;
+}
 
-  constructor(backend: string, cause?: unknown) {
-    super(
-      `Audit repository initialisation failed for backend "${backend}". See cause for details.`,
-    );
-    this.name = 'AuditRepositoryInitError';
-    this.backend = backend;
-    if (cause !== undefined) {
-      (this as { cause?: unknown }).cause = cause;
+const MAX_CACHE_ENTRIES = 8;
+
+const repositoryCache = new Map<string, CachedRepositoryEntry>();
+
+function cacheKey(backend: string, dbPath: string | undefined): string {
+  return `${backend}::${dbPath ?? '<unset>'}`;
+}
+
+function resolveDbPath(): string {
+  return (
+    process.env['AUDIT_DB_PATH'] ??
+    (process.env['NODE_ENV'] === 'test'
+      ? ':memory:'
+      : path.join(process.cwd(), 'talenttrust-audit.db'))
+  );
+}
+
+function getOrCreate(
+  key: string,
+  factory: () => CachedRepositoryEntry,
+): AuditLogRepository {
+  const existing = repositoryCache.get(key);
+  if (existing) {
+    // Refresh LRU order so hot keys are evicted last.
+    repositoryCache.delete(key);
+    repositoryCache.set(key, existing);
+    return existing.repository;
+  }
+
+  // Note: Node.js is single-threaded for JS execution, and the factory below
+  // is synchronous. This guarantees that two interleaved calls cannot both
+  // observe a cache miss and create duplicate SQLite connections.
+  const created = factory();
+  repositoryCache.set(key, created);
+
+  // Evict least-recently used entries and close their underlying resources.
+  while (repositoryCache.size > MAX_CACHE_ENTRIES) {
+    const oldestKey = repositoryCache.keys().next().value;
+    if (oldestKey === undefined) break;
+    const evicted = repositoryCache.get(oldestKey);
+    repositoryCache.delete(oldestKey);
+    try {
+      evicted?.close?.();
+    } catch {
+      // Best-effort cleanup; eviction must not throw.
     }
   }
+
+  return created.repository;
+}
+
+/**
+ * Resets the process-wide repository cache. Intended for tests and for
+ * controlled shutdown paths. Closes any cached SQLite connections.
+ */
+export function resetDefaultAuditRepository(): void {
+  for (const [, entry] of repositoryCache) {
+    try {
+      entry.close?.();
+    } catch {
+      // Best-effort cleanup.
+    }
+  }
+  repositoryCache.clear();
 }
 
 export function createDefaultAuditRepository(): AuditLogRepository {
   const backend = process.env['AUDIT_STORAGE_BACKEND'] ?? 'memory';
-
-/**
- * Validates CreateAuditEntryInput before it reaches the repository.
- * Throws AuditValidationError if validation fails.
- */
-function validateCreateAuditEntryInput(input: CreateAuditEntryInput): void {
-  // Validate action
-  const actionResult = validateEnum(input.action, 'action', AUDIT_ACTIONS);
-  if (!actionResult.valid) {
-    throw actionResult.error;
-  }
-
-  // Validate severity
-  const severityResult = validateEnum(input.severity, 'severity', AUDIT_SEVERITIES);
-  if (!severityResult.valid) {
-    throw severityResult.error;
-  }
-
-  // Validate actor
-  const actorResult = validateStringField(input.actor, 'actor');
-  if (!actorResult.valid) {
-    throw actorResult.error;
-  }
-
-  // Validate resource
-  const resourceResult = validateStringField(input.resource, 'resource');
-  if (!resourceResult.valid) {
-    throw resourceResult.error;
-  }
-
-  // Validate resourceId
-  const resourceIdResult = validateStringField(input.resourceId, 'resourceId');
-  if (!resourceIdResult.valid) {
-    throw resourceIdResult.error;
-  }
-
-  // Validate metadata
-  const metadataResult = validateMetadata(input.metadata, 'metadata');
-  if (!metadataResult.valid) {
-    throw metadataResult.error;
-  }
-
-  // Validate optional fields
-  if (input.ipAddress !== undefined && input.ipAddress !== null) {
-    const ipResult = validateStringField(input.ipAddress, 'ipAddress');
-    if (!ipResult.valid) {
-      throw ipResult.error;
-    }
-  }
-
-  if (input.correlationId !== undefined && input.correlationId !== null) {
-    const correlationResult = validateStringField(input.correlationId, 'correlationId');
-    if (!correlationResult.valid) {
-      throw correlationResult.error;
-    }
-  }
-}
-
-/**
- * Validates AuditQuery parameters before they reach the repository.
- * Returns a normalized query with safe defaults applied.
- */
-function validateAuditQuery(query: AuditQuery = {}): AuditQuery {
-  const normalized: AuditQuery = { ...query };
-
-  // Validate limit
-  const limitResult = validateLimit(query.limit);
-  if (limitResult.valid) {
-    normalized.limit = limitResult.data;
-  } else {
-    // Log the error but use a safe default
-    console.error('[repository] Invalid limit:', limitResult.error.message);
-    normalized.limit = 50;
-  }
-
-  // Validate offset
-  const offsetResult = validateOffset(query.offset);
-  if (offsetResult.valid) {
-    normalized.offset = offsetResult.data;
-  } else {
-    // Log the error but use a safe default
-    console.error('[repository] Invalid offset:', offsetResult.error.message);
-    normalized.offset = 0;
-  }
-
-  // Validate timestamp filters if provided
-  if (query.from) {
-    const fromResult = validateTimestamp(query.from, 'from');
-    if (!fromResult.valid) {
-      console.error('[repository] Invalid from timestamp:', fromResult.error.message);
-      delete normalized.from;
-    }
-  }
-
-  if (query.to) {
-    const toResult = validateTimestamp(query.to, 'to');
-    if (!toResult.valid) {
-      console.error('[repository] Invalid to timestamp:', toResult.error.message);
-      delete normalized.to;
-    }
-  }
-
-  // Validate action filter if provided
-  if (query.action) {
-    const actionResult = validateEnum(query.action, 'action', AUDIT_ACTIONS);
-    if (!actionResult.valid) {
-      console.error('[repository] Invalid action filter:', actionResult.error.message);
-      delete normalized.action;
-    }
-  }
-
-  // Validate severity filter if provided
-  if (query.severity) {
-    const severityResult = validateEnum(query.severity, 'severity', AUDIT_SEVERITIES);
-    if (!severityResult.valid) {
-      console.error('[repository] Invalid severity filter:', severityResult.error.message);
-      delete normalized.severity;
-    }
-  }
-
-  // Validate string filters if provided
-  if (query.actor !== undefined) {
-    const actorResult = validateStringField(query.actor, 'actor');
-    if (!actorResult.valid) {
-      console.error('[repository] Invalid actor filter:', actorResult.error.message);
-      delete normalized.actor;
-    }
-  }
-
-  if (query.resource !== undefined) {
-    const resourceResult = validateStringField(query.resource, 'resource');
-    if (!resourceResult.valid) {
-      console.error('[repository] Invalid resource filter:', resourceResult.error.message);
-      delete normalized.resource;
-    }
-  }
-
-  if (query.resourceId !== undefined) {
-    const resourceIdResult = validateStringField(query.resourceId, 'resourceId');
-    if (!resourceIdResult.valid) {
-      console.error('[repository] Invalid resourceId filter:', resourceIdResult.error.message);
-      delete normalized.resourceId;
-    }
-  }
-
-  return normalized;
-}
-
-// ─── Validating repository wrapper ─────────────────────────────────────────────
-
-/**
- * A repository wrapper that applies validation at the boundary.
- * This ensures all inputs are validated before reaching the underlying storage.
- */
-class ValidatingAuditRepository implements AuditLogRepository {
-  constructor(private readonly inner: AuditLogRepository) {}
-
-  append(input: CreateAuditEntryInput): AuditEntry {
-    validateCreateAuditEntryInput(input);
-    return this.inner.append(input);
-  }
-
-  getById(id: string): AuditEntry | undefined {
-    // Validate ID format
-    const idResult = validateStringField(id, 'id');
-    if (!idResult.valid) {
-      console.error('[repository] Invalid id:', idResult.error.message);
-      return undefined;
-    }
-    return this.inner.getById(id);
-  }
-
-  query(query?: AuditQuery): AuditEntry[] {
-    const normalized = validateAuditQuery(query);
-    return this.inner.query(normalized);
-  }
-
-  queryWithCursor(query?: AuditQuery): AuditQueryResult {
-    const normalized = validateAuditQuery(query);
-    return this.inner.queryWithCursor(normalized);
-  }
-
-  stream(query?: AuditQuery): IterableIterator<AuditEntry> {
-    const normalized = validateAuditQuery(query);
-    return this.inner.stream(normalized);
-  }
-
-  count(): number {
-    return this.inner.count();
-  }
-
-  verifyIntegrity(): IntegrityReport {
-    return this.inner.verifyIntegrity();
-  }
-}
-
-export function createDefaultAuditRepository(): AuditLogRepository {
-  const backend = process.env['AUDIT_STORAGE_BACKEND'] ?? 'memory';
-  const cacheKey = cacheKeyForBackend(backend);
-
-  const cached = repositoryCache.get(cacheKey);
-  if (cached) {
-    return cached;
-  }
-
-  // Validate backend selection
-  const validBackends = ['memory', 'sqlite'] as const;
-  if (!validBackends.includes(backend as any)) {
-    throw new Error(
-      `Unsupported AUDIT_STORAGE_BACKEND: ${backend}. Must be one of: ${validBackends.join(', ')}`,
-    );
-  }
-
-  let innerRepository: AuditLogRepository;
 
   if (backend === 'memory') {
-    innerRepository = auditStore;
-  } else {
-    // SQLite backend
-    const dbPath =
-      process.env['AUDIT_DB_PATH'] ??
-      (process.env['NODE_ENV'] === 'test'
-        ? ':memory:'
-        : path.join(process.cwd(), 'talenttrust-audit.db'));
-    // Load the native module only when the SQLLite backend is selected so
-    // in-memory tests can run on machines without compiled bindings.
-    //
-    // Failure recovery is deterministic: any error during construction of
-    // the native database or the repository is wrapped in a stable,
-    // non-sensitive error type. We do not silently fall back to the in-memory
-    // store because that would lose persisted audit data and make the
-    // failure unobservable.
-    try {
+    // The in-memory store is already a process-wide singleton with its own
+    // internal concurrency guarantees, so we return it directly without
+    // adding another layer of caching.
+    return auditStore;
+  }
+
+  if (backend === 'sqlite') {
+    const dbPath = resolveDbPath();
+    const key = cacheKey('sqlite', dbPath);
+
+    return getOrCreate(key, () => {
+      // Load the native module only when the SQLite backend is selected so
+      // in-memory tests can run on machines without compiled bindings.
       const db = new Database(dbPath);
-      return new SqliteAuditRepository(db);
-    } catch (error) {
-      throw new AuditRepositoryInitError('sqlite', error);
-    }
+      const repository = new SqliteAuditRepository(db);
+      return {
+        repository,
+        close: () => {
+          // better-sqlite3 exposes a synchronous `close`. Guard against
+          // double-close during eviction races.
+          try {
+            (db as unknown as { close?: () => void }).close?.();
+          } catch {
+            // Ignore close failures during eviction.
+          }
+        },
+      };
+    });
   }
 
   // Wrap with validation layer

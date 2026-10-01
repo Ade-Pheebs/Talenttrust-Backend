@@ -73,28 +73,19 @@ function hashBody(input: CreateAuditEntryInput): string {
 }
 
 /**
- * Thrown when a caller attempts to commit a key with a body hash that differs
- * from the one recorded at claim time. This is a client error (conflicting
- * payloads for the same idempotency key) and must not be swallowed.
+ * In-memory idempotency store.
+ *
+ * Concurrency / idempotency invariants:
+ * - `set` is monotonic for a given key: once a key is bound to a response, a
+ *   subsequent `set` with the same key must not overwrite it. This prevents a
+ *   concurrent retry from claiming the key with a different body and returning
+ *   an inconsistent response to the original caller.
+ * - `setIfAbsent` returns the existing record when the key is already bound,
+ *   allowing callers to detect and surface body mismatches (409-style conflict)
+ *   without losing the original response.
+ * - Eviction is bounded and deterministic: expired entries are removed first,
+ *   then the oldest insertion order entry is evicted when atthe capacity limit.
  */
-export class IdempotencyConflictError extends Error {
-  constructor(message: string) {
-    super(message);
-    this.name = 'IdempotencyConflictError';
-  }
-}
-
-/**
- * Thrown when a caller attempts to commit or release a key that is not
- * currently claimed by them.
- */
-export class IdempotencyStateError extends Error {
-  constructor(message: string) {
-    super(message);
-    this.name = 'IdempotencyStateError';
-  }
-}
-
 export class IdempotencyStore {
   private readonly store = new Map<string, IdempotencyRecord>();
   /**
@@ -128,86 +119,34 @@ export class IdempotencyStore {
   }
 
   /**
-   * Atomically reserve a key for execution.
-   *
-   * This is the concurrency-safe entry point for callers that need to
-   * guarantee a single audit entry per key even when multiple requests are
-   * in flight. The caller must not await anything between claim and the
-   * decision to execute.
-   *
-   * @param key - Idempotency key (typically the client-supplied header).
-   * @param input - The payload being attempted; used to bind the claim
-   *   to a specific body hash so a conflicting payload fails loud.
+   * Binds a key to a response. If the key is already bound to a live record,
+   * the existing record is returned and nothing is overwritten.
    */
-  claim(key: string, input: CreateAuditEntryInput): ClaimResult {
+  set(key: string, input: CreateAuditEntryInput, response: AuditEntry): IdempotencyRecord {
     const existing = this.get(key);
     if (existing) {
-      return { status: 'completed', record: existing };
+      return existing;
     }
 
-    if (this.inFlight.has(key)) {
-      return { status: 'in-flight' };
-    }
-
-    // Ensure we have room for the eventual commit before claiming.
     this.evictExpired();
     this.ensureCapacity();
 
-    this.inFlight.set(key, hashBody(input));
-    return { status: 'claimed' };
-  }
-
-  /**
-   * Persist the result of a claimed key. The body hash must match the one
-   * recorded at claim time; otherwise the caller is attempting to commit
-   * a different payload under the same key and we raise
-   * `IdempotencyConflictError`.
-   */
-  commit(key: string, input: CreateAuditEntryInput, response: AuditEntry): void {
-    const inFlightHash = this.inFlight.get(key);
-    if (inFlightHash === undefined) {
-      throw new IdempotencyStateError(
-        `Attempted to commit key ${key} without an active claim`,
-      );
-    }
-
-    const bodyHash = hashBody(input);
-    if (bodyHash !== inFlightHash) {
-      throw new IdempotencyConflictError(
-        `Idempotency key ${key} was claimed with a different payload`,
-      );
-    }
-
-    this.inFlight.delete(key);
-    this.store.set(key, {
-      bodyHash,
-      response,
-      createdAt: this.clock(),
-    });
-  }
-
-  /**
-   * Release a claim without persisting a result. Use this on failure so a
-   * retry can proceed instead of being blocked by an orphaned claim.
-   */
-  release(key: string): void {
-    this.inFlight.delete(key);
-  }
-
-  /**
-   * @deprecated Use `claim` + `commit``. Retained for backward
-   * compatibility with existing callers. Still atomic within the event
-   * loop, but does not protect against callers that await between get/set.
-   */
-  set(key: string, input: CreateAuditEntryInput, response: AuditEntry): void {
-    this.evictExpired();
-    this.ensureCapacity();
-
-    this.store.set(key, {
+    const record: IdempotencyRecord = {
       bodyHash: hashBody(input),
       response,
-      createdAt: this.clock(),
-    });
+      createdAt: Date.now(),
+    };
+    this.store.set(key, record);
+    return record;
+  }
+
+  /**
+   * Atomic alias for `set` that makes the idempotent semantics explicit at
+   * call sites: if the key is already bound, the existing record is returned
+   * and the caller must not persist the new response.
+   */
+  setIfAbsent(key: string, input: CreateAuditEntryInput, response: AuditEntry): IdempotencyRecord {
+    return this.set(key, input, response);
   }
 
   delete(key: string): void {

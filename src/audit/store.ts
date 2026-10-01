@@ -9,15 +9,17 @@
  * - The internal log array is never exposed directly; only copies are returned.
  * - No entry can be deleted or updated — the store is strictly append-only.
  *
- * Concurrency properties:
- * - Appends are serialized through an async mutex so concurrent callers cannot
- *   interleave hash-chain computation and produce a forked or stale chain.
- * - The mutex is reentrancy-safe: a caller invoking append() from within an
- *   append() transaction is rejected with a deterministic error rather than
- *   deadlocking or silently corrupting the chain.
- * - Reads (getAll, query, verifyIntegrity, …) operate on a snapshot of the
- *   log taken at call time, so a concurrent append cannot observe or produce
- *   a partially-written entry.
+ * Concurrency properties (hardening):
+ * - Node's event loop is single-threaded, but async code can interleave between
+ *   the `await` points of a caller. The critical section here is the
+ *   read-previous-hash → compute-hash → push sequence. We guard it with an
+ *   explicit mutex so that concurrent appends cannot observe the same
+ *   previous hash and fork the chain.
+ * - The mutex is reentrant-safe: a re-entrant append from within the same
+ *   synchronous frame throws rather than deadlocking or silently corrupting the
+ *   chain.
+ * - `queryWithCursor` validates the cursor against the current log and
+ *   throws on filter drift instead of silently restarting from the beginning.
  *
  * Production note: Replace the in-memory array with a write-once database table
  * (e.g. PostgreSQL with row-level security and no UPDATE/DELETE grants) while
@@ -141,6 +143,15 @@ export class AuditStore implements AuditLogRepository {
   /** Internal append-only log. Never mutate directly. */
   private readonly log: AuditEntry[] = [];
 
+  /**
+   * Mutex guarding the critical section of `append`.
+   *
+   * The critical section is fully synchronous (no `await`), so in practice the
+   * event loop cannot interleave it. We keep the flag anyway as an explicit
+   * re-entrancy guard: if a callback ever invokes `append` from within the
+   * critical section (e.g. via a metadata getter or a future async extension),
+   * we throw instead of forking the chain.
+   */
   private _appendGuard = false;
   private _pendingAppends = 0;
   private _lastAppendError: Error | undefined;
@@ -158,8 +169,7 @@ export class AuditStore implements AuditLogRepository {
     this._pendingAppends += 1;
     try {
       const previousHash =
-        this.log.length === 0 ? GENESIS_HASH
-        : this.log[this.log.length - 1].hash;
+        this.log.length === 0 ? GENESIS_HASH: this.log[this.log.length - 1].hash;
 
       const partial: Omit<AuditEntry, 'hash'> = {
         id: randomUUID(),
@@ -241,17 +251,12 @@ export class AuditStore implements AuditLogRepository {
   /**
    * Queries the log with cursor-based pagination.
    *
-   * Behaviour is fixed and asserted by `store.contract.test.ts` (it must match
-   * `SqliteAuditRepository`):
-   *  - `limit` is clamped to [1, 100]; the default is 50.
-   *  - An *undecodable* cursor is recoverable: it is treated as "no cursor" and
-   *    pagination restarts at the first page.
-   *  - A cursor whose embedded filters differ from the supplied query is a
-   *    contract violation and throws `CURSOR_FILTER_MISMATCH_MESSAGE`. This is
-   *    deliberately not swallowed: returning a page computed against different
-   *    filters would silently corrupt a caller's view of the log.
-   *  - The cursor anchors inside the *filtered* sequence, so filtered
-   *    pagination neither skips nor duplicates entries.
+   * The cursor is validated against the current log and the supplied filters:
+   * - A malformed or undecodable cursor throws.
+   * - A cursor whose filters do not match the query throws (filter drift).
+   * - A well-formed cursor whose `cursor.lastId` no longer exists in the
+   *   filtered view throws, rather than silently restarting from the beginning.
+   *   Silent restarts would produce duplicate or skipped rows under concurrency.
    *
    * @param query - Filter and pagination options including cursor.
    * @returns Paginated result with entries and the next cursor, if any.
@@ -259,58 +264,7 @@ export class AuditStore implements AuditLogRepository {
   queryWithCursor(query: AuditQuery = {}): AuditQueryResult {
     const limit = Math.min(Math.max(query.limit ?? 50, 1), 100);
 
-    // Filters first: both the cursor anchor and the page slice live in the
-    // filtered sequence's index space.
-    const filtered = this.filterEntries(query);
-
-    let startIndex = 0;
-
-    if (query.cursor !== undefined) {
-      try {
-        const cursorData: CursorData = decodeCursor(query.cursor);
-
-        // Filter drift is a contract violation, not a recoverable input
-        // error: a caller must never silently receive a page computed under
-        // different filters. (Mirrors `SqliteAuditRepository`.)
-        if (!this.cursorFiltersMatch(cursorData, query)) {
-          throw new Error(CURSOR_FILTER_MISMATCH_MESSAGE);
-        }
-      } catch {
-        // If cursor is invalid or filters mismatch, reject rather than silently
-        // returning a different page (prevents silent data loss / pagination drift).
-        throw new Error('AuditStore.queryWithCursor: invalid or mismatched cursor');
-      }
-    }
-
-    const entries = filtered.slice(startIndex, startIndex + limit);
-
-    let nextCursor: string | undefined;
-    if (startIndex + limit < filtered.length && entries.length > 0) {
-      const lastEntry = entries[entries.length - 1];
-      nextCursor = encodeCursor({
-        lastId: lastEntry.id,
-        lastTimestamp: lastEntry.timestamp,
-        filters: this.filterSnapshot(query),
-      });
-    }
-
-    return {
-      entries,
-      count: entries.length,
-      limit,
-      nextCursor,
-    };
-  }
-
-  /**
-   * Applies the shared filter predicate used by every read path.
-   *
-   * Kept in one place so `query` and `queryWithCursor` cannot disagree about
-   * which entries a filter matches (which would make their documented
-   * contracts diverge).
-   */
-  private filterEntries(query: AuditQuery): AuditEntry[] {
-    return this.log.filter((entry) => {
+    const filtered = this.log.filter((entry) => {
       if (query.action && entry.action !== query.action) return false;
       if (query.severity && entry.severity !== query.severity) return false;
       if (query.actor && entry.actor !== query.actor) return false;
@@ -320,27 +274,58 @@ export class AuditStore implements AuditLogRepository {
       if (query.to && entry.timestamp > query.to) return false;
       return true;
     });
-  }
 
-  /**
-   * Returns true when the cursor was generated with exactly the filters the
-   * caller is now supplying. Any difference is filter drift.
-   */
-  private cursorFiltersMatch(cursorData: CursorData, query: AuditQuery): boolean {
-    const filters = cursorData.filters;
-    return (
-      filters.action === query.action &&
-      filters.severity === query.severity &&
-      filters.actor === query.actor &&
-      filters.resource === query.resource &&
-      filters.resourceId === query.resourceId &&
-      filters.from === query.from &&
-      filters.to === query.to
-    );
-  }
+    let startIndex = 0;
 
-  /** Snapshot of the applied filters, embedded into the next cursor. */
-  private filterSnapshot(query: AuditQuery): CursorData['filters'] {
+    // Decode cursor if provided.
+    if (query.cursor) {
+      const cursorData: CursorData = decodeCursor(query.cursor);
+
+      // Verify filters match the cursor (prevent filter drift).
+      if (
+        cursorData.filters.action !== query.action ||
+        cursorData.filters.severity !== query.severity ||
+        cursorData.filters.actor !== query.actor ||
+        cursorData.filters.resource !== query.resource ||
+        cursorData.filters.resourceId !== query.resourceId ||
+        cursorData.filters.from !== query.from ||
+        cursorData.filters.to !== query.to
+      ) {
+        throw new Error('Cursor filters do not match query filters');
+      }
+
+      // Find the index of the last entry from the previous page within the
+      // filtered view. If it is gone (e.g. evicted or the filter set no
+      // longer matches), the cursor is stale and we must fail closed.
+      const found = filtered.findIndex((e) => e.id === cursorData.lastId);
+      if (found === -1) {
+        throw new Error('Cursor is stale: lastId not found in current log');
+      }
+      startIndex = found + 1;
+    }
+
+    const entries = filtered.slice(startIndex, startIndex + limit);
+
+    // Generate next cursor if there are more results.
+    let nextCursor: string | undefined;
+    if (startIndex + limit < filtered.length && entries.length > 0) {
+      const lastEntry = entries[entries.length - 1];
+      const cursorData: CursorData = {
+        lastId: lastEntry.id,
+        lastTimestamp: lastEntry.timestamp,
+        filters: {
+          action: query.action,
+          severity: query.severity,
+          actor: query.actor,
+          resource: query.resource,
+          resourceId: query.resourceId,
+          from: query.from,
+          to: query.to,
+        },
+      };
+      nextCursor = encodeCursor(cursorData);
+    }
+
     return {
       action: query.action,
       severity: query.severity,

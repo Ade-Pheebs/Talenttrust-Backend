@@ -12,23 +12,16 @@
  */
 
 import { z } from 'zod';
-import { decodeCursor } from './types';
+import { decodeCursor, AUDIT_ACTIONS, AUDIT_SEVERITIES } from './types';
 
-/** Mirrors the `AuditAction` union in `./types.ts`. Keep these in sync. */
-export const AUDIT_ACTIONS = [
-  'CONTRACT_CREATED', 'CONTRACT_UPDATED', 'CONTRACT_CANCELLED', 'CONTRACT_COMPLETED',
-  'PAYMENT_INITIATED', 'PAYMENT_RELEASED', 'PAYMENT_DISPUTED',
-  'REPUTATION_UPDATED',
-  'USER_CREATED', 'USER_UPDATED', 'USER_DELETED',
-  'AUTH_LOGIN', 'AUTH_LOGOUT', 'AUTH_FAILED',
-  'AUTH_LOCKOUT_TRIGGERED', 'AUTH_LOCKOUT_RELEASED',
-  'ADMIN_ACTION',
-  'ENDPOINT_ACCESS', 'ENDPOINT_MUTATION',
-  'DEPLOYMENT_PROMOTED', 'DEPLOYMENT_ROLLED_BACK',
-] as const;
-
-/** Mirrors the `AuditSeverity` union in `./types.ts`. */
-export const AUDIT_SEVERITIES = ['INFO', 'WARNING', 'CRITICAL'] as const;
+// The action/severity vocabularies are owned by `./types.ts` (the single source
+// of truth) and re-exported here so existing importers of this module keep
+// working. Deriving both zod enums from the same arrays means the HTTP contract
+// can never accept an action the rest of the system rejects (or vice versa) —
+// these arrays used to be hand-mirrored and had already drifted (the copies
+// here were missing CONTRACT_DELETED, REPUTATION_CORRECTED, and the
+// MILESTONES_* actions that `AuditAction` allowed).
+export { AUDIT_ACTIONS, AUDIT_SEVERITIES };
 
 export const auditActionSchema = z.enum(AUDIT_ACTIONS);
 export const auditSeveritySchema = z.enum(AUDIT_SEVERITIES);

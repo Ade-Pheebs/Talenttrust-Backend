@@ -94,6 +94,7 @@ export interface ReplayableDlqStore {
 
 let dlqStore: ReplayableDlqStore | null = null;
 let stopSampling: (() => void) | null = null;
+let replayInFlight: Set<string> = new Set();
 
 const router = Router();
 
@@ -186,6 +187,7 @@ export function shutdownJobs(): void {
     stopSampling = null;
   }
 
+  replayInFlight.clear();
   dlqStore = null;
 }
 
@@ -230,8 +232,15 @@ router.post(
         return;
       }
 
+      if (replayInFlight.has(id)) {
+        res.status(409).json({ error: 'Replay already in progress for this DLQ record' });
+        return;
+      }
+      replayInFlight.add(id);
+
       const dlqItem = await dlqStore.getEntryById(id);
       if (!dlqItem) {
+        replayInFlight.delete(id);
         res.status(404).json({ error: 'DLQ item not found' });
         return;
       }
@@ -240,6 +249,7 @@ router.post(
       const isDuplicate = await IdempotencyLayer.isEventProcessed(dlqItem.eventId);
       if (isDuplicate) {
         incrementDlqReplay('idempotent_noop');
+        replayInFlight.delete(id);
         res.status(200).json({ status: 'ignored', reason: 'Idempotent no-op: Event already delivered' });
         return;
       }
@@ -254,14 +264,17 @@ router.post(
         await dlqStore.removeEntry(id);
         await IdempotencyLayer.markEventProcessed(dlqItem.eventId);
         incrementDlqReplay('success');
+        replayInFlight.delete(id);
         res.status(200).json({ status: 'success', message: 'DLQ record replayed and processed', auditReason: reason });
       } else {
         await dlqStore.incrementReplayAttempts(id);
         incrementDlqReplay('failed');
+        replayInFlight.delete(id);
         res.status(500).json({ status: 'failed', error: 'Delivery transmission failed during retry execution' });
       }
     } catch (error) {
       incrementDlqReplay('error');
+      replayInFlight.delete(id);
       next(error);
     }
   },
@@ -297,8 +310,15 @@ router.post(
       const context = extractRequestContext(req);
 
       for (const id of ids as string[]) {
+        if (replayInFlight.has(id)) {
+          summary.failureCount++;
+          continue;
+        }
+        replayInFlight.add(id);
+
         const dlqItem = await dlqStore.getEntryById(id);
         if (!dlqItem) {
+          replayInFlight.delete(id);
           summary.failureCount++;
           continue;
         }
@@ -306,6 +326,7 @@ router.post(
         const isDuplicate = await IdempotencyLayer.isEventProcessed(dlqItem.eventId);
         if (isDuplicate) {
           incrementDlqReplay('idempotent_noop');
+          replayInFlight.delete(id);
           summary.noOpCount++;
           continue;
         }
@@ -317,10 +338,12 @@ router.post(
           await dlqStore.removeEntry(id);
           await IdempotencyLayer.markEventProcessed(dlqItem.eventId);
           incrementDlqReplay('success');
+          replayInFlight.delete(id);
           summary.successCount++;
         } else {
           await dlqStore.incrementReplayAttempts(id);
           incrementDlqReplay('failed');
+          replayInFlight.delete(id);
           summary.failureCount++;
         }
       }

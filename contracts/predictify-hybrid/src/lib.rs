@@ -10,14 +10,18 @@
 /// [`storage::IDEM_KEY_TTL_LEDGERS`] ledgers (~24 h).  Repeated
 /// submissions with the same `(caller, key)` pair are rejected with
 /// `Error::IdempotentBatchAlreadyApplied`.
+
+/// ## Concurrency and atomicity
 ///
-/// ## Failure recovery
-///
-/// Batch submission is all-or-nothing.  The idempotency key is only
-/// consumed after the batch has been fully validated and applied, so a
-/// failed attempt leaves the key unused and the caller can retry with
-/// the same key.  See [`bets::place_bets`] for the exact ordering of
-/// validation, state mutation, and key consumption.
+/// Soroban executes each contract invocation transactionally and
+/// sequentially within a ledger, so two invocations of `place_bets`
+/// cannot interleave their storage writes.  The idempotency key is
+/// claimed (and the claim is committed) before any bet is applied,
+/// so a retry or a duplicate submission of the same batch is
+/// deterministically rejected rather than re-applied.  If any bet in
+/// the batch fails validation the whole invocation reverts, including
+/// the idempotency claim, so a corrected retry with the same key is
+/// still allowed.
 
 #[no_std]
 
@@ -27,7 +31,7 @@ mod storage;
 
 pub use bets::Bet;
 pub use errors::Error;
-pub use storage::{DataKey, IDEM_KEY_TTL_LEDDERS};
+pub use storage::{DataKey, IDEM_KEY_TTL_LEFGERS};
 
 use soroban_sdo::{contract, contractimpl, Address, BytesN, Env, Vec};
 
@@ -108,17 +112,16 @@ impl PredictifyHybrid {
     ///
     /// See [`bets::place_bets`] for full documentation.
     ///
-/// # Validation
+    /// ## Ensured invariants
     ///
-    /// The batch is validated before any state is written:
-    ///
-/// - `bets.len()` must be in `[1, MAX_BATCH_SIZE]`.
-    /// - Every bet amount must be in `(MIN_BET_AMOUNT, MAX_BET_AMOUNT]`.
-    /// - No duplicate `(market_id, outcome)` pairs may appear within the
-    ///   batch.
-    ///
-    /// Rejected batches do not consume the idempotency key and leave
-    /// storage unchanged.
+    /// - **Idempotency**: a `(caller, idempotency_key)` pair is claimed
+    ///   exactly once.  A second submission with the same pair returns
+    ///   [`Error::IdempotentBatchAlreadyApplied`] without mutating state.
+    /// - **All-or-nothing**: if any bet is invalid the entire invocation
+    ///   reverts, including the idempotency claim, so no partial batch
+    ///   is ever observable.
+    /// - **Concurrency**: Soroban serializes invocations within a ledger,
+    ///   so two racing submissions of the same key cannot both succeed.
     pub fn place_bets(
         env: Env,
         caller: Address,

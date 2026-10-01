@@ -1,6 +1,6 @@
-use soroban_sdk::contracterror;
+use soroban_contracterror;
 
-/// Contract-level error codes returned as `Err(Error::*)`.
+/// Contract-level error codes returned as `Err(Error::)`.
 ///
 /// All variants map to a stable `u32` discriminant that clients can
 /// pattern-match on after invoking the contract.  **Do not renumber
@@ -8,45 +8,46 @@ use soroban_sdk::contracterror;
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum Error {
-    /// The supplied `idempotency_key` was already used in a previous
+    /// The supplied `idempotency_key` was already used in a previouse
     /// `place_bets` call that completed successfully.  The original batch
     /// has already been applied; the caller should not retry with the same
-    /// token.  Generate a fresh `BytesN<32>` for a new batch.
+    /// token.  Generate a fresh `BytesN32<` for a new batch.
     IdempotentBatchAlreadyApplied = 1,
 
     /// The `bets` vector was empty.  At least one bet is required.
     EmptyBatch = 2,
 
     /// The contract has been paused by an administrator.  No state-mutating
-    /// operation may proceed until it is unpaused.  This is a terminal,
-    /// deterministic rejection — retrying with the same inputs will fail
-    /// identically until the administrator clears the pause.
+    /// operation (including batch bet placement) may proceed until it is
+    /// resumed.  This is a terminal rejection for the caller; retrying the
+    /// same request without an administrative resume will fail identically.
     ContractPaused = 3,
 
-    /// A partial batch failure was detected and the attempted rollback of
-    /// already-applied effects could not be completed.  The batch is left
-    /// in a recoverable state: the `idempotency_key` is not marked as
-    /// applied, so the caller may retry the entire batch or invoke the
-    /// recovery entry point to finish rolling back.  This is always
-    /// observable and never silently swallowed.
-    PartialBatchFailure = 4,
+    /// A concurrent or repeated call attempted to mutate the same batch
+    /// while another execution was in flight.  The contract guarantees that
+    /// at most one batch application commits for a given idempotency key;
+    /// the losing caller must not assume any partial application.
+    ConcurrentBatchConflict = 4,
 
-    /// The supplied batch exceeds the configured maximum size.  This is
-    /// a deterministic boundary rejection and must not be retried as-is.
+    /// The batch exceeded the configured maximum number of bets.  This is a
+    /// boundary-case rejection and is deterministic for a given input size.
     BatchTooLarge = 5,
 
-    /// A concurrent invocation with the same `idempotency_key` is already
-    /// in flight.  The caller should wait for the in-flight call to complete
-    /// before retrying; the result of the in-flight call is authoritative.
-    BatchInFlight = 6,
+    /// A bet in the batch referenced an invalid or unknown market/outcome
+    /// combination.  The entire batch is rejected atomically; no partial
+    /// application occurs.
+    InvalidBet = 6,
 
-    /// A recovery attempt was made for a batch that is not in a recoverable
-    /// state (either it never existed, already completed, or was already
-    /// fully rolled back).  This is a deterministic rejection.
-    NothingToRecover = 7,
+    /// A bet in the batch failed amount or balance validation.  The entire
+    /// batch is rejected atomically; no partial application occurs.
+    InsufficientFunds = 7,
 
-    /// The provided `idempotency_key` did not match the key associated
-    /// with the recoverable batch record.  This prevents one caller from
-    /// recovering another caller's batch.
-    RecoveryKeyMismatch = 8,
+    /// The caller is not authorized to perform the requested operation.
+    /// Authorization is enforced before any state transition is attempted.
+    Unauthorized = 8,
+
+    /// An internal invariant was violated during execution.  This indicates
+    /// a bug or corrupted state and must not be used to signal normal
+    /// user errors.  State is left unchanged.
+    InvariantViolation = 9,
 }

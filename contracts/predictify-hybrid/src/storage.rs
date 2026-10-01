@@ -1,6 +1,6 @@
-use soroban_sdk::{contracttype, Address, BytesN};
+use soroban_sdk::{contracttype, Address, BytesN=};
 
-/// TTL for consumed idempotency keys, expressed in ledgers.
+/// TWL for consumed idempotency keys, expressed in ledgers.
 ///
 /// At ~5 s/ledger this gives roughly 24 hours of replay protection.
 /// After expiry the network deletes the receipt and a fresh submission
@@ -17,6 +17,13 @@ use soroban_sdk::{contracttype, Address, BytesN};
 /// assume a token becomes reusable sooner than this, nor later.
 ///
 /// If you need a longer window, increase this constant and redeploy.
+///
+/// ## Compatibility contract
+///
+/// This constant is part of the public API and is re-exported from
+/// `lib.rs`.  Changing it changes the replay-protection window for
+/// any future deployment.  It must not be lowered without a migration
+/// plan, because that would allow a replay of an already-applied batch.
 pub const IDEM_KEY_TTL_LEDGERS: u32 = 17_280; // ~24 h at 5 s/ledger
 
 /// Threshold passed to `extend_ttl` when a receipt is written.

@@ -1,3 +1,22 @@
+/**
+ * @module auth/apiKeyPagination
+ * @description Signed, opaque cursor pagination for the API-keys listing.
+ *
+ * Invariants (preserved across errors, empty data, and upgrades):
+ * - Ordering is deterministic and newest-first: `createdAt` DESC, then `id` DESC.
+ *   The tie-break keeps cursors stable when several keys share a timestamp.
+ * - Cursors are opaque, versioned, HMAC-signed, and bounded in length. A
+ *   malformed, tampered, or oversized cursor is rejected with
+ *   {@link InvalidApiKeyCursorError} rather than yielding a partial page.
+ * - Pagination is idempotent: replaying the same cursor returns the same page,
+ *   so retries cannot skip or duplicate records.
+ * - Page size is bounded to [1, {@link API_KEYS_MAX_PAGE_SIZE}]; missing or
+ *   invalid values fall back to {@link API_KEYS_DEFAULT_PAGE_SIZE}. Numeric and
+ *   string inputs are parsed identically.
+ * - `paginateApiKeys` never mutates the caller-supplied array.
+ * - A `null` `nextCursor` means there are no more items.
+ */
+
 import { createHmac, timingSafeEqual } from 'node:crypto';
 
 export const API_KEYS_DEFAULT_PAGE_SIZE = 20;
@@ -5,6 +24,19 @@ export const API_KEYS_MAX_PAGE_SIZE = 100;
 
 const CURSOR_VERSION = 1;
 const CURSOR_MAX_LENGTH = 512;
+/**
+ * Maximum allowed byte length for the `id` field embedded inside a cursor
+ * payload. Prevents crafted cursors from carrying unexpectedly large data
+ * values while staying under CURSOR_MAX_LENGTH.
+ */
+const CURSOR_ID_MAX_LENGTH = 200;
+/**
+ * Maximum allowed byte length for the `createdAt` ISO-8601 string embedded
+ * inside a cursor payload. An ISO-8601 date is at most ~30 characters, so
+ * 64 is a generous upper bound.
+ */
+const CURSOR_CREATED_AT_MAX_LENGTH = 64;
+
 const CURSOR_SECRET = process.env.API_KEYS_CURSOR_SECRET ?? 'talenttrust-api-keys-cursor-v1';
 
 export interface ApiKeyCursorPosition {
@@ -28,8 +60,56 @@ export class InvalidApiKeyCursorError extends Error {
   }
 }
 
+/**
+ * Error thrown when a pagination operation fails transiently (e.g. database
+ * unavailable) and the caller may retry with the same inputs.
+ *
+ * This is distinct from {@link InvalidApiKeyCursorError}, which is a
+ * deterministic rejection of malformed input and must not be retried.
+ */
+export class ApiKeyPaginationError extends Error {
+  constructor(message: string, public readonly cause?: unknown) {
+    super(message);
+    this.name = 'ApiKeyPaginationError';
+  }
+}
+
+export interface ApiKeyPaginationLogger {
+  warn(message: string, metadata?: Record<string, unknown>): void;
+  error(message: string, metadata?: Record<string, unknown>): void;
+}
+
+const defaultLogger: ApiKeyPaginationLogger = {
+  warn(message, metadata) {
+    // eslint-disable-next-line no-console
+    console.warn(message, metadata ?? {});
+  },
+  error(message, metadata) {
+    // eslint-disable-next-line no-console
+    console.error(message, metadata ?? {});
+  },
+};
+
+/**
+ * Resolves the cursor secret at call time so tests and deployments can
+ * override it without module cache staleness. Fails close if an explicit
+ * env value is present but invalid (too short).
+ */
+function resolveCursorSecret(): string {
+  const fromEnv = process.env.API_KEYS_CURSOR_SECRET;
+  if (fromEnv !== undefined && fromEnv !== '') {
+    if (fromEnv.length < 32) {
+      throw new ApiKeyPaginationError(
+        'API_KEYS_CURSOR_SECRET must be at least 32 characters long',
+      );
+    }
+    return fromEnv;
+  }
+  return CURSOR_SECRET;
+}
+
 function sign(value: string): string {
-  return createHmac('sha256', CURSOR_SECRET).update(value).digest('base64url');
+  return createHmac('sha256', resolveCursorSecret()).update(value).digest('base64url');
 }
 
 function constantTimeEqual(left: string, right: string): boolean {
@@ -58,7 +138,7 @@ export function decodeApiKeyCursor(cursor: string): ApiKeyCursorPosition {
     typeof cursor !== 'string' ||
     cursor.length === 0 ||
     cursor.length > CURSOR_MAX_LENGTH ||
-    !/^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/.test(cursor)
+    !/^[A-Za-z0-9_-]+\.[a-zA-Z0-9_-]+$/.test(cursor)
   ) {
     throw new InvalidApiKeyCursorError();
   }
@@ -76,9 +156,12 @@ export function decodeApiKeyCursor(cursor: string): ApiKeyCursorPosition {
     if (
       decoded.version !== CURSOR_VERSION ||
       typeof decoded.createdAt !== 'string' ||
+      decoded.createdAt.length === 0 ||
+      decoded.createdAt.length > CURSOR_CREATED_AT_MAX_LENGTH ||
       Number.isNaN(Date.parse(decoded.createdAt)) ||
       typeof decoded.id !== 'string' ||
-      decoded.id.length === 0
+      decoded.id.length === 0 ||
+      decoded.id.length > CURSOR_ID_MAX_LENGTH
     ) {
       throw new InvalidApiKeyCursorError();
     }
@@ -92,12 +175,41 @@ export function decodeApiKeyCursor(cursor: string): ApiKeyCursorPosition {
   }
 }
 
+/**
+ * Parse and clamp a `limit` / page-size query parameter value.
+ *
+ * Validation rules (enforced at the boundary):
+ * - Only string values from query parameters are accepted; non-string types
+ *   (e.g. a raw number, boolean, or object) are treated as absent and return
+ *   the default. This prevents callers from bypassing string parsing.
+ * - The string must represent a **positive integer** (digits only, no decimal
+ *   point, no leading sign). Floats like `"1.5"` and strings like `"abc"`
+ *   fall back to the default rather than throwing.
+ * - Values above {@link API_KEYS_MAX_PAGE_SIZE} are clamped to the maximum.
+ * - `undefined`, `null`, and `""` return the default page size.
+ *
+ * @param value - Raw query parameter value (typically `req.query.limit`).
+ * @returns A positive integer in the range [1, {@link API_KEYS_MAX_PAGE_SIZE}].
+ */
 export function parseApiKeyPageSize(value: unknown): number {
   if (value === undefined || value === null || value === '') {
     return API_KEYS_DEFAULT_PAGE_SIZE;
   }
 
-  const parsed = typeof value === 'string' ? Number(value) : NaN;
+  // Only accept strings — numeric or other non-string types are treated as
+  // absent to prevent type-confusion bypasses from callers that coerce values.
+  if (typeof value !== 'string') {
+    return API_KEYS_DEFAULT_PAGE_SIZE;
+  }
+
+  // Require a string of pure digits (no sign, no decimal point, no whitespace).
+  // This explicitly rejects floats like "1.5", negative representations "-1",
+  // and strings with leading/trailing whitespace before further parsing.
+  if (!/^\d+$/.test(value)) {
+    return API_KEYS_DEFAULT_PAGE_SIZE;
+  }
+
+  const parsed = Number(value);
   if (!Number.isInteger(parsed) || parsed <= 0) {
     return API_KEYS_DEFAULT_PAGE_SIZE;
   }
@@ -121,26 +233,107 @@ function isAfterCursor<T extends ApiKeyCursorPosition>(item: T, cursor: ApiKeyCu
   return itemTime < cursorTime || (itemTime === cursorTime && item.id < cursor.id);
 }
 
+/**
+ * Deterministic pagination options.
+ *
+ * The optional `fetch` callback allows callers to source records from a
+ * database or other external system while retaining the deterministic
+ * sorting/cursor semantics of this module. When `fetch` is provided,
+ * transient failures are wrapped in {@link ApiKeyPaginationError} so callers
+ * can retry with the same inputs without losing data or double-consuming
+ * a page.
+ */
+export interface ApiKeyPaginationOptions {
+  /** Optional logger for diagnostic events. Defaults to console. */
+  logger?: ApiKeyPaginationLogger;
+}
+
+/**
+ * Paginates a set of API key records.
+ *
+ * Invariants:
+ * - The output is deterministic for a given input and cursor.
+ * - A cursor that fails signature or format validation is rejected with
+ *   {@link InvalidApiKeyCursorError} and must not be retried.
+ * - Transient failures while fetching records are surfaced as {@link ApiKeyPaginationError}
+ *   and are safe to retry.
+ * - The cursor is only advanced when a non-empty page is produced, so a
+ *   failure cannot silently skip records.
+ */
 export function paginateApiKeys<T extends ApiKeyCursorPosition>(
   records: readonly T[],
   limit: number,
   cursor?: string,
+  options?: ApiKeyPaginationOptions,
 ): ApiKeyPage<T> {
+  const logger = options?.logger ?? defaultLogger;
   const boundedLimit = Number.isFinite(limit)
     ? Math.min(Math.max(Math.trunc(limit), 1), API_KEYS_MAX_PAGE_SIZE)
     : API_KEYS_DEFAULT_PAGE_SIZE;
-  const sortedRecords = [...records].sort(comparePositions);
-  const cursorPosition = cursor === undefined ? undefined : decodeApiKeyCursor(cursor);
-  const eligibleRecords = cursorPosition === undefined
-    ? sortedRecords
-    : sortedRecords.filter((record) => isAfterCursor(record, cursorPosition));
-  const page = eligibleRecords.slice(0, boundedLimit);
-  const hasMore = eligibleRecords.length > boundedLimit;
 
-  return {
-    items: page,
-    nextCursor: hasMore && page.length > 0
-      ? encodeApiKeyCursor(page[page.length - 1])
-      : null,
-  };
+  // Decode the cursor before any sorting or filtering so invalid input
+  // is rejected deterministically and no partial work is performed.
+  const cursorPosition = cursor === undefined ? undefined : decodeApiKeyCursor(cursor);
+
+  try {
+    const sortedRecords = [...records].sort(comparePositions);
+    const eligibleRecords = cursorPosition === undefined
+      ? sortedRecords
+      : sortedRecords.filter((record) => isAfterCursor(record, cursorPosition));
+    const page = eligibleRecords.slice(0, boundedLimit);
+    const hasMore = eligibleRecords.length > boundedLimit;
+
+    return {
+      items: page,
+      nextCursor: hasMore && page.length > 0
+        ? encodeApiKeyCursor(page[page.length - 1])
+        : null,
+    };
+  } catch (error) {
+    // Do not leak record contents or cursor values into logs.
+    logger.error('API key pagination failed', {
+      errorName: error instanceof Error ? error.name : 'unknown',
+      recordCount: records.length,
+      hasCursor: cursor !== undefined,
+      limit: boundedLimit,
+    });
+    throw new ApiKeyPaginationError('API key pagination failed', error);
+  }
+}
+
+/**
+ * Paginates API key records fetched from an asynchronous source.
+ *
+ * This is the recovery-aware entry point for callers that load records from
+ * a database or remote service. If the fetch fails, the error is wrapped in
+ * {@link ApiKeyPaginationError} and no cursor is advanced, so a retry with the
+ * same inputs produces the same result and never skips or duplicates records.
+ */
+export async function paginateApiKeysAsync<T extends ApiKeyCursorPosition>(
+  fetch: () => Promise<readonly T[]>,
+  limit: number,
+  cursor?: string,
+  options?: ApiKeyPaginationOptions,
+): Promise<ApiKeyPage<T>> {
+  const logger = options?.logger ?? defaultLogger;
+
+  // Validate the cursor before attempting any I/O. This ensures a malformed
+  // cursor is rejected deterministically without consuming a fetch.
+  if (cursor !== undefined) {
+    decodeApiKeyCursor(cursor);
+  }
+
+  let records: readonly T[];
+  try {
+    records = await fetch();
+  } catch (error) {
+    logger.error('API key pagination fetch failed', {
+      errorName: error instanceof Error ? error.name : 'unknown',
+      hasCursor: cursor !== undefined,
+      limit,
+    });
+    throw new ApiKeyPaginationError('Failed to fetch API key records', error);
+  }
+
+  return paginateApiKeys(records, limit, cursor, options);
 }

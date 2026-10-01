@@ -44,40 +44,9 @@ export interface AuditServiceOptions {
   maxRetries?: number;
 }
 
-export const VALID_ACTIONS = new Set<AuditAction>(['CONTRACT_CREATED', 'CONTRACT_UPDATED', 'CONTRACT_CANCELLED', 'CONTRACT_COMPLETED', 'PAYMENT_INITIATED', 'PAYMENT_RELEASED', 'PAYMENT_DISPUTED', 'REPUTATION_UPDATED', 'REPUTATION_CORRECTED', 'USER_CREATED', 'USER_UPDATED', 'USER_DELETED', 'AUTH_LOGIN', 'AUTH_LOGOUT', 'AUTH_FAILED', 'AUTH_LOCKOUT_TRIGGERED', 'AUTH_LOCKOUT_RELEASED', 'ADMIN_ACTION', 'ENDPOINT_ACCESS', 'ENDPOINT_MUTATION']);
+export const VALID_ACTIONS = new Set<AuditAction>(AUDIT_ACTIONS);
 
-export const VALID_SEVERITIES: ReadonlySet<AuditSeverity> = new Set<AuditSeverity>(AUDIT_SEVERITIES);
-
-/**
- * Maximum accepted length for free-form string fields on an audit entry.
- * This is a defensive bound that prevents an attacker from bloating the
- * audit log with giant strings that would later break exports or downstream
- * consumers. The value is generous enough for real user/service identifiers
- * but not so large that it becomes a deni-of-service vector.
- */
-export const MAX_IDENTIFIER_LENGTH = 512;
-
-/**
- * Maximum accepted length for the correlation ID / IP address fields.
- */
-export const MAX_CONTEXT_LENGTH = 256;
-
-/**
- * Maximum number of keys allowed in a metadata object. This bounds the
- * size of a single audit entry and keeps the hash chain cheap to verify.
- */
-export const MAX_METADATA_KEYS = 64;
-
-/**
- * Maximum depth of a metadata object. Prevents cyclic/deeply-nested
- * payloads from causing unpredictable serialisation or stack overflow.
- */
-export const MAX_METADATA_DEPTH = 8;
-
-/**
- * Maximum number of elements allowed in a metadata array.
- */
-export const MAX_METADATA_ARRAY = 128;
+export const VALID_SEVERITIES = new Set<AuditSeverity>(AUDIT_SEVERITIES);
 
 export function parseOptionalIsoDate(
   value: string | undefined,

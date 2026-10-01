@@ -13,6 +13,7 @@
  */
 
 import {
+  AUDIT_ACTIONS,
   createAuditEntryBodySchema,
   buildAuditQuerySchema,
   auditEntryResponseSchema,
@@ -42,6 +43,14 @@ describe('createAuditEntryBodySchema', () => {
     expect(result.success).toBe(true);
     if (result.success) {
       expect(result.data.metadata).toEqual({ foo: 'bar' });
+    }
+  });
+
+  it('keeps action values unique and accepts every declared action for writes and queries', () => {
+    expect(new Set(AUDIT_ACTIONS).size).toBe(AUDIT_ACTIONS.length);
+    for (const action of AUDIT_ACTIONS) {
+      expect(createAuditEntryBodySchema.safeParse({ ...valid, action }).success).toBe(true);
+      expect(buildAuditQuerySchema({ maxLimit: 100 }).safeParse({ action }).success).toBe(true);
     }
   });
 

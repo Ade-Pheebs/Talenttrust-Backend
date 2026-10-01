@@ -31,19 +31,9 @@ export const DEFAULT_EXPORT_PAGE_SIZE = 100;
 /**
  * Every audited action, as a runtime value list.
  *
- * This is the single source of truth: {@link AuditAction} is *derived* from it
- * (see below), so the compile-time union and the runtime list are the same set
- * by construction and can never drift apart. Every validator in the module
- * consumes this one array:
- *   - `audit/inputValidation` (non-HTTP producers)
- *   - `audit/schemas` (the HTTP body/query contract)
- *   - `audit/service` (`VALID_ACTIONS`, the legacy query parser)
- *
- * Invariant: adding an entry here is the *only* way to add an action to the
- * system. Previously this array, the `AuditAction` union, and the two
- * hand-mirrored copies in `schemas.ts`/`service.ts` had already diverged, so
- * the same action could be accepted by one ingest path and rejected by
- * another.
+ * This is the single source of truth: {@link AuditAction} is derived from it,
+ * and request-body, query-filter and service validators consume this array so
+ * an action cannot be accepted by one path and rejected by another.
  */
 export const AUDIT_ACTIONS = [
   'CONTRACT_CREATED',
@@ -69,39 +59,13 @@ export const AUDIT_ACTIONS = [
   'ENDPOINT_MUTATION',
   'DEPLOYMENT_PROMOTED',
   'DEPLOYMENT_ROLLED_BACK',
-  'CONTRACT_DELETED',
   'MILESTONES_CREATED',
   'MILESTONES_UPDATED',
   'MILESTONES_DELETED',
 ] as const;
 
 /** Categories of sensitive state changes that must be audited. */
-export type AuditAction =
-  | 'CONTRACT_CREATED'
-  | 'CONTRACT_UPDATED'
-  | 'CONTRACT_CANCELLED'
-  | 'CONTRACT_COMPLETED'
-  | 'CONTRACT_DELETED'
-  | 'PAYMENT_INITIATED'
-  | 'PAYMENT_RELEASED'
-  | 'PAYMENT_DISPUTED'
-  | 'REPUTATION_UPDATED'
-  | 'REPUTATION_CORRECTED'
-  | 'USER_CREATED'
-  | 'USER_UPDATED'
-  | 'USER_DELETED'
-  | 'AUTH_LOGIN'
-  | 'AUTH_LOGOUT'
-  | 'AUTH_FAILED'
-  | 'AUTH_LOCKOUT_TRIGGERED'
-  | 'AUTH_LOCKOUT_RELEASED'
-  | 'ADMIN_ACTION' | 'ENDPOINT_ACCESS'
-  | 'ENDPOINT_MUTATION'
-  | 'DEPLOYMENT_PROMOTED'
-  | 'DEPLOYMENT_ROLLED_BACK'
-  | 'MILESTONES_CREATED'
-  | 'MILESTONES_UPDATED'
-  | 'MILESTONES_DELETED';
+export type AuditAction = (typeof AUDIT_ACTIONS)[number];
 
 export const AUDIT_SEVERITIES = ['INFO', 'WARNING', 'CRITICAL'] as const;
 
@@ -247,6 +211,55 @@ export interface CursorData {
   };
 }
 
+/** Maximum accepted encoded audit cursor size (8 KiB). */
+export const MAX_AUDIT_CURSOR_LENGTH = 8_192;
+
+const AUDIT_ACTION_SET: ReadonlySet<string> = new Set(AUDIT_ACTIONS);
+const AUDIT_SEVERITY_SET: ReadonlySet<string> = new Set(AUDIT_SEVERITIES);
+const CURSOR_FILTER_KEYS = new Set([
+  'action', 'severity', 'actor', 'resource', 'resourceId', 'from', 'to',
+]);
+
+function isCanonicalIsoTimestamp(value: unknown): value is string {
+  if (typeof value !== 'string') return false;
+  const milliseconds = Date.parse(value);
+  return Number.isFinite(milliseconds) && new Date(milliseconds).toISOString() === value;
+}
+
+/**
+ * Runtime guard for the cursor wire format. Cursors are untrusted query input;
+ * validating their complete shape here prevents malformed values from reaching
+ * repositories, where they could otherwise trigger silent pagination resets.
+ */
+function isCursorData(value: unknown): value is CursorData {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) return false;
+  const data = value as Record<string, unknown>;
+  if (Object.keys(data).some((key) => !['lastId', 'lastTimestamp', 'filters'].includes(key))) return false;
+  if (
+    typeof data['lastId'] !== 'string' || data['lastId'].length === 0 ||
+    typeof data['lastTimestamp'] !== 'string' || !isCanonicalIsoTimestamp(data['lastTimestamp']) ||
+    typeof data['filters'] !== 'object' || data['filters'] === null || Array.isArray(data['filters'])
+  ) {
+    return false;
+  }
+
+  const filters = data['filters'] as Record<string, unknown>;
+  if (Object.keys(filters).some((key) => !CURSOR_FILTER_KEYS.has(key))) return false;
+  for (const [key, filter] of Object.entries(filters)) {
+    if (filter === undefined) continue;
+    if (key === 'action') {
+      if (typeof filter !== 'string' || !AUDIT_ACTION_SET.has(filter)) return false;
+    } else if (key === 'severity') {
+      if (typeof filter !== 'string' || !AUDIT_SEVERITY_SET.has(filter)) return false;
+    } else if (key === 'from' || key === 'to') {
+      if (!isCanonicalIsoTimestamp(filter)) return false;
+    } else if (typeof filter !== 'string') {
+      return false;
+    }
+  }
+  return true;
+}
+
 /** Query filters for retrieving audit log entries. */
 export interface AuditQuery {
   action?: AuditAction;
@@ -306,42 +319,41 @@ export interface AuditQueryResult {
   lastSequence?: number;
 }
 
-// ---------------------------------------------------------------------------
-// Cursor codec
-//
-// Failure-recovery contract (issue #1383):
-//   `decodeCursor` is *total and deterministic*. For any input it either
-//   returns a fully validated `CursorData` or throws a `CursorFormatError`.
-//   It never returns `null`, a primitive, or a partially-populated object —
-//   previously `JSON.parse` of base64('null') / base64('{}') produced exactly
-//   those, so callers either crashed with a `TypeError` deep in the store or
-//   silently restarted pagination. Every rejection carries the same stable
-//   message and machine-readable `code`/`reason` and never echoes the raw
-//   cursor value (which may be client-controlled).
-// ---------------------------------------------------------------------------
-
-/** Returns true when `value` is a non-negative safe integer. */
-export function isValidSequence(value: unknown): value is number {
-  return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0;
+/** Encodes validated cursor data to an opaque, bounded base64 string. */
+export function encodeCursor(data: CursorData): string {
+  try {
+    const json = JSON.stringify(data);
+    if (typeof json !== 'string') throw new Error('Invalid cursor format');
+    // Validate the actual JSON representation, not just the input object: this
+    // also excludes values silently dropped by JSON.stringify (e.g. undefined).
+    if (!isCursorData(JSON.parse(json) as unknown)) throw new Error('Invalid cursor format');
+    const cursor = Buffer.from(json, 'utf-8').toString('base64');
+    if (cursor.length > MAX_AUDIT_CURSOR_LENGTH) throw new Error('Invalid cursor format');
+    return cursor;
+  } catch {
+    throw new Error('Invalid cursor format');
+  }
 }
 
-/** Decodes an opaque base64 cursor string to cursor data. */
+/** Decodes and validates an opaque base64 cursor string from an untrusted caller. */
 export function decodeCursor(cursor: string): CursorData {
   try {
-    const json = Buffer.from(cursor, 'base64').toString('utf-8');
-    const parsed = JSON.parse(json) as CursorData;
     if (
-      typeof parsed !== 'object' ||
-      parsed === null ||
-      typeof parsed.lastId !== 'string' ||
-      typeof parsed.lastTimestamp !== 'string' ||
-      !isValidSequence(parsed.lastSequence) ||
-      typeof parsed.filters !== 'object' ||
-      parsed.filters === null
+      typeof cursor !== 'string' || cursor.length === 0 ||
+      cursor.length > MAX_AUDIT_CURSOR_LENGTH ||
+      !/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(cursor)
     ) {
       throw new Error('Invalid cursor format');
     }
-    return parsed;
+    const json = Buffer.from(cursor, 'base64').toString('utf-8');
+    // Buffer's base64 decoder is permissive; round-trip equality enforces the
+    // canonical encoding emitted above and rejects ignored trailing garbage.
+    if (Buffer.from(json, 'utf-8').toString('base64') !== cursor) {
+      throw new Error('Invalid cursor format');
+    }
+    const data: unknown = JSON.parse(json);
+    if (!isCursorData(data)) throw new Error('Invalid cursor format');
+    return data;
   } catch {
     throw new Error('Invalid cursor format');
   }

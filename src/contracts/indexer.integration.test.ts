@@ -122,7 +122,7 @@ describe('ContractEventIndexer Integration (Replay & Cursor Pagination)', () => 
       expect(result.processedCount).toBe(0);
       expect(result.duplicateCount).toBe(0);
       expect(result.errors).toHaveLength(0);
-      expect(result.newCursor).toBeUndefined();
+      expect(result.newCursor).toBeNull();
     });
 
     it('handles all-duplicate batch correctly', async () => {

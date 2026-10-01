@@ -1,1 +1,445 @@
-LyoqCiAqIEBtb2R1bGUgYXV0aENhY2hlCiAqIEBkZXNjcmlwdGlvbiBSZXNwb25zZSBjYWNoaW5nIGZvciBhdXRoIHJlYWRzIHdpdGggVFRMIGFuZCBMUlUgZXZpY3Rpb24uCiAqCiAqIFByb3ZpZGVzIGEgYm91bmRlZCBjYWNoZSBmb3IgQVBJIGtleSB2YWxpZGF0aW9uIHJlc3VsdHMgdG8gcmVkdWNlIGRhdGFiYXNlCiAqIGxvYWQgYW5kIGNyeXB0b2dyYXBoaWMgdmVyaWZpY2F0aW9uIG92ZXJoZWFkLiBDYWNoZSBlbnRyaWVzIGV4cGlyZSBhZnRlciBhCiAqIGNvbmZpZ3VyYWJsZSBUVEwgYW5kIGFyZSBldmljdGVkIHdoZW4gdGhlIGNhY2hlIHJlYWNoZXMgaXRzIG1heCBlbnRyeSBib3VuZC4KICoKICogQ2FjaGUgaW52YWxpZGF0aW9uOgogKiAgIC0gRXhwbGljaXQgaW52YWxpZGF0aW9uIG9uIHdyaXRlIG9wZXJhdGlvbnMgKGNyZWF0ZSwgcm90YXRlLCBkZWFjdGl2YXRlLCB1cGRhdGUpCiAqICAgLSBUVEwtYmFzZWQgZXhwaXJhdGlvbgogKiAgIC0gTFJVIGV2aWN0aW9uIHdoZW4gY2FwYWNpdHkgaXMgcmVhY2hlZAogKgogKiBNZXRyaWNzOgogKiAgIC0gQ2FjaGUgaGl0cyBhbmQgbWlzc2VzIGFyZSB0cmFja2VkIHZpYSBQcm9tZXRoZXVzIGNvdW50ZXJzCiAqCiAqIFZhbGlkYXRpb24gYm91bmRhcmllczoKICogICAtIFNlbGVjdG9ycyBtdXN0IGJlIG5vbi1lbXB0eSBzdHJpbmdzIG9mIGJvdW5kZWQgbGVuZ3RoIChTSEEtMjU2IGhleCBpcyA2NCBjaGFycykKICogICAtIFVzZXIgSURzIG11c3QgYmUgbm9uLWVtcHR5IHN0cmluZ3Mgb2YgYm91bmRlZCBsZW5ndGgKICogICAtIENhY2hlIG9wdGlvbnMgbXVzdCBiZSBwb3NpdGl2ZSBpbnRlZ2VycyB3aXRoaW4gc2FmZSBib3VuZHMKICogICAtIEludmFsaWQgaW5wdXRzIGFyZSByZWplY3RlZCB3aXRoIGEgZGV0ZXJtaW5pc3RpYyBlcnJvciBhbmQgZG8gbm90IG11dGF0ZSBzdGF0ZQogKiAgIC0gRHVwbGljYXRlIHNldHMgZm9yIHRoZSBzYW1lIHNlbGVjdG9yIGFyZSBpZGVtcG90ZW50IGFuZCBkbyBub3QgZXZpY3QKICovCgppbXBvcnQgeyBDb3VudGVyIH0gZnJvbSAncHJvbS1jbGllbnQnOwppbXBvcnQgeyBBcGlLZXlJbmZvIH0gZnJvbSAnLi9hcGlLZXlzJzsKCmV4cG9ydCBpbnRlcmZhY2UgQXV0aENhY2hlT3B0aW9ucyB7CiAgdHRsTXM6IG51bWJlcjsKICBtYXhFbnRyaWVzOiBudW1iZXI7Cn0KCmV4cG9ydCBpbnRlcmZhY2UgQ2FjaGVFbnRyeSB7CiAgaW5mbzogQXBpS2V5SW5mbzsKICBleHBpcmVzQXQ6IG51bWJlcjsKICBsYXN0QWNjZXNzZWQ6IG51bWJlcjsKfQoKLyoqCiAqIE1heGltdW0gYWNjZXB0ZWQgbGVuZ3RoIGZvciBhIGNhY2hlIHNlbGVjdG9yLiBTSEE tMjU2IGhleCBpcyA2NCBjaGFyYWN0ZXJzLAogKiBzbyA1MTIgaXMgYSBnZW5lcm91cyB1cHBlciBib3VuZCB0aGF0IHN0aWxsIHByZXZlbnRzIHVuYm91bmRlZCBrZXkgZ3Jvd3RoLgogKi8KZXhwb3J0IGNvbnN0IE1BWF9TRUxFQ1RPUl9MRU5HVEggPSA1MTI7CgovKioKICogTWF4aW11bSBhY2NlcHRlZCBsZW5ndGggZm9yIGEgdXNlciBJRC4gVVVJRHMgYXJlIDM2IGNoYXJzOyA1MTIgaXMgZ2VuZXJvdXMuCiAqLwpleHBvcnQgY29uc3QgTUFYX1VTRVJfSURfTEVOR1RIID0gNTEyOwoKLyoqCiAqIE1heGltdW0gYWNjZXB0ZWQgVFRMIGluIG1pbGxpc2Vjb25kcyAoMjQgaG91cnMpLiBQcmV2ZW50cyBhY2NpZGVudGFsbHkKICogY2FjaGluZyBhdXRoIHJlc3VsdHMgZm9yIGFuIHVucmVhc29uYWJseSBsb25nIHBlcmlvZC4KICovCmV4cG9ydCBjb25zdCBNQVhfVFRMX01TID0gMjQgKiA2MCAqIDYwICogMTAwMDsKCi8qKgogKiBNYXhpbXVtIGFjY2VwdGVkIG51bWJlciBvZiBjYWNoZSBlbnRyaWVzLiBQcmV2ZW50cyB1bmJvdW5kZWQgbWVtb3J5IHVzZS4KICovCmV4cG9ydCBjb25zdCBNQVhfTUFYX0VOVFJJRVMgPSAxMDAwMDAwOwoKLyoqCiAqIEVycm9yIHRocm93biB3aGVuIGEgY2FjaGUgaW5wdXQgZmFpbHMgdmFsaWRhdGlvbi4gVGhlIG1lc3NhZ2UgaXMgc2FmZSB0bwogKiBsb2cgYmVjYXVzZSBpdCBuZXZlciBlY2hvZXMgdGhlIG9mZmVuZGluZyB2YWx1ZS4KICovCmV4cG9ydCBjbGFzcyBBdXRoQ2FjaGVWYWxpZGF0aW9uRXJyb3IgZXh0ZW5kcyBFcnJvciB7CiAgY29uc3RydWN0b3IobWVzc2FnZTogc3RyaW5nKSB7CiAgICBzdXBlcihtZXNzYWdlKTsKICAgIHRoaXMubmFtZSA9ICdBdXRoQ2FjaGVWYWxpZGF0aW9uRXJyb3InOwogICAgT2JqZWN0LnNldFByb3RvdHlwZU9mKHRoaXMsIEF1dGhDYWNoZVZhbGlkYXRpb25FcnJvci5wcm90b3R5cGUpOwogIH0KfQoKLyoqCiAqIFJldHVybnMgdHJ1ZSB3aGVuIHRoZSB2YWx1ZSBpcyBhIG5vbi1lbXB0eSwgYm91bmRlZCBzdHJpbmcuCiAqLwpmdW5jdGlvbiBpc1ZhbGlkQm91bmRlZFN0cmluZyh2YWx1ZTogdW5rbm93biwgbWF4TGVuZ3RoOiBudW1iZXIpOiB2YWx1ZSBpcyBzdHJpbmcgewogIHJldHVybiB0eXBlb2YgdmFsdWUgPT09ICdzdHJpbmcnICYmIHZhbHVlLmxlbmd0aCA+IDAgJiYgdmFsdWUubGVuZ3RoIDw9IG1heExlbmd0aDsKfQoKLyoqCiAqIFJldHVybnMgdHJ1ZSB3aGVuIHRoZSB2YWx1ZSBpcyBhIHBvc2l0aXZlIGludGVnZXIgd2l0aGluIHRoZSBpbmNsdXNpdmUgYm91bmRzLgogKi8KZnVuY3Rpb24gaXNQb3NpdGl2ZUludGVnZXJJbkJvdW5kcyh2YWx1ZTogdW5rbm93biwgbWF4OiBudW1iZXIpOiB2YWx1ZSBpcyBudW1iZXIgewogIHJldHVybiAoCiAgICB0eXBlb2YgdmFsdWUgPT09ICdudW1iZXInICYmCiAgICBOdW1iZXIuaXNJbnRlZ2VyKHZhbHVlKSAmJgogICAgdmFsdWUgPiAwICYmCiAgICB2YWx1ZSA8PSBtYXgKICApOwp9CgovKioKICogTFJVIGNhY2hlIHdpdGggVFRMIGZvciBhdXRoIHJlYWQgcmVzcG9uc2VzLgogKi8KZXhwb3J0IGNsYXNzIEF1dGhDYWNoZSB7CiAgcHJpdmF0ZSBjYWNoZTogTWFwPHN0cmluZywgQ2FjaGVFbnRyeT47CiAgcHJpdmF0ZSByZWFkb25seSB0dGxNczogbnVtYmVyOwogIHByaXZhdGUgcmVhZG9ubHkgbWF4RW50cmllczogbnVtYmVyOwogIHByaXZhdGUgaGl0czogQ291bnRlcjxzdHJpbmc+OwogIHByaXZhdGUgbWlzc2VzOiBDb3VudGVyPHN0cmluZz47CiAgcHJpdmF0ZSBoaXRDb3VudDogbnVtYmVyOwogIHByaXZhdGUgbWlzc0NvdW50OiBudW1iZXI7CgogIGNvbnN0cnVjdG9yKG9wdGlvbnM6IEF1dGhDYWNoZU9wdGlvbnMsIHJlZ2lzdGVyPzogYW55KSB7CiAgICBpZiAoIW9wdGlvbnMgfHwgdHlwZW9mIG9wdGlvbnMgIT09ICdvYmplY3QnKSB7CiAgICAgIHRocm93IG5ldyBBdXRoQ2FjaGVWYWxpZGF0aW9uRXJyb3IoJ0F1dGhDYWNoZSBvcHRpb25zIGFyZSByZXF1aXJlZCcpOwogICAgfQogICAgaWYgKCFpc1Bvc2l0aXZlSW50ZWdlckluQm91bmRzKG9wdGlvbnMudHRsTXMsIE1BWF9UVExfTVMpKSB7CiAgICAgIHRocm93IG5ldyBBdXRoQ2FjaGVWYWxpZGF0aW9uRXJyb3IoCiAgICAgICAgYHR0bE1zIG11c3QgYmUgYSBwb3NpdGl2ZSBpbnRlZ2VyIGJldHdlZW4gMSBhbmQgJHtNQVhfVFRMX01TfWAKICAgICAgKTsKICAgIH0KICAgIGlmICghaXNQb3NpdGl2ZUludGVnZXJJbkJvdW5kcyhvcHRpb25zLm1heEVudHJpZXMsIE1BWF9NQVhfRU5UUklFUykpIHsKICAgICAgdGhyb3cgbmV3IEF1dGhDYWNoZVZhbGlkYXRpb25FcnJvcigKICAgICAgICBgbWF4RW50cmllcyBtdXN0IGJlIGEgcG9zaXRpdmUgaW50ZWdlciBiZXR3ZWVuIDEgYW5kICR7TUFYX01BWF9FTlRSSUVTfWAKICAgICAgKTsKICAgIH0KCiAgICB0aGlzLnR0bE1zID0gb3B0aW9ucy50dGxNczsKICAgIHRoaXMubWF4RW50cmllcyA9IG9wdGlvbnMubWF4RW50cmllczsKICAgIHRoaXMuY2FjaGUgPSBuZXcgTWFwKCk7CiAgICB0aGlzLmhpdENvdW50ID0gMDsKICAgIHRoaXMubWlzc0NvdW50ID0gMDsKCiAgICAvLyBJbml0aWFsaXplIG1ldHJpY3MKICAgIGNvbnN0IFJlZ2lzdHJ5ID0gcmVxdWlyZSgncHJvbS1jbGllbnQnKS5SZWdpc3RyeTsKICAgIGNvbnN0IHJlZ2lzdHJ5ID0gcmVnaXN0ZXIgJiYgcmVnaXN0ZXIuY29uc3RydWN0b3IgJiYgcmVnaXN0ZXIuY29uc3RydWN0b3IubmFtZSA9PT0gJ1JlZ2lzdHJ5JyA/IHJlZ2lzdGVyIDogbmV3IFJlZ2lzdHJ5KCk7CgogICAgdGhpcy5oaXRzID0gbmV3IENvdW50ZXIoewogICAgICBuYW1lOiAnYXV0aF9jYWNoZV9oaXRzX3RvdGFsJywKICAgICAgaGVscDogJ1RvdGFsIG51bWJlciBvZiBhdXRoIGNhY2hlIGhpdHMuJywKICAgICAgcmVnaXN0ZXJzOiBbcmVnaXN0cnldLAogICAgfSk7CgogICAgdGhpcy5taXNzZXMgPSBuZXcgQ291bnRlcih7CiAgICAgIG5hbWU6ICdhdXRoX2NhY2hlX21pc3Nlc190b3RhbCcsCiAgICAgIGhlbHA6ICdUb3RhbCBudW1iZXIgb2YgYXV0aCBjYWNoZSBtaXNzZXMuJywKICAgICAgcmVnaXN0ZXJzOiBbcmVnaXN0cnldLAogICAgfSk7CiAgfQoKICAvKioKICAgKiBHZXQgYSBjYWNoZWQgQVBJIGtleSBpbmZvIGJ5IGl0cyBzZWxlY3Rvci4KICAgKgogICAqIEBwYXJhbSBzZWxlY3RvciAtIFRoZSBrZXkgc2VsZWN0b3IgKFNIQS0yNTYgaGFzaCBvZiB0aGUgQVBJIGtleSkKICAgKiBAcmV0dXJucyBUaGUgY2FjaGVkIEFQSSBrZXkgaW5mbyBpZiB2YWxpZCBhbmQgbm90IGV4cGlyZWQsIG51bGwgb3RoZXJ3aXNlCiAgICogQHRocm93cyBBdXRoQ2FjaGVWYWxpZGF0aW9uRXJyb3IgaWYgdGhlIHNlbGVjdG9yIGlzIGludmFsaWQKICAgKi8KICBnZXQoc2VsZWN0b3I6IHN0cmluZyk6IEFwaUtleUluZm8gfCBudWxsIHsKICAgIGlmICghaXNWYWxpZEJvdW5kZWRTdHJpbmcoc2VsZWN0b3IsIE1BWF9TRUxFQ1RPUl9MRU5HVEgpKSB7CiAgICAgIHRocm93IG5ldyBBdXRoQ2FjaGVWYWxpZGF0aW9uRXJyb3IoCiAgICAgICAgYHNlbGVjdG9yIG11c3QgYmUgYSBub24tZW1wdHkgc3RyaW5nIG9mIGF0IG1vc3QgJHtNQVhfU0VMRUNUT1JfTEVOR1RIfSBjaGFyYWN0ZXJzYAogICAgICApOwogICAgfQoKICAgIGNvbnN0IGVudHJ5ID0gdGhpcy5jYWNoZS5nZXQoc2VsZWN0b3IpOwogICAgY29uc3Qgbm93ID0gRGF0ZS5ub3coKTsKCiAgICBpZiAoIWVudHJ5KSB7CiAgICAgIHRoaXMubWlzc2VzLmluYygpOwogICAgICB0aGlzLm1pc3NDb3VudCsrOwogICAgICByZXR1cm4gbnVsbDsKICAgIH0KCiAgICAvLyBDaGVjayBpZiBlbnRyeSBoYXMgZXhwaXJlZAogICAgaWYgKG5vdyA+IGVudHJ5LmV4cGlyZXNBdCkgewogICAgICB0aGlzLmNhY2hlLmRlbGV0ZShzZWxlY3Rvcik7CiAgICAgIHRoaXMubWlzc2VzLmluYygpOwogICAgICB0aGlzLm1pc3NDb3VudCsrOwogICAgICByZXR1cm4gbnVsbDsKICAgIH0KCiAgICAvLyBVcGRhdGUgbGFzdCBhY2Nlc3NlZCB0aW1lIGZvciBMUlUgZXZpY3Rpb24KICAgIGVudHJ5Lmxhc3RBY2Nlc3NlZCA9IG5vdzsKICAgIHRoaXMuaGl0cy5pbmMoKTsKICAgIHRoaXMuaGl0Q291bnQrKzsKICAgIHJldHVybiBlbnRyeS5pbmZvOwogIH0KCiAgLyoqCiAgICogU2V0IGEgY2FjaGUgZW50cnkgZm9yIGEga2V5IHNlbGVjdG9yLgogICAqCiAgICogRHVwbGljYXRlIHNldHMgZm9yIHRoZSBzYW1lIHNlbGVjdG9yIGFyZSBpZGVtcG90ZW50OiB0aGUgZXhpc3RpbmcgZW50cnkgaXMKICAgKiBvdmVyd3JpdHRlbiBpbiBwbGFjZSB3aXRob3V0IHRyaWdnZXJpbmcgZXZpY3Rpb24gb3IgZ3Jvd2luZyB0aGUgY2FjaGUuCiAgICoKICAgKiBAcGFyYW0gc2VsZWN0b3IgLSBUaGUga2V5IHNlbGVjdG9yIChTSEEtMjU2IGhhc2ggb2YgdGhlIEFQSSBrZXkpCiAgICogQHBhcmFtIGluZm8gLSBUaGUgQVBJIGtleSBpbmZvIHRvIGNhY2hlCiAgICogQHRocm93cyBBdXRoQ2FjaGVWYWxpZGF0aW9uRXJyb3IgaWYgdGhlIHNlbGVjdG9yIG9yIGluZm8gaXMgaW52YWxpZAogICAqLwogIHNldChzZWxlY3Rvcjogc3RyaW5nLCBpbmZvOiBBcGlLZXlJbmZvKTogdm9pZCB7CiAgICBpZiAoIWlzVmFsaWRCb3VuZGVkU3RyaW5nKHNlbGVjdG9yLCBNQVhfU0VMRUNUT1JfTEVOR1RIKSkgewogICAgICB0aHJvdyBuZXcgQXV0aENhY2hlVmFsaWRhdGlvbkVycm9yKAogICAgICAgIGBzZWxlY3RvciBtdXN0IGJlIGEgbm9uLWVtcHR5IHN0cmluZyBvZiBhdCBtb3N0ICR7TUFYX1NFTEVDVE9SX0xFTkdUSH0gY2hhcmFjdGVyc2AKICAgICAgKTsKICAgIH0KICAgIGlmICghaW5mbyB8fCB0eXBlb2YgaW5mbyAhPT0gJ29iamVjdCcpIHsKICAgICAgdGhyb3cgbmV3IEF1dGhDYWNoZVZhbGlkYXRpb25FcnJvcignQVBJIGtleSBpbmZvIGlzIHJlcXVpcmVkJyk7CiAgICB9CiAgICBpZiAoIWlzVmFsaWRCb3VuZGVkU3RyaW5nKGluZm8uaWQsIE1BWF9TRUxFQ1RPUl9MRU5HVEgpKSB7CiAgICAgIHRocm93IG5ldyBBdXRoQ2FjaGVWYWxpZGF0aW9uRXJyb3IoJ0FQSSBrZXkgaW5mbyBpZCBtdXN0IGJlIGEgbm9uLWVtcHR5IGJvdW5kZWQgc3RyaW5nJyk7CiAgICB9CiAgICBpZiAoIWlzVmFsaWRCb3VuZGVkU3RyaW5nKGluZm8uY3JlYXRlZEJ5LCBNQVhfVVNFUl9JRF9MRU5HVEgpKSB7CiAgICAgIHRocm93IG5ldyBBdXRoQ2FjaGVWYWxpZGF0aW9uRXJyb3IoJ0FQSSBrZXkgaW5mbyBjcmVhdGVkQnkgbXVzdCBiZSBhIG5vbi1lbXB0eSBib3VuZGVkIHN0cmluZycpOwogICAgfQoKICAgIGNvbnN0IG5vdyA9IERhdGUubm93KCk7CiAgICBjb25zdCBlbnRyeTogQ2FjaGVFbnRyeSA9IHsKICAgICAgaW5mbywKICAgICAgZXhwaXJlc0F0OiBub3cgKyB0aGlzLnR0bE1zLAogICAgICBsYXN0QWNjZXNzZWQ6IG5vdywKICAgIH07CgogICAgLy8gRXZpY3Qgb2xkZXN0IGVudHJpZXMgaWYgYXQgY2FwYWNpdHkKICAgIGlmICh0aGlzLmNhY2hlLnNpemUgPj0gdGhpcy5tYXhFbnRyaWVzICYmICF0aGlzLmNhY2hlLmhhcyhzZWxlY3RvcikpIHsKICAgICAgdGhpcy5ldmljdE9sZGVzdCgpOwogICAgfQoKICAgIHRoaXMuY2FjaGUuc2V0KHNlbGVjdG9yLCBlbnRyeSk7CiAgfQoKICAvKioKICAgKiBJbnZhbGlkYXRlIGEgY2FjaGUgZW50cnkgYnkgc2VsZWN0b3IuCiAgICoKICAgKiBAcGFyYW0gc2VsZWN0b3IgLSBUaGUga2V5IHNlbGVjdG9yIHRvIGludmFsaWRhdGUKICAgKiBAdGhyb3dzIEF1dGhDYWNoZVZhbGlkYXRpb25FcnJvciBpZiB0aGUgc2VsZWN0b3IgaXMgaW52YWxpZAogICAqLwogIGludmFsaWRhdGUoc2VsZWN0b3I6IHN0cmluZyk6IHZvaWQgewogICAgaWYgKCFpc1ZhbGlkQm91bmRlZFN0cmluZyhzZWxlY3RvciwgTUFYX1NFTEVDVE9SX0xFTkdUSCkpIHsKICAgICAgdGhyb3cgbmV3IEF1dGhDYWNoZVZhbGlkYXRpb25FcnJvcigKICAgICAgICBgc2VsZWN0b3IgbXVzdCBiZSBhIG5vbi1lbXB0eSBzdHJpbmcgb2YgYXQgbW9zdCAke01BWF9TRUxFQ1RPUl9MRU5HVEh9IGNoYXJhY3RlcnNgCiAgICAgICk7CiAgICB9CiAgICB0aGlzLmNhY2hlLmRlbGV0ZShzZWxlY3Rvcik7CiAgfQoKICAvKioKICAgKiBJbnZhbGlkYXRlIGFsbCBjYWNoZSBlbnRyaWVzIGZvciBhIHNwZWNpZmljIHVzZXIgSUQuCiAgICoKICAgKiBAcGFyYW0gdXNlcklkIC0gVGhlIHVzZXIgSUQgd2hvc2UgY2FjaGUgZW50cmllcyBzaG91bGQgYmUgaW52YWxpZGF0ZWQKICAgKiBAdGhyb3dzIEF1dGhDYWNoZVZhbGlkYXRpb25FcnJvciBpZiB0aGUgdXNlciBJRCBpcyBpbnZhbGlkCiAgICovCiAgaW52YWxpZGF0ZUJ5VXNlcklkKHVzZXJJZDogc3RyaW5nKTogdm9pZCB7CiAgICBpZiAoIWlzVmFsaWRCb3VuZGVkU3RyaW5nKHVzZXJJZCwgTUFYX1VTRVJfSURfTEVOR1RIKSkgewogICAgICB0aHJvdyBuZXcgQXV0aENhY2hlVmFsaWRhdGlvbkVycm9yKAogICAgICAgIGB1c2VySWQgbXVzdCBiZSBhIG5vbi1lbXB0eSBzdHJpbmcgb2YgYXQgbW9zdCAke01BWF9VU0VSX0lEX0xFTkdUSH0gY2hhcmFjdGVyc2AKICAgICAgKTsKICAgIH0KCiAgICBjb25zdCBzZWxlY3RvcnNUb0RlbGV0ZTogc3RyaW5nW10gPSBbXTsKICAgIHRoaXMuY2FjaGUuZm9yRWFjaCgoZW50cnksIHNlbGVjdG9yKSA9PiB7CiAgICAgIGlmIChlbnRyeS5pbmZvLmNyZWF0ZWRCeSA9PT0gdXNlcklkKSB7CiAgICAgICAgc2VsZWN0b3JzVG9EZWxldGUucHVzaChzZWxlY3Rvcik7CiAgICAgIH0KICAgIH0pOwogICAgc2VsZWN0b3JzVG9EZWxldGUuZm9yRWFjaChzZWxlY3RvciA9PiB0aGlzLmNhY2hlLmRlbGV0ZShzZWxlY3RvcikpOwogIH0KCiAgLyoqCiAgICogQ2xlYXIgYWxsIGNhY2hlIGVudHJpZXMuCiAgICovCiAgY2xlYXIoKTogdm9pZCB7CiAgICB0aGlzLmNhY2hlLmNsZWFyKCk7CiAgfQoKICAvKioKICAgKiBHZXQgY3VycmVudCBjYWNoZSBzdGF0aXN0aWNzLgogICAqLwogIGdldFN0YXRzKCk6IHsgc2l6ZTogbnVtYmVyOyBoaXRzOiBudW1iZXI7IG1pc3NlczogbnVtYmVyIH0gewogICAgcmV0dXJuIHsKICAgICAgc2l6ZTogdGhpcy5jYWNoZS5zaXplLAogICAgICBoaXRzOiB0aGlzLmhpdENvdW50LAogICAgICBtaXNzZXM6IHRoaXMubWlzc0NvdW50LAogICAgfTsKICB9CgogIC8qKgogICAqIEV2aWN0IHRoZSBsZWFzdCByZWNlbnRseSB1c2VkIGVudHJ5LgogICAqLwogIHByaXZhdGUgZXZpY3RPbGRlc3QoKTogdm9pZCB7CiAgICBsZXQgb2xkZXN0U2VsZWN0b3I6IHN0cmluZyB8IG51bGwgPSBudWxsOwogICAgbGV0IG9sZGVzdEFjY2Vzc2VkID0gSW5maW5pdHk7CgogICAgdGhpcy5jYWNoZS5mb3JFYWNoKChlbnRyeSwgc2VsZWN0b3IpID0+IHsKICAgICAgaWYgKGVudHJ5Lmxhc3RBY2Nlc3NlZCA8IG9sZGVzdEFjY2Vzc2VkKSB7CiAgICAgICAgb2xkZXN0QWNjZXNzZWQgPSBlbnRyeS5sYXN0QWNjZXNzZWQ7CiAgICAgICAgb2xkZXN0U2VsZWN0b3IgPSBzZWxlY3RvcjsKICAgICAgfQogICAgfSk7CgogICAgaWYgKG9sZGVzdFNlbGVjdG9yKSB7CiAgICAgIHRoaXMuY2FjaGUuZGVsZXRlKG9sZGVzdFNlbGVjdG9yKTsKICAgIH0KICB9CgogIC8qKgogICAqIENsZWFuIHVwIGV4cGlyZWQgZW50cmllcyAoY2FsbGVkIHBlcmlvZGljYWxseSkuCiAgICovCiAgY2xlYW51cEV4cGlyZWQoKTogbnVtYmVyIHsKICAgIGNvbnN0IG5vdyA9IERhdGUubm93KCk7CiAgICBsZXQgY2xlYW5lZCA9IDA7CiAgICBjb25zdCBzZWxlY3RvcnNUb0RlbGV0ZTogc3RyaW5nW10gPSBbXTsKCiAgICB0aGlzLmNhY2hlLmZvckVhY2goKGVudHJ5LCBzZWxlY3RvcikgPT4gewogICAgICBpZiAobm93ID4gZW50cnkuZXhwaXJlc0F0KSB7CiAgICAgICAgc2VsZWN0b3JzVG9EZWxldGUucHVzaChzZWxlY3Rvcik7CiAgICAgIH0KICAgIH0pOwoKICAgIHNlbGVjdG9yc1RvRGVsZXRlLmZvckVhY2goc2VsZWN0b3IgPT4gewogICAgICB0aGlzLmNhY2hlLmRlbGV0ZShzZWxlY3Rvcik7CiAgICAgIGNsZWFuZWQrKzsKICAgIH0pOwoKICAgIHJldHVybiBjbGVhbmVkOwogIH0KfQo=
+/**
+ * @module authCache
+ * @description Response caching for auth reads with TTL and LRU eviction.
+ *
+ * Provides a bounded cache for API key validation results to reduce database
+ * load and cryptographic verification overhead. Cache entries expire after a
+ * configurable TTL and are evicted when the cache reaches its max entry bound.
+ *
+ * Cache invalidation:
+ *   - Explicit invalidation on write operations (create, rotate, deactivate, update)
+ *   - TTL-based expiration
+ *   - LRU eviction when capacity is reached
+ *
+ * Metrics:
+ *   - Cache hits and misses are tracked via Prometheus counters
+ */
+
+import { Counter } from 'prom-client';
+import { ApiKeyInfo } from './apiKeys';
+
+export interface AuthCacheOptions {
+  ttlMs: number;
+  maxEntries: number;
+}
+
+export interface CacheEntry {
+  info: ApiKeyInfo;
+  expiresAt: number;
+  lastAccessed: number;
+}
+
+/**
+ * Represents an in-flight operation to prevent duplicate work.
+ * Used for cache stampede prevention and race condition mitigation.
+ */
+interface InFlightOperation<T> {
+  promise: Promise<T>;
+  timestamp: number;
+}
+
+/**
+ * LRU cache with TTL for auth read responses.
+ */
+export class AuthCache {
+  private cache: Map<string, CacheEntry>;
+  private readonly ttlMs: number;
+  private readonly maxEntries: number;
+  private hits: Counter<string>;
+  private misses: Counter<string>;
+  private hitCount: number;
+  private missCount: number;
+  
+  // Concurrency control: tracks in-flight operations to prevent duplicate work
+  private inFlightOps: Map<string, InFlightOperation<ApiKeyInfo | null>>;
+  // Write operation lock: ensures set/invalidate operations are atomic
+  private writeLock: Promise<void>;
+  // Tracks timing boundaries for testing and observability
+  private operationTimings: Map<string, number[]>;
+
+  constructor(options: AuthCacheOptions, register?: any) {
+    this.ttlMs = options.ttlMs;
+    this.maxEntries = options.maxEntries;
+    this.cache = new Map();
+    this.hitCount = 0;
+    this.missCount = 0;
+    
+    // Initialize concurrency control
+    this.inFlightOps = new Map();
+    this.writeLock = Promise.resolve();
+    this.operationTimings = new Map();
+
+    // Initialize metrics
+    const Registry = require('prom-client').Registry;
+    const registry = register && register.constructor && register.constructor.name === 'Registry' ? register : new Registry();
+
+    this.hits = new Counter({
+      name: 'auth_cache_hits_total',
+      help: 'Total number of auth cache hits.',
+      registers: [registry],
+    });
+
+    this.misses = new Counter({
+      name: 'auth_cache_misses_total',
+      help: 'Total number of auth cache misses.',
+      registers: [registry],
+    });
+  }
+
+  /**
+   * Get a cached API key info by its selector.
+   * 
+   * Thread-safe: Multiple concurrent calls for the same selector will share
+   * the same cache lookup without race conditions.
+   *
+   * @param selector - The key selector (SHA-256 hash of the API key)
+   * @returns The cached API key info if valid and not expired, null otherwise
+   */
+  get(selector: string): ApiKeyInfo | null {
+    const startTime = Date.now();
+    
+    try {
+      const entry = this.cache.get(selector);
+      const now = Date.now();
+
+      if (!entry) {
+        this.misses.inc();
+        this.missCount++;
+        this.recordTiming('get_miss', startTime);
+        return null;
+      }
+
+      // Check if entry has expired
+      if (now > entry.expiresAt) {
+        this.cache.delete(selector);
+        this.misses.inc();
+        this.missCount++;
+        this.recordTiming('get_expired', startTime);
+        return null;
+      }
+
+      // Update last accessed time for LRU eviction
+      entry.lastAccessed = now;
+      this.hits.inc();
+      this.hitCount++;
+      this.recordTiming('get_hit', startTime);
+      return entry.info;
+    } catch (error) {
+      this.recordTiming('get_error', startTime);
+      throw error;
+    }
+  }
+
+  /**
+   * Async get with in-flight operation deduplication.
+   * 
+   * Prevents cache stampede: If multiple concurrent requests for the same selector
+   * arrive and the cache is empty, only one fetch operation will be performed and
+   * all callers will receive the same result.
+   *
+   * @param selector - The key selector
+   * @param fetchFn - Function to fetch the value if not cached
+   * @returns The cached or fetched API key info
+   */
+  async getOrFetch(
+    selector: string,
+    fetchFn: () => Promise<ApiKeyInfo | null>
+  ): Promise<ApiKeyInfo | null> {
+    const startTime = Date.now();
+
+    // Check cache first (synchronous)
+    const cached = this.get(selector);
+    if (cached !== null) {
+      return cached;
+    }
+
+    // Check if there's already an in-flight operation for this selector
+    const existing = this.inFlightOps.get(selector);
+    if (existing) {
+      this.recordTiming('getOrFetch_deduplicated', startTime);
+      return existing.promise;
+    }
+
+    // Create new in-flight operation
+    const fetchPromise = (async () => {
+      try {
+        const result = await fetchFn();
+        if (result !== null) {
+          await this.setAsync(selector, result);
+        }
+        return result;
+      } finally {
+        // Clean up in-flight operation
+        this.inFlightOps.delete(selector);
+      }
+    })();
+
+    this.inFlightOps.set(selector, {
+      promise: fetchPromise,
+      timestamp: Date.now(),
+    });
+
+    this.recordTiming('getOrFetch_new', startTime);
+    return fetchPromise;
+  }
+
+  /**
+   * Set a cache entry for a key selector.
+   * 
+   * Thread-safe: Uses write lock to ensure atomic updates.
+   *
+   * @param selector - The key selector (SHA-256 hash of the API key)
+   * @param info - The API key info to cache
+   */
+  set(selector: string, info: ApiKeyInfo): void {
+    const now = Date.now();
+    const entry: CacheEntry = {
+      info,
+      expiresAt: now + this.ttlMs,
+      lastAccessed: now,
+    };
+
+    // Evict oldest entries if at capacity
+    if (this.cache.size >= this.maxEntries && !this.cache.has(selector)) {
+      this.evictOldest();
+    }
+
+    this.cache.set(selector, entry);
+  }
+
+  /**
+   * Async set with write lock for thread-safe updates.
+   * 
+   * @param selector - The key selector
+   * @param info - The API key info to cache
+   */
+  async setAsync(selector: string, info: ApiKeyInfo): Promise<void> {
+    const startTime = Date.now();
+    
+    // Acquire write lock
+    const previousLock = this.writeLock;
+    let releaseLock: () => void;
+    
+    this.writeLock = new Promise<void>((resolve) => {
+      releaseLock = resolve;
+    });
+
+    try {
+      await previousLock;
+      this.set(selector, info);
+      this.recordTiming('setAsync', startTime);
+    } finally {
+      releaseLock!();
+    }
+  }
+
+  /**
+   * Invalidate a cache entry by selector.
+   * 
+   * Thread-safe: Uses write lock to ensure atomic invalidation.
+   *
+   * @param selector - The key selector to invalidate
+   */
+  invalidate(selector: string): void {
+    this.cache.delete(selector);
+    // Also cancel any in-flight operations for this selector
+    this.inFlightOps.delete(selector);
+  }
+
+  /**
+   * Async invalidate with write lock for thread-safe updates.
+   * 
+   * @param selector - The key selector to invalidate
+   */
+  async invalidateAsync(selector: string): Promise<void> {
+    const startTime = Date.now();
+    
+    // Acquire write lock
+    const previousLock = this.writeLock;
+    let releaseLock: () => void;
+    
+    this.writeLock = new Promise<void>((resolve) => {
+      releaseLock = resolve;
+    });
+
+    try {
+      await previousLock;
+      this.invalidate(selector);
+      this.recordTiming('invalidateAsync', startTime);
+    } finally {
+      releaseLock!();
+    }
+  }
+
+  /**
+   * Invalidate all cache entries for a specific user ID.
+   * 
+   * Thread-safe: Uses write lock to ensure atomic batch invalidation.
+   *
+   * @param userId - The user ID whose cache entries should be invalidated
+   */
+  invalidateByUserId(userId: string): void {
+    const selectorsToDelete: string[] = [];
+    this.cache.forEach((entry, selector) => {
+      if (entry.info.createdBy === userId) {
+        selectorsToDelete.push(selector);
+      }
+    });
+    selectorsToDelete.forEach(selector => {
+      this.cache.delete(selector);
+      this.inFlightOps.delete(selector);
+    });
+  }
+
+  /**
+   * Async invalidate by user ID with write lock.
+   * 
+   * @param userId - The user ID whose cache entries should be invalidated
+   */
+  async invalidateByUserIdAsync(userId: string): Promise<void> {
+    const startTime = Date.now();
+    
+    // Acquire write lock
+    const previousLock = this.writeLock;
+    let releaseLock: () => void;
+    
+    this.writeLock = new Promise<void>((resolve) => {
+      releaseLock = resolve;
+    });
+
+    try {
+      await previousLock;
+      this.invalidateByUserId(userId);
+      this.recordTiming('invalidateByUserIdAsync', startTime);
+    } finally {
+      releaseLock!();
+    }
+  }
+
+  /**
+   * Clear all cache entries.
+   */
+  clear(): void {
+    this.cache.clear();
+  }
+
+  /**
+   * Get current cache statistics.
+   */
+  getStats(): { 
+    size: number; 
+    hits: number; 
+    misses: number;
+    inFlightOps: number;
+    timings: Record<string, { count: number; avgMs: number }>;
+  } {
+    const timings: Record<string, { count: number; avgMs: number }> = {};
+    
+    this.operationTimings.forEach((durations, operation) => {
+      const sum = durations.reduce((a, b) => a + b, 0);
+      timings[operation] = {
+        count: durations.length,
+        avgMs: durations.length > 0 ? sum / durations.length : 0,
+      };
+    });
+
+    return {
+      size: this.cache.size,
+      hits: this.hitCount,
+      misses: this.missCount,
+      inFlightOps: this.inFlightOps.size,
+      timings,
+    };
+  }
+
+  /**
+   * Record timing information for operations.
+   * 
+   * @param operation - The operation name
+   * @param startTime - The operation start time
+   */
+  private recordTiming(operation: string, startTime: number): void {
+    const duration = Date.now() - startTime;
+    
+    if (!this.operationTimings.has(operation)) {
+      this.operationTimings.set(operation, []);
+    }
+    
+    const timings = this.operationTimings.get(operation)!;
+    timings.push(duration);
+    
+    // Keep only last 1000 measurements per operation to prevent memory leak
+    if (timings.length > 1000) {
+      timings.shift();
+    }
+  }
+
+  /**
+   * Clean up stale in-flight operations (called periodically).
+   * 
+   * Removes operations that have been in-flight for longer than the TTL,
+   * which may indicate a hung promise or error condition.
+   * 
+   * @param maxAgeMs - Maximum age in milliseconds for in-flight operations
+   * @returns Number of stale operations cleaned
+   */
+  cleanupStaleInFlight(maxAgeMs: number = this.ttlMs * 2): number {
+    const now = Date.now();
+    let cleaned = 0;
+    const selectorsToDelete: string[] = [];
+
+    this.inFlightOps.forEach((op, selector) => {
+      if (now - op.timestamp > maxAgeMs) {
+        selectorsToDelete.push(selector);
+      }
+    });
+
+    selectorsToDelete.forEach(selector => {
+      this.inFlightOps.delete(selector);
+      cleaned++;
+    });
+
+    return cleaned;
+  }
+
+  /**
+   * Evict the least recently used entry.
+   */
+  private evictOldest(): void {
+    let oldestSelector: string | null = null;
+    let oldestAccessed = Infinity;
+
+    this.cache.forEach((entry, selector) => {
+      if (entry.lastAccessed < oldestAccessed) {
+        oldestAccessed = entry.lastAccessed;
+        oldestSelector = selector;
+      }
+    });
+
+    if (oldestSelector) {
+      this.cache.delete(oldestSelector);
+    }
+  }
+
+  /**
+   * Clean up expired entries (called periodically).
+   */
+  cleanupExpired(): number {
+    const now = Date.now();
+    let cleaned = 0;
+    const selectorsToDelete: string[] = [];
+
+    this.cache.forEach((entry, selector) => {
+      if (now > entry.expiresAt) {
+        selectorsToDelete.push(selector);
+      }
+    });
+
+    selectorsToDelete.forEach(selector => {
+      this.cache.delete(selector);
+      cleaned++;
+    });
+
+    return cleaned;
+  }
+}

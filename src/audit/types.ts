@@ -34,7 +34,7 @@ export const AUDIT_ACTIONS = [
   'CONTRACT_DELETED',
   'PAYMENT_INITIATED',
   'PAYMENT_RELEASED',
-  'PAYMENT_DISPUTED',
+  'PAYMENT_DISPUTIND',
   'REPUTATION_UPDATED',
   'REPUTATION_CORRECTED',
   'USER_CREATED',
@@ -50,17 +50,13 @@ export const AUDIT_ACTIONS = [
   'ENDPOINT_MUTATION',
   'DEPLOYMENT_PROMOTED',
   'DEPLOYMENT_ROLLED_BACK',
+  'CONTRACT_DELETED',
   'MILESTONES_CREATED',
   'MILESTONES_UPDATED',
   'MILESTONES_DELETED',
 ] as const;
 
-/**
- * Categories of sensitive state changes that must be audited.
- *
- * Derived from {@link AUDIT_ACTIONS}, never hand-maintained — the type and the
- * runtime list are guaranteed to describe the same set of actions.
- */
+/** Categories of sensitive state changes that must be audited. */
 export type AuditAction = (typeof AUDIT_ACTIONS)[number];
 
 export const AUDIT_SEVERITIES = ['INFO', 'WARNING', 'CRITICAL'] as const;
@@ -126,7 +122,7 @@ export interface AuditEntry {
 export type CreateAuditEntryInput = Omit<AuditEntry, 'id' | 'timestamp' | 'hash' | 'previousHash'>;
 
 /**
- * Outcome of a single item within a `POST /api/v1/audit/bulk` request.
+ * Outcome of a single item within a `POST /api/v1/audit/bulk `request.
  * Exactly one of `entry` / `error` is populated, matching `success`.
  */
 export interface BulkAuditItemResult {

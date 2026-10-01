@@ -7,6 +7,13 @@ use soroban_sdk::{contracttype, Address, BytesN, Env};
 /// and a fresh submission with the same token is treated as a new batch.
 ///
 /// If you need a longer window, increase this constant and redeploy.
+///
+/// ## Compatibility contract
+///
+/// This constant is part of the public API and is re-exported from
+/// `lib.rs`.  Changing it changes the replay-protection window for
+/// any future deployment.  It must not be lowered without a migration
+/// plan, because that would allow a replay of an already-applied batch.
 pub const IDEM_KEY_TTL_LEDGERS: u32 = 17_280; // ~24 h at 5 s/ledger
 
 /// TTL the contract instance is extended to on every successful batch
@@ -38,22 +45,12 @@ pub const MAX_BATCH_SIZE: u32 = 100;
 /// token to the submitting address so two different callers may reuse the
 /// same 32-byte token independently without conflict.
 ///
-/// ### Concurrency invariants
+/// ## Compatibility contract
 ///
-/// The contract must remain deterministic under concurrent and
-/// repeated invocations.  Soroban executes a contract invocation asynchronously
-/// and atomically within a ledger, but the same caller can still submit
-/// duplicate or racing requests across ledgers.  The idempotency sentinel is
-/// the only guarantee that a given (caller, key) pair is applied at most
-/// once.  To keep this guarantee correct:
-///
-/// 1. The sentinel must be written and extended in the same transaction
-///    as the batch effects, so a partial failure cannot leave the key
-///    consumed without the batch being applied (or vice versa).
-/// 2. The sentinel must be read before any state mutation so a duplicate
-///    submission is rejected before it can affect state.
-/// 3. The TWL must be refreshed on every successful write so a key cannot
-///    expire between the read and the write of a competing invocation.
+/// The constructor shape of `DataKey` is part of the on-chain state
+/// layout.  Adding new variants is allowed (they must be appended),
+/// but reordering or removing existing variants would invalidate
+/// persisted state and break existing deployments.
 #[contracttype]
 #[derive(Clone)]
 pub enum DataKey {

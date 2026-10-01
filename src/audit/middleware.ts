@@ -29,6 +29,49 @@ import type { Request, Response, NextFunction } from 'express';
 import { auditService } from './service';
 import type { AuditEntry, CreateAuditEntryInput } from './types';
 import { validateEnv } from '../config/env.schema';
+import { z } from 'zod';
+import { AUDIT_ACTIONS } from './types';
+import { CreateAuditEntrySchema } from './inputValidation';
+import { redactBody } from './redact';
+import { sanitizeCorrelationId } from '../utils/correlationId';
+import { AppError } from '../errors/appError';
+
+type RequestAuditInput = Omit<CreateAuditEntryInput, 'ipAddress' | 'correlationId'>;
+
+// The HTTP write schema predates these actions in the public AuditAction type.
+// Preserve every typed helper action without broadening the HTTP endpoint.
+const requestAuditSchema = CreateAuditEntrySchema
+  .omit({ ipAddress: true, correlationId: true })
+  .extend({ action: z.enum([
+    ...AUDIT_ACTIONS, 'CONTRACT_DELETED',
+    'MILESTONES_CREATED', 'MILESTONES_UPDATED', 'MILESTONES_DELETED',
+  ]) })
+  .strip();
+
+function freezeMetadata(value: unknown): void {
+  if (value !== null && typeof value === 'object') {
+    Object.values(value).forEach(freezeMetadata);
+    Object.freeze(value);
+  }
+}
+
+/** Prepare a detached JSON snapshot before any append can change store state. */
+function prepareInput(input: RequestAuditInput): RequestAuditInput {
+  try {
+    const parsed = requestAuditSchema.parse(input);
+    // Validation bounds depth/size and rejects cycles and non-JSON values.
+    // Revalidate the serialized snapshot as getters/toJSON can alter the value.
+    const snapshot: unknown = JSON.parse(JSON.stringify(parsed.metadata));
+    const metadata = CreateAuditEntrySchema.shape.metadata.parse(
+      redactBody(CreateAuditEntrySchema.shape.metadata.parse(snapshot)),
+    );
+    freezeMetadata(metadata);
+    return { ...parsed, metadata };
+  } catch {
+    // Never expose raw values, property names or exceptions from custom getters.
+    throw new AppError(400, 'validation_error', 'Invalid audit event');
+  }
+}
 
 /** Helper attached to res.locals for route-level audit logging. */
 export interface RequestAuditHelper {
@@ -40,13 +83,16 @@ export interface RequestAuditHelper {
    * callers do not need to supply those fields manually.
    *
    * When `AUDIT_ENABLED=false` this is a **no-op**: it returns a stub
-   * `AuditEntry` with empty `id`/`hash` fields and does **not** write
+   * `AuditEntry` with empty `id/`hash` fields and does **not** write
    * anything to the underlying store.
    *
    * @param input - Audit event details, excluding `ipAddress` and
    *   `correlationId` (injected from the request context).
    * @returns The persisted {@link AuditEntry}, or a stub entry when the
    *   feature flag is off.
+   * @throws A safe validation error for invalid events, even when disabled.
+   *   Storage failures propagate unchanged; there is no automatic retry or
+   *   deduplication. Each valid call appends a distinct event synchronously.
    */
   log(input: Omit<CreateAuditEntryInput, 'ipAddress' | 'correlationId'>): AuditEntry;
 }
@@ -83,19 +129,15 @@ export function auditMiddleware(req: Request, res: Response, next: NextFunction)
     // Feature flag off — attach a no-op helper so route code compiles and
     // runs without branching on the flag themselves.
     res.locals.audit = {
-      log(_input: Omit<CreateAuditEntryInput, 'ipAddress' | 'correlationId'>): AuditEntry {
-        return {
+      log(input: RequestAuditInput): AuditEntry {
+        const prepared = prepareInput(input);
+        return Object.freeze({
           id: '',
           timestamp: new Date().toISOString(),
           hash: '',
           previousHash: '',
-          action: _input.action,
-          severity: _input.severity,
-          actor: _input.actor,
-          resource: _input.resource,
-          resourceId: _input.resourceId,
-          metadata: _input.metadata,
-        };
+          ...prepared,
+        });
       },
     } satisfies RequestAuditHelper;
     next();
@@ -103,7 +145,7 @@ export function auditMiddleware(req: Request, res: Response, next: NextFunction)
   }
 
   const ipAddress = (req.ip ?? req.socket?.remoteAddress) as string | undefined;
-  const correlationId = req.headers['x-correlation-id'] as string | undefined;
+  const correlationId = sanitizeCorrelationId(req.headers['x-correlation-id']);
 
   // Capture the request-scoped context in closure so the helper cannot be
   // affected by later mutation of `req` headers or by concurrent requests.
@@ -111,7 +153,7 @@ export function auditMiddleware(req: Request, res: Response, next: NextFunction)
   // the service's hash-chain / serialisation invariants.
   res.locals.audit = {
     log(input: Omit<CreateAuditEntryInput, 'ipAddress' | 'correlationId'>): AuditEntry {
-      return auditService.log({ ...input, ipAddress, correlationId });
+      return auditService.log({ ...prepareInput(input), ipAddress, correlationId });
     },
   } satisfies RequestAuditHelper;
 

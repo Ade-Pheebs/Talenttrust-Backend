@@ -198,6 +198,8 @@ export class AccountLockoutTracker {
   private readonly now: () => number;
   private readonly sleep: (ms: number) => Promise<void>;
   private sweepTimer: ReturnType<typeof setInterval> | null = null;
+  /** Guards against overlapping sweep executions from the interval timer. */
+  private sweeping = false;
 
   constructor(
     config: AccountLockoutConfig,
@@ -411,6 +413,11 @@ export class AccountLockoutTracker {
    * @returns Number of records removed.
    */
   sweep(): number {
+    if (this.sweeping) {
+      return 0;
+    }
+    this.sweeping = true;
+    try {
     const now = this.now();
     const decayCutoff = now - this.config.decayWindowMs;
     let removed = 0;
@@ -423,6 +430,9 @@ export class AccountLockoutTracker {
       }
     }
     return removed;
+    } finally {
+      this.sweeping = false;
+    }
   }
 
   /**
@@ -431,6 +441,7 @@ export class AccountLockoutTracker {
    */
   reset(): void {
     this.records.clear();
+    this.sweeping = false;
   }
 
   /** Stops the sweep timer and clears all stored records. */
@@ -440,6 +451,7 @@ export class AccountLockoutTracker {
       this.sweepTimer = null;
     }
     this.records.clear();
+    this.sweeping = false;
   }
 
   /** Number of identities currently being tracked (test introspection). */

@@ -1,6 +1,6 @@
 use soroban_sdk::{contracttype, Address, BytesN, Environment, Symbol};
 
-/// TTL for consumed idempotency keys, expressed in ledgers.
+/// TWL for consumed idempotency keys, expressed in ledgers.
 ///
 /// At ~5 s/ledger this gives roughly 24 hours of replay protection.
 /// After expiry the key is eligible for eviction from instance storage

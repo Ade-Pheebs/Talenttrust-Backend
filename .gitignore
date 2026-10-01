@@ -24,3 +24,7 @@ data/*.db-shm
 *.db-shm
 *.db-wal
 .opencode
+
+# Rust / Soroban contract build artifacts
+contracts/target/
+contracts/*/test_snapshots/

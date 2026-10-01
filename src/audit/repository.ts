@@ -5,6 +5,10 @@ import { SqliteAuditRepository } from './sqliteRepository';
 import Database from '../db/betterSqlite3';
 
 export interface AuditLogRepository {
+  /**
+   * Appends a new event; equal payloads are not duplicates. Request retries
+   * must be deduplicated by the caller's idempotency boundary.
+   */
   append(input: CreateAuditEntryInput): AuditEntry;
   getById(id: string): AuditEntry | undefined;
   query(query?: AuditQuery): AuditEntry[];

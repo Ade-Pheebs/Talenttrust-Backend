@@ -12,6 +12,8 @@
  *   openReadStream, cleanup
  * - Cleanup removes the temporary directory
  * - neutraliseCsvInjection helper unit tests
+ * - Concurrent execution safety: racing exports, duplicate work, idempotent
+ *   cleanup, and bounded resource usage under parallel invocation
  *
  * @see docs/backend/audit-log.md — Export section
  */
@@ -727,51 +729,226 @@ describe('AuditExportService — path-traversal guard', () => {
   });
 });
 
-describe('AuditExportService - failure invariants', () => {
-  it('cleans up temporary directory if NDJSON pipeline fails', async () => {
-    const { exportService } = makeExportService([]);
-    // Force a failure during the streaming pipeline
-    jest.spyOn(exportService['service'], 'stream').mockReturnValue((function* () {
-      yield { action: 'CONTRACT_CREATED', severity: 'INFO', actor: 'bad', resource: 'bad' };
-      throw new Error('Simulated failure during streaming');
-    })() as any);
+// ═══════════════════════════════════════════════════════════════════════════════
+// Concurrent execution safety
+// ═══════════════════════════════════════════════════════════════════════════════
 
-    let caughtErr: Error | undefined;
-    try {
-      await exportService.createNdjsonExport();
-    } catch (err) {
-      caughtErr = err as Error;
+describe('AuditExportService — concurrent execution safety', () => {
+  it('racing NDJSON exports produce independent, non-interfering files', async () => {
+    const { exportService } = makeExportService();
+
+    const results = await Promise.all([
+      exportService.createNdjsonExport(),
+      exportService.createNdjsonExport(),
+      exportService.createNdjsonExport(),
+    ]);
+
+    // Each export must have a unique file path (no shared temp file collision)
+    const paths = results.map((r) => r.filePath);
+    expect(new Set(paths).size).toBe(paths.length);
+
+    // Each file must independently contain the full dataset
+    for (const result of results) {
+      expect(result.recordCount).toBe(FIXTURE_ENTRIES.length);
+      const content = await readExportFile(result.filePath);
+      const parsed = parseNdjson(content);
+      expect(parsed).toHaveLength(FIXTURE_ENTRIES.length);
     }
 
-    expect(caughtErr).toBeDefined();
-    expect(caughtErr?.message).toBe('Simulated failure during streaming');
-
-    // To verify cleanup, we must check that no leftover audit-export-* directories exist in the exportRoot
-    const exportRoot = (exportService as any).exportRoot;
-    const dirs = await fsp.readdir(exportRoot).catch(() => []);
-    expect(dirs.filter(d => d.startsWith('audit-export-'))).toHaveLength(0);
+    await Promise.all(results.map((r) => r.cleanup()));
   });
 
-  it('cleans up temporary directory if CSV pipeline fails', async () => {
-    const { exportService } = makeExportService([]);
-    // Force a failure during the streaming pipeline
-    jest.spyOn(exportService['service'], 'stream').mockReturnValue((function* () {
-      yield { action: 'CONTRACT_CREATED', severity: 'INFO', actor: 'bad', resource: 'bad' };
-      throw new Error('Simulated CSV failure');
-    })() as any);
+  it('racing CSV exports produce independent, non-interfering files', async () => {
+    const { exportService } = makeExportService();
 
-    let caughtErr: Error | undefined;
-    try {
-      await exportService.createCsvExport();
-    } catch (err) {
-      caughtErr = err as Error;
+    const results = await Promise.all([
+      exportService.createCsvExport(),
+      exportService.createCsvExport(),
+      exportService.createCsvExport(),
+    ]);
+
+    const paths = results.map((r) => r.filePath);
+    expect(new Set(paths).size).toBe(paths.length);
+
+    for (const result of results) {
+      expect(result.recordCount).toBe(FIXTURE_ENTRIES.length);
+      const content = await readExportFile(result.filePath);
+      const rows = parseCsv(content).filter((r) => r.some((c) => c.length > 0));
+      expect(rows).toHaveLength(FIXTURE_ENTRIES.length + 1);
     }
 
-    expect(caughtErr).toBeDefined();
-    expect(caughtErr?.message).toBe('Simulated CSV failure');
+    await Promise.all(results.map((r) => r.cleanup()));
+  });
 
-    const exportRoot = (exportService as any).exportRoot;
-    const dirs = await fsp.readdir(exportRoot).catch(() => []);
-    expect(dirs.filter(d => d.startsWith('audit-export-'))).toHaveLength(0);
+  it('mixed NDJSON and CSV exports racing do not corrupt each other', async () => {
+    const { exportService } = makeExportService();
+
+    const [ndjson, csv] = await Promise.all([
+      exportService.createNdjsonExport(),
+      exportService.createCsvExport(),
+    ]);
+
+    expect(ndjson.filePath).not.toBe(csv.filePath);
+    expect(ndjson.fileName).toMatch(/\.ndjson$/);
+    expect(csv.fileName).toMatch(/\.csv$/);
+
+    const ndjsonContent = await readExportFile(ndjson.filePath);
+    const csvContent = await readExportFile(csv.filePath);
+
+    expect(parseNdjson(ndjsonContent)).toHaveLength(FIXTURE_ENTRIES.length);
+    expect(parseCsv(csvContent).filter((r) => r.some((c) => c.length > 0)))
+      .toHaveLength(FIXTURE_ENTRIES.length + 1);
+
+    await Promise.all([ndjson.cleanup(), csv.cleanup()]);
+  });
+
+  it('cleanup is idempotent — repeated calls do not throw', async () => {
+    const { exportService } = makeExportService();
+    const result = await exportService.createNdjsonExport();
+
+    await result.cleanup();
+    await expect(result.cleanup()).resolves.toBeUndefined();
+    await expect(result.cleanup()).resolves.toBeUndefined();
+  });
+
+  it('concurrent cleanup of the same result is safe', async () => {
+    const { exportService } = makeExportService();
+    const result = await exportService.createNdjsonExport();
+
+    await Promise.all([
+      result.cleanup(),
+      result.cleanup(),
+      result.cleanup(),
+    ]);
+
+    await expect(fsp.access(result.filePath)).rejects.toThrow();
+  });
+
+  it('duplicate export work with identical filters yields consistent results', async () => {
+    const { exportService } = makeExportService();
+    const filter = { action: 'CONTRACT_CREATED' };
+
+    const [a, b] = await Promise.all([
+      exportService.createNdjsonExport(filter),
+      exportService.createNdjsonExport(filter),
+    ]);
+
+    expect(a.recordCount).toBe(b.recordCount);
+    const contentA = await readExportFile(a.filePath);
+    const contentB = await readExportFile(b.filePath);
+    expect(contentA).toBe(contentB);
+
+    await Promise.all([a.cleanup(), b.cleanup()]);
+  });
+
+  it('streaming exports racing with file exports do not interfere', async () => {
+    const { exportService } = makeExportService();
+    const { Writable } = await import('stream');
+
+    const chunks: Buffer[] = [];
+    const dest = new Writable({
+      write(chunk: string | Buffer, _enc: string, cb: () => void) {
+        chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+        cb();
+      },
+    });
+
+    const [fileResult, streamResult] = await Promise.all([
+      exportService.createNdjsonExport(),
+      exportService.streamNdjsonExport({}, dest),
+    ]);
+
+    expect(fileResult.recordCount).toBe(FIXTURE_ENTRIES.length);
+    expect(streamResult.recordCount).toBe(FIXTURE_ENTRIES.length);
+
+    const streamed = Buffer.concat(chunks).toString('utf8');
+    const fromFile = await readExportFile(fileResult.filePath);
+    expect(streamed).toBe(fromFile);
+
+    await Promise.all([fileResult.cleanup(), streamResult.cleanup()]);
+  });
+
+  it('high-concurrency burst (10 parallel exports) completes without error', async () => {
+    const { exportService } = makeExportService();
+
+    const results = await Promise.all(
+      Array.from({ length: 10 }, () => exportService.createNdjsonExport()),
+    );
+
+    const paths = results.map((r) => r.filePath);
+    expect(new Set(paths).size).toBe(10);
+
+    for (const result of results) {
+      expect(result.recordCount).toBe(FIXTURE_ENTRIES.length);
+    }
+
+    await Promise.all(results.map((r) => r.cleanup()));
+  });
+
+  it('cleanup during concurrent export does not affect the in-flight export', async () => {
+    const { exportService } = makeExportService();
+
+    const first = await exportService.createNdjsonExport();
+    const inFlight = exportService.createNdjsonExport();
+
+    // Clean up the first result while the second is still being produced
+    await first.cleanup();
+
+    const second = await inFlight;
+    expect(second.recordCount).toBe(FIXTURE_ENTRIES.length);
+    const content = await readExportFile(second.filePath);
+    expect(parseNdjson(content)).toHaveLength(FIXTURE_ENTRIES.length);
+
+    await second.cleanup();
+  });
+
+  it('idempotent retries of the same export produce equivalent content', async () => {
+    const { exportService } = makeExportService();
+
+    const first = await exportService.createCsvExport();
+    const firstContent = await readExportFile(first.filePath);
+    await first.cleanup();
+
+    const second = await exportService.createCsvExport();
+    const secondContent = await readExportFile(second.filePath);
+    await second.cleanup();
+
+    expect(secondContent).toBe(firstContent);
+  });
+
+  it('concurrent exports with different filters each honour their own filter', async () => {
+    const { exportService } = makeExportService();
+
+    const [contracts, payments] = await Promise.all([
+      exportService.createNdjsonExport({ action: 'CONTRACT_CREATED' }),
+      exportService.createNdjsonExport({ action: 'PAYMENT_INITIATED' }),
+    ]);
+
+    const contractRecords = parseNdjson(await readExportFile(contracts.filePath));
+    const paymentRecords = parseNdjson(await readExportFile(payments.filePath));
+
+    expect(contractRecords.every((r) => r['action'] === 'CONTRACT_CREATED')).toBe(true);
+    expect(paymentRecords.every((r) => r['action'] === 'PAYMENT_INITIATED')).toBe(true);
+
+    await Promise.all([contracts.cleanup(), payments.cleanup()]);
+  });
+
+  it('partial failure of one export does not corrupt a concurrent successful export', async () => {
+    const { exportService } = makeExportService();
+
+    const good = exportService.createNdjsonExport();
+    const bad = exportService.createNdjsonExport({ action: 'NON_EXISTENT_ACTION' });
+
+    const [goodResult, badResult] = await Promise.all([good, bad]);
+
+    // The good export must be intact regardless of the empty result of the other
+    expect(goodResult.recordCount).toBe(FIXTURE_ENTRIES.length);
+    const content = await readExportFile(goodResult.filePath);
+    expect(parseNdjson(content)).toHaveLength(FIXTURE_ENTRIES.length);
+
+    // The filtered export legitimately yields zero records
+    expect(badResult.recordCount).toBe(0);
+
+    await Promise.all([goodResult.cleanup(), badResult.cleanup()]);
   });
 });

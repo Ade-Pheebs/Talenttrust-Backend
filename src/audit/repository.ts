@@ -64,129 +64,61 @@ export interface AuditLogRepository {
 }
 
 /**
- * State invariants enforced by this factory:
+ * Global cache of repository instances keyed by the resolved backend
+ * configuration. This guarantees that concurrent or repeated calls to
+ * `createDefaultAuditRepository()` return the same instance for the same
+ * configuration, so concurrent writers cannot open competing SQLite
+ * connections to the same file and produce inconsistent or stale results.
  *
- * 1. The backend selection is deterministic for a given environment configuration.
- *    The resolved backend is captured once at creation time so a single repository
- *    instance cannot silently switch backends if environment variables mutate later.
- * 2. Unsupported backends fail fast with an explicit error rather than falling back to
- *    a default that could cause silent data loss or inconsistent state.
- * 3. The SQLite backend is only constructed when explicitly selected, so the native
- *    module is never required for in-memory operation.
- * 4. The database handle is owned by the returned repository; callers must not share
- *    or close it independently.
- */
-
-export function createDefaultAuditRepository(): AuditLogRepository {
-  const backend = process.env['AUDIT_STORAGE_BACKEND'] ?? 'memory';
-
-/**
- * Resolved, normalised storage configuration. Exported so operators/tests can
- * assert exactly which backend a given environment selects without opening a
- * database as a side effect.
- *
- * @warning The `dbPath` for a SQLite backend may be `':memory:'`, which is
- *          *connection*-scoped: two connections to `:memory:` are two
- *          independent stores. See the stability invariant above.
- */
-export type AuditStorageConfig =
-  | { backend: 'memory' }
-  | { backend: 'sqlite'; dbPath: string };
-
-/** Backends considered valid; used only to build the fail-fast error message. */
-const SUPPORTED_BACKENDS: readonly AuditStorageBackend[] = ['memory', 'sqlite'];
-
-/**
- * Normalise + validate the raw `AUDIT_STORAGE_BACKEND` value.
- *
- * Blank/undefined means "not configured" and resolves to the documented
- * default (`memory`). Anything else is trimmed and lower-cased before the
- * lookup. Unknown values throw synchronously — a typo must never silently
- * select a different backend than the operator intended.
- *
- * @throws {Error} when the value is non-blank and not a supported backend.
- */
-export function resolveAuditStorageBackend(rawBackend: string | undefined): AuditStorageBackend {
-  const normalised = (rawBackend ?? '').trim().toLowerCase();
-  if (normalised === '') {
-    return 'memory';
-  }
-  if ((SUPPORTED_BACKENDS as readonly string[]).includes(normalised)) {
-    return normalised as AuditStorageBackend;
-  }
-  // Preserve the historical `Unsupported AUDIT_STORAGE_BACKEND: <value>`
-  // prefix for any caller matching on it, then add the accepted values so
-  // the failure is self-diagnosing.
-  throw new Error(
-    `Unsupported AUDIT_STORAGE_BACKEND: ${rawBackend}. Accepted values: ${SUPPORTED_BACKENDS.join(', ')}`,
-  );
-}
-
-/**
- * Resolve the effective SQLite database path.
- *
- * Contract (unchanged from the original implementation):
- *   - explicit `AUDIT_DB_PATH` always wins;
- *   - otherwise tests use an ephemeral `:memory:` database;
- *   - otherwise the file lives in the current working directory.
- *
- * A blank `AUDIT_DB_PATH` (e.g. `AUDIT_DB_PATH=` exported by a shell) is
- * treated as unset rather than as an empty filename.
- */
-export function resolveAuditDbPath(env: NodeJS.ProcessEnv = process.env): string {
-  const configured = (env['AUDIT_DB_PATH'] ?? '').trim();
-  if (configured !== '') {
-    return configured;
-  }
-  if (env['NODE_ENV'] === 'test') {
-    return ':memory:';
-  }
-  return path.join(process.cwd(), 'talenttrust-audit.db');
-}
-
-/**
- * Pure resolver for the whole storage configuration. Kept side-effect free so
- * it can be unit-tested and used for logging/observability without touching
- * the filesystem or the native driver.
- */
-export function resolveAuditStorageConfig(
-  env: NodeJS.ProcessEnv = process.env,
-): AuditStorageConfig {
-  const backend = resolveAuditStorageBackend(env['AUDIT_STORAGE_BACKEND']);
-
-  if (backend === 'sqlite') {
-    return { backend: 'sqlite', dbPath: resolveAuditDbPath(env) };
-  }
-
-  return { backend: 'memory' };
-}
-
-/**
- * Instance cache keyed by resolved configuration.
- *
- * @internal Exported only through {@link resetAuditRepositoryCache} for tests.
+ * Invariants:
+ * - The cache key is derived only from environment configuration, not
+ *   from caller input, so two callers with the same config always share
+ *   the same repository.
+ * - If a cached instance fails to initialize (e.g. native binding missing),
+ *   the failure is not cached, so a retry can succeed once the underlying
+ *   condition is resolved.
+ * - The cache is bounded by the number of distinct backend configurations
+ *   encountered in a process, which is effectively constant.
  */
 const repositoryCache = new Map<string, AuditLogRepository>();
 
-function cacheKey(config: AuditStorageConfig): string {
-  return config.backend === 'sqlite' ? `sqlite:${config.dbPath}` : 'memory';
+function resolveSqliteDbPath(): string {
+  return (
+    process.env['AUDIT_DB_PATH'] ??
+    (process.env['NODE_ENV'] === 'test'
+      ? ':memory:'
+      : path.join(process.cwd(), 'talenttrust-audit.db'))
+  );
 }
 
-function createRepositoryFor(config: AuditStorageConfig): AuditLogRepository {
-  if (config.backend === 'memory') {
+function cacheKeyForBackend(backend: string): string {
+  if (backend === 'sqlite') {
+    return `sqlite:${resolveSqliteDbPath()}`;
+  }
+  return backend;
+}
+
+export function createDefaultAuditRepository(): AuditLogRepository {
+  const backend = process.env['AUDIT_STORAGE_BACKEND'] ?? 'memory';
+  const cacheKey = cacheKeyForBackend(backend);
+
+  const cached = repositoryCache.get(cacheKey);
+  if (cached) {
+    return cached;
+  }
+
+  if (backend === 'memory') {
+    repositoryCache.set(cacheKey, auditStore);
     return auditStore;
   }
 
   if (backend === 'sqlite') {
-    const dbPath =
-      process.env['AUDIT_DB_PATH'] ?>
-      (process.env['NODE_ENV'] === 'test'
-        ? ':memory:'
-        : path.join(process.cwd(), 'talenttrust-audit.db'));
     // Load the native module only when the SQLite backend is selected so
     // in-memory tests can run on machines without compiled bindings.
-    const db = new Database(dbPath);
-    return new SqliteAuditRepository(db);
+    const db = new Database(resolveSqliteDbPath());
+    const repo = new SqliteAuditRepository(db);
+    repositoryCache.set(cacheKey, repo);
+    return repo;
   }
 
   return new SqliteAuditRepository(db);
@@ -223,5 +155,14 @@ export function createDefaultAuditRepository(
  * and evicting an in-memory repository silently discards the audit log.
  */
 export function resetAuditRepositoryCache(): void {
+  repositoryCache.clear();
+}
+
+/**
+ * Test-only helper to reset the cached repository instances. This is
+ * exported so tests can exercise different backend configurations without
+ * leaking state between cases. It is not intended for production use.
+ */
+export function _resetAuditRepositoryCache(): void {
   repositoryCache.clear();
 }

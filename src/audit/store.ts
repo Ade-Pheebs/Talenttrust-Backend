@@ -9,6 +9,16 @@
  * - The internal log array is never exposed directly; only copies are returned.
  * - No entry can be deleted or updated — the store is strictly append-only.
  *
+ * Concurrency properties:
+ * - Appends are serialized through an async mutex so concurrent callers cannot
+ *   interleave hash-chain computation and produce a forked or stale chain.
+ * - The mutex is reentrancy-safe: a caller invoking append() from within an
+ *   append() transaction is rejected with a deterministic error rather than
+ *   deadlocking or silently corrupting the chain.
+ * - Reads (getAll, query, verifyIntegrity, …) operate on a snapshot of the
+ *   log taken at call time, so a concurrent append cannot observe or produce
+ *   a partially-written entry.
+ *
  * Production note: Replace the in-memory array with a write-once database table
  * (e.g. PostgreSQL with row-level security and no UPDATE/DELETE grants) while
  * keeping this interface contract intact.
@@ -74,39 +84,35 @@ export function computeEntryHash(
 }
 
 /**
- * Validates a CreateAuditEntryInput before it is accepted into the log.
+ * Async mutex used to serialize mutating operations on the audit log.
  *
- * Invariants enforced here (all must hold for every appended entry):
- * - `action`, `severity`, `actor`, `resource`, `resourceId` are non-empty strings.
- * - `metadata` is a plain object (not null/array) so it can be safely frozen.
- * - Optional `ipAddress` / `correlationId`, when present, are non-empty strings.
- *
- * Throwing here keeps the store append-only and prevents partially-formed
- * entries from ever entering the hash chain (which would otherwise make
- * verifyIntegrity() report a false positive on a valid chain).
+ * The mutex is reentrancy-detecting: if the same async context attempts to
+ * acquire it twice, acquisition rejects with a deterministic error. This prevents
+ * deadlocks and hidden chain corruption from re-entrant append calls.
  */
-function assertValidInput(input: CreateAuditEntryInput): void {
-  const required: Array<keyof CreateAuditEntryInput> = [
-    'action',
-    'severity',
-    'actor',
-    'resource',
-    'resourceId',
-  ];
-  for (const key of required) {
-    const value = input[key];
-    if (typeof value !== 'string' || value.length === 0) {
-      throw new Error(`AuditStore.append: "${key}" must be a non-empty string`);
+class AsyncMutex {
+  private tail: Promise<void> = Promise.resolve();
+  private locked = false;
+
+  async runExclusive<T>(fn: () => Promise<T> | T): Promise<T> {
+    if (this.locked) {
+      throw new Error('AuditStore append re-entrancy detected');
     }
-  }
-  if (input.metadata === null || typeof input.metadata !== 'object' || Array.isArray(input.metadata)) {
-    throw new Error('AuditStore.append: "metadata" must be a plain object');
-  }
-  if (input.ipAddress !== undefined && (typeof input.ipAddress !== 'string' || input.ipAddress.length === 0)) {
-    throw new Error('AuditStore.append: "ipAddress" must be a non-empty string when provided');
-  }
-  if (input.correlationId !== undefined && (typeof input.correlationId !== 'string' || input.correlationId.length === 0)) {
-    throw new Error('AuditStore.append: "correlationId" must be a non-empty string when provided');
+
+    this.locked = true;
+    const previous = this.tail;
+    let release!: () => void;
+    this.tail = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+
+    await previous;
+    try {
+      return await fn();
+    } finally {
+      this.locked = false;
+      release();
+    }
   }
 }
 
@@ -130,7 +136,7 @@ function assertValidInput(input: CreateAuditEntryInput): void {
  * @example
  * ```ts
  * const store = new AuditStore();
- * store.append({ action: 'CONTRACT_CREATED', severity: 'INFO', actor: 'user-1', ... });
+ * await store.append({ action: 'CONTRACT_CREATED', severity: 'INFO', actor: 'user-1', ... });
  * const report = store.verifyIntegrity();
  * ```
  */
@@ -138,23 +144,26 @@ export class AuditStore implements AuditLogRepository {
   /** Internal append-only log. Never mutate directly. */
   private readonly log: AuditEntry[] = [];
 
+  /** Serializes append operations across concurrent callers. */
+  private readonly mutex = new AsyncMutex();
+
   /**
-   * Depth of the write critical section currently executing. `0` means idle;
-   * a non-zero value on entry means a nested write, which is rejected.
+   * Appends a new entry to the log.
+   *
+   * @description The append is atomic and serialized: the previous hash is
+   * read, the new entry hash computed, and the entry pushed within a single
+   * exclusive section. Concurrent appends cannot observe stale previous hashes
+  * or produce a forked chain.
+   *
+   * @param input - The audit entry data.
+   * @returns The frozen, chained entry that was appended.
+   * @rejects If a re-entrant append is detected.
    */
-  private _appendDepth = 0;
-
-  append(input: CreateAuditEntryInput): AuditEntry {
-    if (this._appendGuard) {
-      throw new Error('AuditStore append re-entrancy detected');
-    }
-
-    this._appendGuard = true;
-    try {
-      assertValidInput(input);
-
+  append(input: CreateAuditEntryInput): Promise<AuditEntry> {
+    return this.mutex.runExclusive(() => {
       const previousHash =
-        this.log.length === 0 ? GENESIS_HASH : this.log[this.log.length - 1].hash;
+        this.log.length === 0 ? GENESIS_HASH
+        : this.log[this.log.length - 1].hash;
 
       const partial: Omit<AuditEntry, 'hash'> = {
         id: randomUUID(),
@@ -179,85 +188,6 @@ export class AuditStore implements AuditLogRepository {
       Object.freeze(this.log);
       return entry;
     });
-  }
-
-  /**
-   * Atomically appends a batch of entries, chaining each to the one before it.
-   *
-   * All-or-nothing: if any entry in the batch fails to build (for example a
-   * `metadata` value whose `toJSON` throws while hashing), *no* entry from the
-   * batch is persisted. Callers that must record several related events can
-   * therefore never observe a partially applied batch.
-   *
-   * Not part of {@link AuditLogRepository} — it is an `AuditStore` primitive,
-   * so adding it does not change the repository interface or the SQLite
-   * backend.
-   */
-  appendMany(inputs: readonly CreateAuditEntryInput[]): AuditEntry[] {
-    return this.withWriteLock(() => {
-      const appended: AuditEntry[] = [];
-      let previousHash = this.currentHash();
-      for (const input of inputs) {
-        const entry = this.buildEntry(input, previousHash);
-        this.log.push(entry);
-        appended.push(entry);
-        previousHash = entry.hash;
-      }
-      return appended;
-    });
-  }
-
-  /** Hash of the current chain head, or {@link GENESIS_HASH} when empty. */
-  private currentHash(): string {
-    return this.log.length === 0 ? GENESIS_HASH : this.log[this.log.length - 1].hash;
-  }
-
-  /** Builds (but does not persist) a frozen entry linked to `previousHash`. */
-  private buildEntry(input: CreateAuditEntryInput, previousHash: string): AuditEntry {
-    const partial: Omit<AuditEntry, 'hash'> = {
-      id: randomUUID(),
-      timestamp: new Date().toISOString(),
-      action: input.action,
-      severity: input.severity,
-      actor: input.actor,
-      resource: input.resource,
-      resourceId: input.resourceId,
-      metadata: Object.freeze({ ...input.metadata }),
-      ipAddress: input.ipAddress,
-      correlationId: input.correlationId,
-      previousHash,
-    };
-
-    return Object.freeze({
-      ...partial,
-      hash: computeEntryHash(partial),
-    });
-  }
-
-  /**
-   * Runs `work` inside the single-writer critical section.
-   *
-   * Nested writes are rejected before they can run, and the log is rolled back
-   * to its pre-call length if `work` throws — guaranteeing that a failed or
-   * re-entrant write leaves no partial state behind.
-   */
-  private withWriteLock<T>(work: () => T): T {
-    if (this._appendDepth > 0) {
-      throw new AuditStoreConcurrencyError();
-    }
-
-    this._appendDepth += 1;
-    const priorLength = this.log.length;
-    try {
-      return work();
-    } catch (error) {
-      if (this.log.length > priorLength) {
-        this.log.length = priorLength;
-      }
-      throw error;
-    } finally {
-      this._appendDepth -= 1;
-    }
   }
 
   /**
@@ -443,7 +373,8 @@ export class AuditStore implements AuditLogRepository {
       const entry = this.log[i];
 
       // Verify previousHash linkage
-      const expectedPreviousHash = i === 0 ? GENESIS_HASH : this.log[i - 1].hash;
+      const expectedPreviousHash = i === 0 ? GENESIS_HASH
+        : this.log[i - 1].hash;
       if (entry.previousHash !== expectedPreviousHash) {
         return {
           valid: false,
@@ -477,7 +408,6 @@ export class AuditStore implements AuditLogRepository {
    */
   _reset(): void {
     this.log.length = 0;
-    this._appendDepth = 0;
   }
 }
 

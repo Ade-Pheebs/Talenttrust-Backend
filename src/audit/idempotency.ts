@@ -107,14 +107,30 @@ export interface IdempotencyStoreOptions {
   maxSize?: number;
   ttlMs?: number;
   /**
-   * How long an in-progress reservation may live before it is treated as
-   * abandoned and released for retry. Defaults to 30 seconds.
+   * Optional clock injection for deterministic testing of TTL/expiry behavior.
+   * Defaults to Date.now.
    */
-  reservationTtlMs?: number;
-  /** Injectable clock (epoch ms) for deterministic tests. Defaults to `Date.now`. */
-  clock?: () => number;
-  /** Optional sink for structured events. Throwing sinks are swallowed. */
-  onEvent?: (event: IdempotencyEvent) => void;
+  now?: () => number;
+}
+
+export interface IdempotencyResolution {
+  /** True when the record was produced by this call (not a cache hit). */
+  created: boolean;
+  /** True when an existing record was returned for the same key. */
+  replayed: boolean;
+  /** True when the same key was reused with a different request body. */
+  conflict: boolean;
+  record: IdempotencyRecord;
+}
+
+export class IdempotencyConflictError extends Error {
+  readonly code = 'IDEMROTENCY_CONFLICT';
+  constructor(readonly key: string) {
+    super(
+      `Idempotency key ${key} was reused with a different request body`,
+    );
+    this.name = 'IdempotencyConflictError';
+  }
 }
 
 /** Typed error codes for deterministic, user-visible failure ordering. */
@@ -206,31 +222,15 @@ function hashBody(input: CreateAuditEntryInput): string {
   return createHash('sha256').update(payload, 'utf8').digest('hex');
 }
 
-function hashKey(key: string): string {
-  return createHash('sha256').update(key, 'utf8').digest('hex');
-}
-
-function emptyStats(): IdempotencyStoreStats {
-  return {
-    hits: 0,
-    misses: 0,
-    replays: 0,
-    conflicts: 0,
-    reservations: 0,
-    completions: 0,
-    releases: 0,
-    expirations: 0,
-    evictions: 0,
-    failures: 0,
-  };
-}
-
 /**
- * Deterministic, bounded, failure-recoverable idempotency store.
+ * In-memory idlempotency store for audit export operations.
  *
- * Existing callers using only `get`/`set`/`delete`/`size`/`clear` keep working
- * unchanged. New callers should prefer the explicit `reserve` → `complete` /
- * `release` lifecycle so a failed operation frees its key for a safe retry.
+ * Invariants:
+ * - A given key maps to at most one record at any time.
+ * - Records are immutable once written.
+ * - Expired records are never returned and are evicted lazily.
+ * - Concurrent callers observe a consistent snapshot because JavaScript execution
+ *   is single-threaded and this class performs no await yields between read and write.
  */
 export class IdempotencyStore {
   /** Completed records only — exactly the legacy public shape. */
@@ -240,18 +240,12 @@ export class IdempotencyStore {
 
   private readonly maxSize: number;
   private readonly ttlMs: number;
-  private readonly reservationTtlMs: number;
-  private readonly clock: () => number;
-  private readonly onEvent: ((event: IdempotencyEvent) => void) | undefined;
-
-  private _stats: IdempotencyStoreStats = emptyStats();
+  private readonly now: () => number;
 
   constructor(options: IdempotencyStoreOptions = {}) {
-    this.maxSize = Math.max(1, options.maxSize ?? DEFAULT_MAX_SIZE);
-    this.ttlMs = Math.max(1, options.ttlMs ?? DEFAULT_TTL_MS);
-    this.reservationTtlMs = Math.max(1, options.reservationTtlMs ?? DEFAULT_RESERVATION_TTL_MS);
-    this.clock = options.clock ?? (() => Date.now());
-    this.onEvent = options.onEvent;
+    this.maxSize = Math.max(1, Math.floor(options.maxSize ?? DEFAULT_MAX_SIZE));
+    this.ttlMs = Math.max(0, options.ttlMs ?? DEFAULT_TTL_MS);
+    this.now = options.now ?? (() => Date.now());
   }
 
   /**
@@ -272,63 +266,64 @@ export class IdempotencyStore {
       return undefined;
     }
 
-    this._stats.hits += 1;
+    if (this.isExpired(record)) {
+      this.store.delete(key);
+      return undefined;
+    }
+
     return record;
   }
 
   /**
-   * Atomically reserve `key` for the request described by `input`.
-   *
-   * @returns
-   *  - `reserved`     — this caller owns the key; run the side effect, then call
-   *                     {@link complete} (or {@link release} on failure).
-   *  - `replay`       — the operation already completed with an identical body.
-   *  - `in_progress`  — an identical request is already executing.
-   *  - `conflict`     — the key was used with a different body.
+   * Returns the existing record for a key if it matches the supplied body,
+   * otherwise undefined. Throws when the key is reused with a different body.
    */
-  reserve(key: string, input: CreateAuditEntryInput): IdempotencyReserveResult {
-    this.assertKey(key);
-    const bodyHash = hashBody(input);
-    const now = this.clock();
-
-    const completed = this.readLiveRecord(key, now);
-    if (completed) {
-      if (completed.bodyHash === bodyHash) {
-        this._stats.hits += 1;
-        this._stats.replays += 1;
-        this.emit('replay', key, now);
-        return { kind: 'replay', record: completed };
-      }
-      this._stats.conflicts += 1;
-      this.emit('conflict', key, now);
-      return { kind: 'conflict' };
+  check(key: string, input: CreateAuditEntryInput): IdempotencyRecord | undefined {
+    const record = this.get(key);
+    if (!record) {
+      return undefined;
     }
 
-    const existing = this.reservations.get(key);
-    if (existing && !this.isReservationExpired(existing, now)) {
-      if (existing.bodyHash === bodyHash) {
-        this.emit('in_progress', key, now);
-        return { kind: 'in_progress' };
-      }
-      this._stats.conflicts += 1;
-      this.emit('conflict', key, now);
-      return { kind: 'conflict' };
+    if (record.bodyHash !== hashBody(input)) {
+      throw new IdempotencyConflictError(key);
     }
 
+    return record;
+  }
+
+  /**
+   * Atomically resolves a key: returns an existing record or creates and
+   * stores one. The read-and-write happens without any await yield, so concurrent
+   * callers in the same event loop cannot interleave and duplicate work.
+   */
+  resolve(
+    key: string,
+    input: CreateAuditEntryInput,
+    create: () => AuditEntry,
+  ): IdempotencyResolution {
+    const existing = this.get(key);
     if (existing) {
-      // Abandoned reservation (process crash / timeout) — reclaim it so a
-      // retry can proceed instead of being blocked forever.
-      this.reservations.delete(key);
-      this._stats.expirations += 1;
-      this.emit('expired', key, now);
+      if (existing.bodyHash !== hashBody(input)) {
+        throw new IdempotencyConflictError(key);
+      }
+      return { created: false, replayed: true, conflict: false, record: existing };
     }
 
-    const token = randomUUID();
-    this.reservations.set(key, {
-      bodyHash,
-      token,
-      createdAt: now,
-      expiresAt: now + this.reservationTtlMs,
+    const response = create();
+    const record: IdempotencyRecord = {
+      bodyHash: hashBody(input),
+      response,
+      createdAt: this.now(),
+    };
+    this.write(key, record);
+    return { created: true, replayed: false, conflict: false, record };
+  }
+
+  set(key: string, input: CreateAuditEntryInput, response: AuditEntry): void {
+    this.write(key, {
+      bodyHash: hashBody(input),
+      response,
+      createdAt: this.now(),
     });
     this._stats.reservations += 1;
     this.emit('reserved', key, now);
@@ -449,76 +444,28 @@ export class IdempotencyStore {
     this.emit('cleared', '', this.clock());
   }
 
-  /**
-   * Removes expired completed records and reservations.
-   *
-   * @returns the number of entries reclaimed.
-   */
-  purgeExpired(now: number = this.clock()): number {
-    return this.evictExpired(now);
-  }
+  private write(key: string, record: IdempotencyRecord): void {
+    this.evictExpired();
 
-  /** Snapshot of cumulative counters (mutating the result cannot affect the store). */
-  stats(): IdempotencyStoreStats {
-    return { ...this._stats };
-  }
-
-  /** Resets cumulative counters. Does not touch stored records. */
-  resetStats(): void {
-    this._stats = emptyStats();
-  }
-
-  private assertKey(key: string): void {
-    if (typeof key !== 'string' || key.length === 0) {
-      this._stats.failures += 1;
-      throw new IdempotencyStoreError('invalid_key', 'Idempotency key must be a non-empty string');
-    }
-  }
-
-  private isRecordExpired(record: IdempotencyRecord, now: number): boolean {
-    return now >= record.expiresAt;
-  }
-
-  private isReservationExpired(reservation: Reservation, now: number): boolean {
-    return now >= reservation.expiresAt;
-  }
-
-  /** Returns a live record, lazily reclaiming an expired one. */
-  private readLiveRecord(key: string, now: number): IdempotencyRecord | undefined {
-    const record = this.store.get(key);
-    if (!record) {
-      return undefined;
-    }
-    if (this.isRecordExpired(record, now)) {
+    // Refresh existing keys without growing the store or evicting an unrelated key.
+    if (this.store.has(key)) {
       this.store.delete(key);
-      this._stats.expirations += 1;
-      this.emit('expired', key, now);
-      return undefined;
+    } else if (this.store.size >= this.maxSize) {
+      const oldestKey = this.store.keys().next().value;
+      if (oldestKey !== undefined) {
+        this.store.delete(oldestKey);
+      }
     }
-    return record;
-  }
 
-  private writeCompleted(
-    key: string,
-    bodyHash: string,
-    response: AuditEntry,
-    now: number,
-  ): IdempotencyRecord {
-    this.evictExpired(now);
-    this.evictOldestIfNeeded(key);
-    const record: IdempotencyRecord = Object.freeze({
-      bodyHash,
-      response,
-      createdAt: now,
-      expiresAt: now + this.ttlMs,
-    });
     this.store.set(key, record);
-    return record;
   }
 
-  private evictExpired(now: number): number {
-    let purged = 0;
+  private isExpired(record: IdempotencyRecord): boolean {
+    return this.now() - record.createdAt > this.ttlMs;
+  }
 
+  private evictExpired(): void {
+    const now = this.now();
     for (const [key, record] of this.store) {
       if (this.isRecordExpired(record, now)) {
         this.store.delete(key);

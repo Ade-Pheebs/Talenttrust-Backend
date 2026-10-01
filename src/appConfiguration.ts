@@ -1,4 +1,5 @@
 import { isSafeUrl } from './utils/ssrf';
+import { z } from 'zod';
 
 export type ChaosMode = 'off' | 'error' | 'timeout' | 'random';
 
@@ -57,6 +58,110 @@ export interface AppConfig {
 const MAX_TIMEOUT_MS = 10_000;
 const MIN_TIMEOUT_MS = 100;
 
+/**
+ * Validation boundaries for environment-driven configuration.
+ *
+ * Invariants enforced here:
+ *  - Every numeric field is finite and within an explicit [min, max] range.
+ *  - String enums are restricted to a known allow-list; unknown values are
+ *    rejected rather than silently coerced, so misconfiguration is diagnosable.
+ *  - List fields are bounded in size and element length to prevent unbounded
+ *    memory growth or log-injection via crafted env values.
+ *  - URLs are validated through `isSafeUrl` to preserve SSRF protections.
+ *
+ * Rejections throw `ConfigValidationError` with a redacted message: the field
+ * name and reason are included, but raw values are never echoed (they may
+ * contain secrets or internal hostnames).
+ */
+export class ConfigValidationError extends Error {
+  public readonly field: string;
+  public readonly reason: string;
+
+  constructor(field: string, reason: string) {
+    super(`Invalid configuration for "${field}": ${reason}`);
+    this.name = 'ConfigValidationError';
+    this.field = field;
+    this.reason = reason;
+  }
+}
+
+const MAX_LIST_ITEMS = 64;
+const MAX_LIST_ITEM_LENGTH = 128;
+
+const chaosModeSchema = z.enum(['off', 'error', 'timeout', 'random']);
+
+const boundedInt = (min: number, max: number) =>
+  z
+    .number()
+    .int()
+    .min(min)
+    .max(max);
+
+const boundedNumber = (min: number, max: number) =>
+  z
+    .number()
+    .min(min)
+    .max(max);
+
+const boundedStringList = z
+  .array(z.string().min(1).max(MAX_LIST_ITEM_LENGTH))
+  .max(MAX_LIST_ITEMS);
+
+const circuitBreakerSchema = z.object({
+  failureThreshold: boundedInt(1, 100),
+  successThreshold: boundedInt(1, 20),
+  timeoutMs: boundedInt(1_000, 300_000),
+});
+
+const webhookRetrySchema = z
+  .object({
+    maxAttempts: boundedInt(1, 20),
+    initialDelayMs: boundedInt(100, 60_000),
+    maxDelayMs: boundedInt(1_000, 600_000),
+    multiplier: boundedNumber(1, 10),
+    jitterFactor: boundedNumber(0, 1),
+  })
+  .refine((v) => v.maxDelayMs >= v.initialDelayMs, {
+    message: 'maxDelayMs must be >= initialDelayMs',
+    path: ['maxDelayMs'],
+  });
+
+const healthProbesSchema = z.object({
+  queueFailedThreshold: boundedInt(0, 10_000),
+  queueBacklogThreshold: boundedInt(0, 1_000_000),
+  queueProbeTimeoutMs: boundedInt(100, 30_000),
+});
+
+const appConfigSchema = z.object({
+  port: boundedInt(1, 65535),
+  gracefulDegradationEnabled: z.boolean(),
+  upstreamContractsUrl: z
+    .string()
+    .min(1)
+    .refine((url) => isSafeUrl(url), { message: 'SSRF protection blocked access to internal resource' }),
+  upstreamTimeoutMs: boundedInt(MIN_TIMEOUT_MS, MAX_TIMEOUT_MS),
+  chaosMode: chaosModeSchema,
+  chaosTargets: boundedStringList,
+  chaosProbability: boundedNumber(0, 1),
+  circuitBreaker: circuitBreakerSchema,
+  webhookRetry: webhookRetrySchema,
+  webhookCircuitBreaker: circuitBreakerSchema,
+  healthProbes: healthProbesSchema,
+  idempotencyTtlMs: boundedInt(0, 7 * 24 * 60 * 60 * 1000),
+  allowedAssets: boundedStringList,
+  milestonesEnabled: z.boolean(),
+});
+
+function assertValidConfig(config: AppConfig): AppConfig {
+  const result = appConfigSchema.safeParse(config);
+  if (!result.success) {
+    const issue = result.error.issues[0];
+    const field = issue.path.join('.') || 'config';
+    throw new ConfigValidationError(field, issue.message);
+  }
+  return result.data;
+}
+
 function toNumber(value: string | undefined, fallback: number): number {
   if (!value) {
     return fallback;
@@ -72,10 +177,11 @@ function clamp(value: number, min: number, max: number): number {
 
 function parseChaosMode(value: string | undefined): ChaosMode {
   const mode = (value ?? 'off').toLowerCase();
-  if (mode === 'error' || mode === 'timeout' || mode === 'random') {
-    return mode;
+  const parsed = chaosModeSchema.safeParse(mode);
+  if (!parsed.success) {
+    throw new ConfigValidationError('CHAOS_MODE', 'must be one of off, error, timeout, random');
   }
-  return 'off';
+  return parsed.data;
 }
 
 function parseBoolean(value: string | undefined, fallback: boolean): boolean {
@@ -91,10 +197,16 @@ function parseTargets(value: string | undefined): string[] {
     return [];
   }
 
-  return value
+  const items = value
     .split(',')
     .map((item) => item.trim().toLowerCase())
     .filter(Boolean);
+
+  if (items.length > MAX_LIST_ITEMS || items.some((item) => item.length > MAX_LIST_ITEM_LENGTH)) {
+    throw new ConfigValidationError('CHAOS_TARGETS', 'exceeds allowed size or item length');
+  }
+
+  return items;
 }
 
 function _parseAssets(value: string | undefined): string[] {
@@ -102,10 +214,16 @@ function _parseAssets(value: string | undefined): string[] {
     return ['USDC', 'XLM', 'BTC', 'ETH']; // Default assets
   }
 
-  return value
+  const items = value
     .split(',')
     .map((item) => item.trim().toUpperCase())
     .filter(Boolean);
+
+  if (items.length > MAX_LIST_ITEMS || items.some((item) => item.length > MAX_LIST_ITEM_LENGTH)) {
+    throw new ConfigValidationError('ALLOWED_ASSETS', 'exceeds allowed size or item length');
+  }
+
+  return items;
 }
 
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
@@ -114,7 +232,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
   const chaosProbability = clamp(toNumber(env.CHAOS_PROBABILITY, 0), 0, 1);
   const idempotencyTtlMs = clamp(toNumber(env.IDEMPOTENCY_TTL_MS, 3_600_000), 0, 7 * 24 * 60 * 60 * 1000);
 
-  return {
+  const config: AppConfig = {
     port,
     gracefulDegradationEnabled: parseBoolean(env.GRACEFUL_DEGRADATION_ENABLED, true),
     upstreamContractsUrl: (() => {
@@ -154,4 +272,6 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     allowedAssets: _parseAssets(env.ALLOWED_ASSETS),
     milestonesEnabled: parseBoolean(env.MILESTONES_ENABLED, true),
   };
+
+  return assertValidConfig(config);
 }

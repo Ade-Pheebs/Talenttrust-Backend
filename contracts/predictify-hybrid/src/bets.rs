@@ -282,6 +282,13 @@ pub fn place_bets(
         return Err(Error::BatchTooLarge);
     }
 
+    // Validate bet amounts.
+    for bet in bets.iter() {
+        if bet.amount <= 0 {
+            return Err(Error::InvalidBetAmount);
+        }
+    }
+
     // ------------------------------------------------------------------
     // Content validation (I5), completing before the first write (I4)
     // ------------------------------------------------------------------

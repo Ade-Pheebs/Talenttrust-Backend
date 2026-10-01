@@ -1,7 +1,7 @@
 import { z } from 'zod';
 import { isSafeUrl } from '../utils/ssrf';
 import { parseFinalityDepths } from '../finality/policy';
-import { isIP } from 'node:net';
+import { appConfigSchema } from '../appConfiguration';
 
 
 /**
@@ -10,6 +10,11 @@ import { isIP } from 'node:net';
  * This schema defines the structure and validation rules for all 
  * required and optional environment variables used by the application.
  * 
+ * Validation boundaries for `src/appConfiguration.ts` are enforced here:
+ * the `APP_CONFIG` variable is parsed through `appConfigSchema`, which
+ * defines the accepted shape, rejects unknown keys, and applies
+ * deterministic defaults for boundary/duplicate inputs.
+ *
  * @security
  *  - Do not log secret values in error messages.
  *  - Use transformations to sanitize inputs.
@@ -498,6 +503,41 @@ export const envSchema = z.object({
     .optional()
     .transform((val) => parseOptionalBool(val))
     .pipe(z.boolean().optional()),
+
+  /**
+   * APP_CONFIG — JSON-encoded application configuration for
+   * `src/appConfiguration.ts`. Parsed through `appConfigSchema` so that
+   * valid, invalid, duplicate, and boundary-case inputs are handled
+   * deterministically at the environment boundary. Invalid JSON or a
+   * schema violation fails validation with a safe, non-sensitive error.
+   */
+  APP_CONFIG: z.string()
+    .optional()
+    .transform((val, ctx) => {
+      if (val === undefined || val.trim() === '') return undefined;
+      let parsed: unknown;
+      try {
+        parsed = JSON.parse(val);
+      } catch {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          message: 'APP_CONFIG must be valid JSON',
+        });
+        return z.NEVER;
+      }
+      const result = appConfigSchema.safeParse(parsed);
+      if (!result.success) {
+        for (const issue of result.error.issues) {
+          ctx.addIssue({
+            code: z.ZodIssueCode.custom,
+            path: issue.path,
+            message: issue.message,
+          });
+        }
+        return z.NEVER;
+      }
+      return result.data;
+    }),
 
 }).superRefine((obj, ctx) => {
   const requireForEmailProvider = (field: keyof typeof obj, message: string): void => {

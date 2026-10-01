@@ -5,15 +5,15 @@
  * validation, default values, and descriptive error messages on failure.
  * Empty strings are treated as missing values.
  *
- * Compatibility contracts:
- * - The public signatures and return types of every exported function are
- *   stable. Callers must be able to upgrade without code changes.
- * - Missing/whitespace-only values are normalized to undefined for all
- *   readers, and values are trimmed before return.
- * - Errors are always thrown as `Error` with a message that names the
- *   offending key but never echoes secret values for sensitive keys.
- * - Parsing is deterministic for valid, invalid, duplicate, and boundary
- *   inputs.
+ * Validation boundaries:
+ * - Missing / empty / whitespace-only values are treated as undefined.
+ * - Values are trimmed before return, so surrounding whitespace is never
+ *   part of the returned value.
+ * - Integer parsing rejects non-numeric, non-finite, and non-integer input.
+ * - Boolean parsing accepts only true/1/false/0 (case-insensitive).
+ * - All failures throw Error with the variable name and the offending raw
+ *   value so failures are diagnosable without exposing secrets from other
+ *   variables.
  * @module
  */
 

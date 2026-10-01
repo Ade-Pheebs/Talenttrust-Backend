@@ -1,5 +1,5 @@
 import { Request, Response } from 'express';
-import { loadConfig, AppConfiguration } from '../appConfiguration';
+import { loadConfig, ConfigError, AppConfig, ConfigErrorCode } from '../appConfiguration';
 
 /**
  * Controller for exposing the application configuration.
@@ -17,10 +17,6 @@ export class ConfigController {
   /**
    * Returns the application configuration, specifically the allowed assets.
    *
-   * The handler is deterministic and idempotent: repeated or concurrent
-   * invocations return the same logical configuration and never expose a
-   * mutable reference to the underlying store.
-   *
    * @param req - Express request
    * @param res - Express response
    */
@@ -28,17 +24,29 @@ export class ConfigController {
     const requestId = req.headers['x-request-id'] ?? req.id ?? undefined;
 
     try {
-      const config = loadConfig() as unknown as AppConfiguration & Record<string, unknown>;
-      const allowedAssets = Array.isArray(config['allowedAssets'])
-        ? [...(config['allowedAssets'] as unknown[])]
-        : [];
-
-      return res.json({ allowedAssets });
-    } catch (error) {
-      console.error('Failed to load config:', {
-        requestId,
-        error: error instanceof Error ? error.message : String(error),
+      const config: AppConfig = loadConfig();
+      return res.json({
+        allowedAssets: config.allowedAssets,
       });
+    } catch (error) {
+      if (error instanceof ConfigError) {
+        // Log the code and context only; avoid logging potentially sensitive values.
+        console.error('Failed to load config:', {
+          code: error.code,
+          context: error.context,
+        });
+
+        const status = error.code === ConfigErrorCode.MISSING_ENV ? 503 : 500;
+        return res.status(status).json({
+          error: {
+            code: error.code,
+            message: error.message,
+          },
+        });
+      }
+
+      // Unknown failure: keep the public contract stable and avoid leaking internal details.
+      console.error('Failed to load config:', error);
       return res.status(500).json({
         error: {
           code: 'internal_error',

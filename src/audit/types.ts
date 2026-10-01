@@ -52,7 +52,7 @@ export const DEFAULT_EXPORT_PAGE_SIZE = 100;
  * runtime. The `TypeScript type {@link AuditAction} is derived from this array
  * so that the compile-time and runtime contracts cannot diverge.
  */
-export const AUDIT_ACTIONS = [
+export const AUDIT_ACTIONS = Object.freeze([
   'CONTRACT_CREATED',
   'CONTRACT_UPDATED',
   'CONTRACT_CANCELLED',
@@ -79,7 +79,7 @@ export const AUDIT_ACTIONS = [
   'MILESTONES_CREATED',
   'MILESTONES_UPDATED',
   'MILESTONES_DELETED',
-] as const;
+] as const);
 
 /** Categories of sensitive state changes that must be audited. */
 export type AuditAction = (typeof AUDIT_ACTIONS)[number];

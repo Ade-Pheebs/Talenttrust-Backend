@@ -163,12 +163,19 @@ function assertValidConfig(config: AppConfig): AppConfig {
 }
 
 function toNumber(value: string | undefined, fallback: number): number {
-  if (!value) {
+  if (!value?.trim()) {
     return fallback;
   }
 
   const parsed = Number(value);
   return Number.isFinite(parsed) ? parsed : fallback;
+}
+
+// Ports and attempt/count thresholds must not reach callers as fractions.
+// Keep the legacy fallback and inclusive clamp behavior for invalid numbers.
+function toInteger(value: string | undefined, fallback: number): number {
+  const parsed = toNumber(value, fallback);
+  return Number.isInteger(parsed) ? parsed : fallback;
 }
 
 function clamp(value: number, min: number, max: number): number {
@@ -184,12 +191,16 @@ function parseChaosMode(value: string | undefined): ChaosMode {
   return parsed.data;
 }
 
-function parseBoolean(value: string | undefined, fallback: boolean): boolean {
-  if (value === undefined) {
+function parseBoolean(value: string | undefined, fallback: boolean, key: string): boolean {
+  const normalized = value?.trim().toLowerCase();
+  if (!normalized) {
     return fallback;
   }
 
-  return value.toLowerCase() === 'true';
+  if (normalized === 'true' || normalized === '1') return true;
+  if (normalized === 'false' || normalized === '0') return false;
+  // A typo must not silently disable milestone validation or degradation.
+  throw new Error(`Invalid ${key}: expected true, false, 1, or 0`);
 }
 
 function parseTargets(value: string | undefined): string[] {
@@ -210,7 +221,7 @@ function parseTargets(value: string | undefined): string[] {
 }
 
 function _parseAssets(value: string | undefined): string[] {
-  if (!value) {
+  if (!value?.trim()) {
     return ['USDC', 'XLM', 'BTC', 'ETH']; // Default assets
   }
 
@@ -226,51 +237,61 @@ function _parseAssets(value: string | undefined): string[] {
   return items;
 }
 
+function loadUpstreamContractsUrl(env: NodeJS.ProcessEnv): string {
+  const url = env.UPSTREAM_CONTRACTS_URL ?? 'https://example.invalid/contracts';
+  try {
+    const protocol = new URL(url).protocol;
+    // Check the supplied environment without ever changing process.env. This
+    // keeps explicit config loads independent of global development bypasses.
+    if ((protocol === 'http:' || protocol === 'https:') && isSafeUrl(url, env)) {
+      return url;
+    }
+  } catch {
+    // URLs and even malformed policy values may contain credentials. Do not
+    // attach the underlying exception or echo either input in diagnostics.
+  }
+  throw new Error('Invalid UPSTREAM_CONTRACTS_URL: SSRF protection requires a permitted HTTP(S) URL');
+}
+
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
-  const port = clamp(toNumber(env.PORT, 3001), 1, 65535);
+  const port = clamp(toInteger(env.PORT, 3001), 1, 65535);
   const upstreamTimeoutMs = clamp(toNumber(env.UPSTREAM_TIMEOUT_MS, 1200), MIN_TIMEOUT_MS, MAX_TIMEOUT_MS);
   const chaosProbability = clamp(toNumber(env.CHAOS_PROBABILITY, 0), 0, 1);
   const idempotencyTtlMs = clamp(toNumber(env.IDEMPOTENCY_TTL_MS, 3_600_000), 0, 7 * 24 * 60 * 60 * 1000);
 
   const config: AppConfig = {
     port,
-    gracefulDegradationEnabled: parseBoolean(env.GRACEFUL_DEGRADATION_ENABLED, true),
-    upstreamContractsUrl: (() => {
-      const url = env.UPSTREAM_CONTRACTS_URL ?? 'https://example.invalid/contracts';
-      if (!isSafeUrl(url)) {
-        throw new Error(`Invalid UPSTREAM_CONTRACTS_URL: SSRF protection blocked access to internal resource "${url}"`);
-      }
-      return url;
-    })(),
+    gracefulDegradationEnabled: parseBoolean(env.GRACEFUL_DEGRADATION_ENABLED, true, 'GRACEFUL_DEGRADATION_ENABLED'),
+    upstreamContractsUrl: loadUpstreamContractsUrl(env),
     upstreamTimeoutMs,
     chaosMode: parseChaosMode(env.CHAOS_MODE),
     chaosTargets: parseTargets(env.CHAOS_TARGETS),
     chaosProbability,
     circuitBreaker: {
-      failureThreshold: clamp(toNumber(env.CB_FAILURE_THRESHOLD, 5), 1, 100),
-      successThreshold: clamp(toNumber(env.CB_SUCCESS_THRESHOLD, 1), 1, 20),
+      failureThreshold: clamp(toInteger(env.CB_FAILURE_THRESHOLD, 5), 1, 100),
+      successThreshold: clamp(toInteger(env.CB_SUCCESS_THRESHOLD, 1), 1, 20),
       timeoutMs: clamp(toNumber(env.CB_TIMEOUT_MS, 30_000), 1_000, 300_000),
     },
     webhookRetry: {
-      maxAttempts: clamp(toNumber(env.WEBHOOK_RETRY_MAX_ATTEMPTS, 5), 1, 20),
+      maxAttempts: clamp(toInteger(env.WEBHOOK_RETRY_MAX_ATTEMPTS, 5), 1, 20),
       initialDelayMs: clamp(toNumber(env.WEBHOOK_RETRY_INITIAL_DELAY_MS, 1_000), 100, 60_000),
       maxDelayMs: clamp(toNumber(env.WEBHOOK_RETRY_MAX_DELAY_MS, 30_000), 1_000, 600_000),
       multiplier: clamp(toNumber(env.WEBHOOK_RETRY_MULTIPLIER, 2), 1, 10),
       jitterFactor: clamp(toNumber(env.WEBHOOK_RETRY_JITTER_FACTOR, 0.1), 0, 1),
     },
     webhookCircuitBreaker: {
-      failureThreshold: clamp(toNumber(env.WEBHOOK_CB_FAILURE_THRESHOLD, 5), 1, 100),
-      successThreshold: clamp(toNumber(env.WEBHOOK_CB_SUCCESS_THRESHOLD, 1), 1, 20),
+      failureThreshold: clamp(toInteger(env.WEBHOOK_CB_FAILURE_THRESHOLD, 5), 1, 100),
+      successThreshold: clamp(toInteger(env.WEBHOOK_CB_SUCCESS_THRESHOLD, 1), 1, 20),
       timeoutMs: clamp(toNumber(env.WEBHOOK_CB_TIMEOUT_MS, 60_000), 1_000, 300_000),
     },
     healthProbes: {
-      queueFailedThreshold: clamp(toNumber(env.QUEUE_FAILED_THRESHOLD, 10), 0, 10_000),
-      queueBacklogThreshold: clamp(toNumber(env.QUEUE_BACKLOG_THRESHOLD, 100), 0, 1_000_000),
+      queueFailedThreshold: clamp(toInteger(env.QUEUE_FAILED_THRESHOLD, 10), 0, 10_000),
+      queueBacklogThreshold: clamp(toInteger(env.QUEUE_BACKLOG_THRESHOLD, 100), 0, 1_000_000),
       queueProbeTimeoutMs: clamp(toNumber(env.QUEUE_PROBE_TIMEOUT_MS, 3_000), 100, 30_000),
     },
     idempotencyTtlMs,
     allowedAssets: _parseAssets(env.ALLOWED_ASSETS),
-    milestonesEnabled: parseBoolean(env.MILESTONES_ENABLED, true),
+    milestonesEnabled: parseBoolean(env.MILESTONES_ENABLED, true, 'MILESTONES_ENABLED'),
   };
 
   return assertValidConfig(config);

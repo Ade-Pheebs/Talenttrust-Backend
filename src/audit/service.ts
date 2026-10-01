@@ -16,7 +16,7 @@
 
 import type { AuditEntry, AuditQuery, AuditSeverity, CreateAuditEntryInput, IntegrityReport, AuditQueryResult } from './types';
 import type { AuditAction } from './types';
-import { decodeCursor } from './types';
+import { decodeCursor, AUDIT_ACTIONS } from './types';
 import { createDefaultAuditRepository, type AuditLogRepository } from './repository';
 import { auditExportService, AuditExportService, type AuditExportFilters, type AuditExportResult } from './exportService';
 import { AuditCache, type AuditCacheOptions } from './auditCache';
@@ -26,17 +26,14 @@ export interface AuditServiceOptions {
   cache?: AuditCacheOptions;
 }
 
-export const VALID_ACTIONS = new Set<AuditAction>([
-  'CONTRACT_CREATED', 'CONTRACT_UPDATED', 'CONTRACT_CANCELLED', 'CONTRACT_COMPLETED',
-  'PAYMENT_INITIATED', 'PAYMENT_RELEASED', 'PAYMENT_DISPUTED',
-  'REPUTATION_UPDATED',
-  'REPUTATION_CORRECTED',
-  'USER_CREATED', 'USER_UPDATED', 'USER_DELETED',
-  'AUTH_LOGIN', 'AUTH_LOGOUT', 'AUTH_FAILED',
-  'AUTH_LOCKOUT_TRIGGERED', 'AUTH_LOCKOUT_RELEASED',
-  'ADMIN_ACTION',
-  'ENDPOINT_ACCESS', 'ENDPOINT_MUTATION',
-]);
+/**
+ * The set of actions the legacy string-based query parser accepts.
+ *
+ * Derived from {@link AUDIT_ACTIONS} (the audit module's single source of
+ * truth) so it can never drift from the type system, the HTTP schema
+ * validators, or the non-HTTP input validator.
+ */
+export const VALID_ACTIONS = new Set<AuditAction>(AUDIT_ACTIONS);
 
 export const VALID_SEVERITIES = new Set<AuditSeverity>(['INFO', 'WARNING', 'CRITICAL']);
 
@@ -165,11 +162,48 @@ export class AuditService {
   /**
    * Records an audit event.
    *
-   * @param input - Event details. metadata must be pre-sanitised.
+   * Validation runs before any repository interaction — the same invalid input
+   * always throws `AuditValidationError` (HTTP 400, code `"validation_error"`)
+   * and is never passed to the repository. This is a permanent failure; do not
+   * retry on `AuditValidationError`.
+   *
+   * Repository write failures (I/O, lock contention, etc.) are transient and
+   * are re-thrown so the caller can decide whether to retry via `withRetry`.
+   *
+   * Validation failures are logged at `warn` level with field-level context but
+   * without exposing field values (no PII in log records). Write failures are
+   * logged at `error` level.
+   *
+   * @param input - Event details. metadata must be pre-sanitised (no raw PII).
    * @returns The persisted, immutable AuditEntry.
-   * @throws Only when options.strict is true and the store throws.
+   * @throws {AuditValidationError} When input fails validation (permanent, HTTP 400).
+   * @throws {Error} When the repository write fails (transient, should be retried by caller).
    */
   log(input: CreateAuditEntryInput): AuditEntry {
+    const log = createLogger({ service: 'audit-service' });
+
+    // ── Step 1: Validate input deterministically ──────────────────────────
+    // Same input always produces the same result. No I/O involved.
+    // AuditValidationError is a permanent failure — do not retry.
+    let validated: CreateAuditEntryInput;
+    try {
+      validated = validateAuditInput(input);
+    } catch (err) {
+      if (err instanceof AuditValidationError) {
+        // Emit a warn with structural context only — never log field values.
+        log.warn('Audit input validation failed', {
+          issueCount: err.issues.length,
+          fields: err.issues.map((i) => i.field),
+        });
+        throw err;
+      }
+      // Unexpected error from the validator itself — escalate.
+      log.error('Unexpected error during audit input validation', { err: err as Error });
+      throw err;
+    }
+
+    // ── Step 2: Persist the validated entry ───────────────────────────────
+    // Repository failures are transient — re-throw so callers can retry.
     try {
       const entry = this.repository.append(input);
       
@@ -180,7 +214,7 @@ export class AuditService {
       
       return entry;
     } catch (err) {
-      console.error('[AuditService] Failed to persist audit entry:', err);
+      log.error('[AuditService] Failed to persist audit entry', { err: err as Error });
       throw err;
     }
   }

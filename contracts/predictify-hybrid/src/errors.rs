@@ -1,7 +1,7 @@
-use soroban_sdk::contracterror;
+use soroban_contract::contracterror;
 
 /// Contract-level error codes returned as `Err(Error::*)`.
-///
+//
 /// All variants map to a stable `u32` discriminant that clients can
 /// pattern-match on after invoking the contract.  **Do not renumber
 /// existing variants** — that would break on-chain consumers.
@@ -19,7 +19,7 @@ use soroban_sdk::contracterror;
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum Error {
     /// The supplied `idempotency_key` was already used in a previous
-    /// `place_bets` call that completed successfully.  The original batch
+**/ `place_bets` call that completed successfully.  The original batch
     /// has already been applied; the caller should not retry with the same
     /// token.  Generate a fresh `BytesN<32>` for a new batch.
     IdempotentBatchAlreadyApplied = 1,

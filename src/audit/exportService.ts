@@ -44,6 +44,18 @@ export interface AuditExportServiceOptions {
 }
 
 /**
+ * Maximum number of records that may be requested in a single export.
+ * Prevents unbounded exports from exhausting disk or memory.
+ */
+export const MAX_EXPORT_LIMIT = 100_000;
+
+/**
+ * Maximum length of a free-form filter string (actor, resource, resourceId).
+ * Prevents pathological inputs from reaching the repository layer.
+ */
+export const MAX_FILTER_STRING_LENGTH = 256;
+
+/**
  * Filters that may be applied to an export request.
  * All fields are optional; omitting them includes all records.
  */
@@ -64,6 +76,143 @@ export interface AuditExportFilters {
   resourceId?: string;
   /** Cap the number of exported records. Omitting it exports every match. */
   limit?: number;
+}
+
+/**
+ * Thrown when an export request fails validation. Callers can rely on this
+ * being a distinct, non-retryable error class so that HTTP layers can map
+ * it to a 400 response without leaking internal details.
+ */
+export class AuditExportValidationError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'AuditExportValidationError';
+  }
+}
+
+const ISO_8601_RE =
+  /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,9})?(?:Z|[+-]\d{2}:\d{2})$/;
+
+/**
+ * Parses and validates an ISO-8601 timestamp. Returns the epoch millis on
+ * success, or `null` when the value is not a valid ISO-8601 instant.
+ */
+function parseIsoTimestamp(value: string): number | null {
+  if (!ISO_8601_RE.test(value)) return null;
+  const ms = Date.parse(value);
+  return Number.isFinite(ms) ? ms : null;
+}
+
+/**
+ * Validates and normalises export filters. Enforces:
+ *  - `from`/`to` are valid ISO-8601 instants and `from <= to`;
+ *  - `limit` is a positive safe integer within {@link MAX_EXPORT_LIMIT};
+ *  - free-form string filters are non-empty and within length bounds;
+ *  - unknown filter keys are rejected to avoid silent typos.
+ *
+ * Returns a frozen copy of the validated filters so downstream code cannot
+ * mutate the caller's object mid-export.
+ */
+export function validateExportFilters(
+  filters: AuditExportFilters = {},
+): Readonly<AuditExportFilters> {
+  if (filters === null || typeof filters !== 'object' || Array.isArray(filters)) {
+    throw new AuditExportValidationError('Export filters must be a plain object');
+  }
+
+  const allowedKeys: ReadonlyArray<keyof AuditExportFilters> = [
+    'from',
+    'to',
+    'action',
+    'severity',
+    'actor',
+    'resource',
+    'resourceId',
+    'limit',
+  ];
+  for (const key of Object.keys(filters)) {
+    if (!(allowedKeys as ReadonlyArray<string>).includes(key)) {
+      throw new AuditExportValidationError(`Unknown export filter: ${key}`);
+    }
+  }
+
+  const normalised: AuditExportFilters = {};
+
+  if (filters.from !== undefined) {
+    if (typeof filters.from !== 'string' || parseIsoTimestamp(filters.from) === null) {
+      throw new AuditExportValidationError('`from` must be a valid ISO-8601 timestamp');
+    }
+    normalised.from = filters.from;
+  }
+
+  if (filters.to !== undefined) {
+    if (typeof filters.to !== 'string' || parseIsoTimestamp(filters.to) === null) {
+      throw new AuditExportValidationError('`to` must be a valid ISO-8601 timestamp');
+    }
+    normalised.to = filters.to;
+  }
+
+  if (normalised.from !== undefined && normalised.to !== undefined) {
+    const fromMs = parseIsoTimestamp(normalised.from) as number;
+    const toMs = parseIsoTimestamp(normalised.to) as number;
+    if (fromMs > toMs) {
+      throw new AuditExportValidationError('`from` must be less than or equal to `to`');
+    }
+  }
+
+  if (filters.limit !== undefined) {
+    if (
+      typeof filters.limit !== 'number' ||
+      !Number.isSafeInteger(filters.limit) ||
+      filters.limit <= 0
+    ) {
+      throw new AuditExportValidationError('`limit` must be a positive safe integer');
+    }
+    if (filters.limit > MAX_EXPORT_LIMIT) {
+      throw new AuditExportValidationError(
+        `\`limit\` must not exceed ${MAX_EXPORT_LIMIT}`,
+      );
+    }
+    normalised.limit = filters.limit;
+  }
+
+  const stringFilters: ReadonlyArray<'actor' | 'resource' | 'resourceId'> = [
+    'actor',
+    'resource',
+    'resourceId',
+  ];
+  for (const key of stringFilters) {
+    const value = filters[key];
+    if (value === undefined) continue;
+    if (typeof value !== 'string') {
+      throw new AuditExportValidationError(`\`${key}\` must be a string`);
+    }
+    if (value.length === 0) {
+      throw new AuditExportValidationError(`\`${key}\` must not be empty`);
+    }
+    if (value.length > MAX_FILTER_STRING_LENGTH) {
+      throw new AuditExportValidationError(
+        `\`${key}\` must not exceed ${MAX_FILTER_STRING_LENGTH} characters`,
+      );
+    }
+    normalised[key] = value;
+  }
+
+  if (filters.action !== undefined) {
+    if (typeof filters.action !== 'string' || filters.action.length === 0) {
+      throw new AuditExportValidationError('`action` must be a non-empty string');
+    }
+    normalised.action = filters.action;
+  }
+
+  if (filters.severity !== undefined) {
+    if (typeof filters.severity !== 'string' || filters.severity.length === 0) {
+      throw new AuditExportValidationError('`severity` must be a non-empty string');
+    }
+    normalised.severity = filters.severity;
+  }
+
+  return Object.freeze(normalised);
 }
 
 /** Ordered CSV column headers for the audit export. */

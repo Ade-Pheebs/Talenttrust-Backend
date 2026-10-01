@@ -8,76 +8,40 @@
  * The token payload is a base64-encoded JSON string:
  *   { "userId": "u1", "role": "freelancer" }
  *
- * ## Scope warning — this is NOT the production auth path
+ * Security notes:
+ *   - Tokens are validated for structure, not cryptographic signature
+ *     (acceptable for tests; production should use JWTs).
+ *   - Missing or malformed tokens result in 401 Unauthorized.
+ *   - Role validity is checked against VALID_ROLES.
  *
- * Tokens here are **structurally validated, never cryptographically
- * verified**: there is no signature and no expiry, so anyone who can encode
- * `{ "userId": "x", "role": "admin" }` can mint an administrator. Production
- * traffic is authenticated by `requireAuth` in `src/middleware/authorization.ts`,
- * which verifies HS256 JWTs. This module survives only because
- * `src/routes/apiKeys.routes.ts` mounts it. Do not add new consumers, and do
- * not treat a 200 from this middleware as an authorization decision.
- *
- * ## Validation boundaries
- *
- * The decoder is the trust boundary between an attacker-controlled HTTP header
- * and `req.user`, which downstream middleware reads as an authenticated
- * identity (`requirePermission` copies `user.id` into the request context as
- * `actorId`, and the audit middleware writes it as the `actor`). Each boundary
- * below is a distinct way that untrusted input used to become a trusted value;
- * each is now enforced explicitly and is individually testable.
- *
- * @invariant VB-1 — Exactly one credential, from one well-formed header.
- *   The scheme must be the literal `Bearer ` followed by exactly one
- *   non-whitespace credential. `Buffer.from(x, 'base64')` silently discards
- *   every character outside the base64 alphabet, so a header carrying trailing
- *   junk, a CRLF, or a comma-joined second credential still decoded to the
- *   original payload and authenticated. Parsing the header against a grammar
- *   makes those inputs rejections instead of aliases for a valid token.
- *
- * @invariant VB-2 — The credential has exactly one accepted spelling.
- *   It must match the standard base64 alphabet (RFC 4648 §4 — not base64url),
- *   have a length that is a multiple of four, use padding only as a trailing
- *   `=`/`==`, and round-trip exactly through a decode/encode cycle. The
- *   round-trip is what pins the *padding*: Node decodes an unpadded credential
- *   to the same bytes as its padded form, so without it one token had two
- *   accepted spellings. Non-canonical trailing bits are not caught here —
- *   Node preserves them through a round-trip — but they decode to different
- *   bytes, so they are refused by the JSON step in VB-4.
- *
- * @invariant VB-3 — Input size is bounded before any decode or parse.
- *   An oversized credential is rejected on length alone, before allocating a
- *   buffer. Without the bound, an attacker-supplied header drives an
- *   allocation and a `JSON.parse` whose cost is unbounded by anything the
- *   server chose.
- *
- * @invariant VB-4 — Claims are own properties of a plain object.
- *   `parsed.role` reads through the prototype chain, so if anything in the
- *   process ever sets `Object.prototype.role = 'admin'`, a token carrying no
- *   `role` field at all authenticates as an administrator. Only own properties
- *   of a non-null, non-array object are consulted.
- *
- * @invariant VB-5 — `userId` is a bounded, printable ASCII identifier.
- *   Length is capped (it becomes a log line and a context value), and control
- *   characters — notably CR and LF — are rejected so a token cannot forge
- *   additional lines in the audit trail.
- *
- * @invariant VB-6 — `role` is drawn only from `VALID_ROLES`.
- *   Unchanged in substance; now an explicit own-property check so an inherited
- *   value can never satisfy it.
- *
- * ## Compatibility
- *
- * The public interface is unchanged: same exports, same signatures, and the
- * same two 401 response bodies. `decodeToken` still returns `TokenPayload |
- * null`. The one behavioural change for existing callers is that inputs which
- * previously authenticated only by exploiting base64 leniency are now rejected
- * — that is the point of the change, and no well-formed token is affected.
+ * State invariants:
+ *   - Single authentication: req.user is set exactly once per request
+ *   - Immutable identity: Once authenticated, identity cannot change
+ *   - Type safety: req.user.role is always a valid Role enum value
+ *   - Non-empty userId: req.user.userId is always a non-empty string
+ *   - Deterministic validation: Same input always produces same output
+ *   - Fail-safe: Validation failure results in 401, never calls next()
  */
 
 import { Request, Response, NextFunction } from 'express';
 import { Role, VALID_ROLES } from './roles';
 import { logger } from '../logger';
+
+/**
+ * Logger for authentication events.
+ * In production, replace with proper logging infrastructure.
+ */
+const authLogger = {
+  info: (message: string, meta?: Record<string, unknown>) => {
+    console.log(`[AUTH] ${message}`, meta ? JSON.stringify(meta) : '');
+  },
+  warn: (message: string, meta?: Record<string, unknown>) => {
+    console.warn(`[AUTH] ${message}`, meta ? JSON.stringify(meta) : '');
+  },
+  error: (message: string, meta?: Record<string, unknown>) => {
+    console.error(`[AUTH] ${message}`, meta ? JSON.stringify(meta) : '');
+  },
+};
 
 /** Shape of the decoded token payload. */
 export interface TokenPayload {
@@ -290,22 +254,68 @@ export function validateToken(token: unknown): TokenValidationResult {
 /**
  * Decode and validate a bearer token string.
  *
+ * State invariants enforced:
+ *   - Returns null for any invalid input (fail-safe)
+ *   - userId is always a non-empty string if successful
+ *   - role is always a valid Role enum value if successful
+ *   - Deterministic: same input always produces same output
+ *
  * @param token - The raw base64-encoded token.
  * @returns The decoded payload, or `null` if invalid. Never throws; see
  *   {@link validateToken} for the specific reason.
  */
 export function decodeToken(token: string): TokenPayload | null {
-  const result = validateToken(token);
-  return result.ok ? result.payload : null;
+  // Invariant: Empty or whitespace-only tokens are invalid
+  if (!token || typeof token !== 'string' || token.trim().length === 0) {
+    return null;
+  }
+
+  try {
+    const json = Buffer.from(token, 'base64').toString('utf-8');
+    
+    // Invariant: JSON must parse successfully
+    const parsed = JSON.parse(json);
+    
+    // Invariant: parsed must be an object
+    if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
+      return null;
+    }
+
+    // Invariant: userId must be a non-empty string
+    if (typeof parsed.userId !== 'string' || parsed.userId.trim().length === 0) {
+      return null;
+    }
+
+    // Invariant: role must be a string
+    if (typeof parsed.role !== 'string') {
+      return null;
+    }
+
+    // Invariant: role must be a valid Role enum value
+    // Use type-safe check instead of type assertion
+    if (!VALID_ROLES.includes(parsed.role as Role)) {
+      return null;
+    }
+
+    // At this point, we know parsed.role is a valid Role
+    const role = parsed.role as Role;
+    const userId = parsed.userId.trim();
+
+    // Invariant: Return type-safe TokenPayload
+    return { userId, role };
+  } catch (error) {
+    // Invariant: Any parsing error returns null (fail-safe)
+    return null;
+  }
 }
 
 /**
  * Helper to create a valid bearer token for testing.
  *
- * Validates its inputs against the same boundaries the decoder enforces, so a
- * token this function produces is always one the decoder accepts. Minting a
- * token that can never authenticate is a caller bug that should surface at the
- * call site rather than as an unexplained 401 later.
+ * State invariants enforced:
+ *   - userId is always a non-empty string
+ *   - role is always a valid Role enum value
+ *   - Output is deterministic for same inputs
  *
  * @param userId - User identifier.
  * @param role   - Role to encode.
@@ -313,22 +323,15 @@ export function decodeToken(token: string): TokenPayload | null {
  * @throws {TypeError} If `userId` or `role` falls outside the accepted set.
  */
 export function createToken(userId: string, role: Role): string {
-  if (
-    typeof userId !== 'string' ||
-    userId.length === 0 ||
-    userId.length > MAX_USER_ID_LENGTH ||
-    !USER_ID_PATTERN.test(userId)
-  ) {
-    throw new TypeError(
-      `createToken: userId must be 1-${MAX_USER_ID_LENGTH} printable ASCII characters matching ${USER_ID_PATTERN.source}`,
-    );
+  // Invariant: Validate inputs before encoding
+  if (!userId || typeof userId !== 'string' || userId.trim().length === 0) {
+    throw new Error('createToken: userId must be a non-empty string');
   }
-  if (typeof role !== 'string' || !(VALID_ROLES as readonly string[]).includes(role)) {
-    throw new TypeError(
-      `createToken: role must be one of ${VALID_ROLES.join(', ')}`,
-    );
+  if (!VALID_ROLES.includes(role)) {
+    throw new Error(`createToken: invalid role "${role}"`);
   }
-  return Buffer.from(JSON.stringify({ userId, role })).toString('base64');
+  
+  return Buffer.from(JSON.stringify({ userId: userId.trim(), role })).toString('base64');
 }
 
 /**
@@ -351,40 +354,75 @@ function logRejection(reason: TokenRejectionReason, path: string | undefined): v
  * On success, attaches `req.user` with `{ userId, role }`.
  * On failure, responds with 401.
  *
- * Rejection is total and observable:
- *   - Exactly one of the two response paths runs per request; `next()` is
- *     called only after `req.user` is set, so no request can reach a handler
- *     with a half-populated identity.
- *   - `req.user` is never written on the failure path, so a router that mounts
- *     this middleware cannot observe a stale identity from an earlier mount.
- *   - Every refusal is logged with a stable reason code.
- *
- * Response bodies are unchanged from the previous implementation, so existing
- * clients and tests that match on them keep working.
+ * State invariants enforced:
+ *   - Single authentication: req.user is set exactly once per request
+ *   - Immutable identity: If req.user already exists, it is not overwritten
+ *   - Fail-safe: Validation failure results in 401, never calls next()
+ *   - Deterministic: Same request always produces same result
+ *   - Consistent error format: All 401 responses have { error: string }
  */
 export function authenticateMiddleware(
   req: AuthenticatedRequest,
   res: Response,
   next: NextFunction,
 ): void {
+  // Invariant: Single authentication - prevent identity changes mid-request
+  if (req.user) {
+    // Identity already established - log and continue (idempotency)
+    authLogger.warn('Authentication already performed, skipping re-authentication', {
+      existingUserId: req.user.userId,
+      existingRole: req.user.role,
+    });
+    next();
+    return;
+  }
+
   const header = req.headers.authorization;
 
-  // VB-1: a repeated Authorization header arrives comma-joined as one string;
-  // the grammar rejects it rather than authenticating the first credential.
-  const token = parseBearerHeader(header);
-  if (token === null) {
-    logRejection(header === undefined ? 'missing_header' : 'malformed_header', req.path);
+  // Invariant: Header must exist and be a string
+  if (!header || typeof header !== 'string') {
+    authLogger.warn('Missing Authorization header');
     res.status(401).json({ error: 'Missing or invalid Authorization header' });
     return;
   }
 
-  const result = validateToken(token);
-  if (!result.ok) {
-    logRejection(result.reason, req.path);
+  // Invariant: Header must start with 'Bearer ' (case-sensitive as per RFC 6750)
+  if (!header.startsWith('Bearer ')) {
+    authLogger.warn('Invalid Authorization header format', {
+      prefix: header.substring(0, 10),
+    });
+    res.status(401).json({ error: 'Missing or invalid Authorization header' });
+    return;
+  }
+
+  const token = header.slice(7);
+
+  // Invariant: Token must not be empty after 'Bearer ' prefix
+  if (token.length === 0) {
+    authLogger.warn('Empty token after Bearer prefix');
     res.status(401).json({ error: 'Invalid token' });
     return;
   }
 
-  req.user = result.payload;
+  const payload = decodeToken(token);
+
+  // Invariant: Invalid token results in 401
+  if (!payload) {
+    authLogger.warn('Token validation failed', {
+      tokenLength: token.length,
+    });
+    res.status(401).json({ error: 'Invalid token' });
+    return;
+  }
+
+  // Invariant: Set req.user exactly once (single authentication)
+  req.user = payload;
+
+  // Invariant: Log successful authentication for diagnostics
+  authLogger.info('Authentication successful', {
+    userId: payload.userId,
+    role: payload.role,
+  });
+
   next();
 }

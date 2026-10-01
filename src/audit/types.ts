@@ -106,6 +106,7 @@ export function isAuditAction(value: unknown): value is AuditAction {
   return typeof value === 'string' && AUDIT_ACTION_SET.has(value);
 }
 
+/** Severity levels used in the audit log. */
 export const AUDIT_SEVERITIES = ['INFO', 'WARNING', 'CRITICAL'] as const;
 
 /** Array of all valid AuditAction values for validation. */

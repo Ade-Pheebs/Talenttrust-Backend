@@ -49,9 +49,11 @@ import compression from 'compression';
 import { createHash } from 'crypto';
 import { auditService, AuditService } from './service';
 import { auditExportService, AuditExportService, type AuditExportFilters, type AuditExportResult } from './exportService';
-import { createAuditEntryBodySchema } from './schemas';
+import type { AuditQuery } from './types';
+import { buildAuditQuerySchema, type AuditQueryParams } from './schemas';
 import { mapZodErrorToDetails, type ValidationErrorResponse } from '../middleware/validate.middleware';
 import { idempotencyMiddleware } from '../middleware/idempotency';
+import { validateCreateAuditEntryInput, type AuditValidationIssue } from './inputValidation';
 import { validateRequest } from '../middleware/validate.middleware';
 import { toAuditEntryResponseDto } from './dto/audit.dto';
 import { validateAuditQuery, validateAuditEntryBody, validateAuditBulkBody } from './dto/audit.dto';
@@ -95,6 +97,24 @@ function buildValidationErrorResponse(requestId: string, correlationId: string |
       code: 'validation_error',
       message: 'Request validation failed',
       requestId,
+      details: mapZodErrorToDetails(error).map((detail) => ({
+        ...detail,
+        field: detail.path.join('.') || '(root)',
+      })),
+    },
+  };
+}
+
+function buildValidationIssuesResponse(
+  requestId: string,
+  issues: AuditValidationIssue[],
+): ValidationErrorResponse {
+  return {
+    error: {
+      code: 'validation_error',
+      message: 'Request validation failed',
+      requestId,
+      details: issues.map(({ path, field, message, code }) => ({ path, field, message, code })),
       ...(correlationId !== undefined && { correlationId }),
       details: mapZodErrorToDetails(error),
     },
@@ -273,16 +293,16 @@ export function createAuditRouter(options: AuditRouterOptions = {}): Router {
     ...accessMiddleware,
     (req: Request, res: Response): void => {
       try {
-        const dtoResult = validateAuditEntryBody(req.body);
-        if (!dtoResult.success) {
-          const requestId = getRequestIdFromUtils(res);
-          const correlationId = getCorrelationId(res);
-          res.status(400).json(buildValidationErrorResponse(requestId, correlationId, dtoResult.error));
+        const validationResult = validateCreateAuditEntryInput(req.body);
+
+        if (!validationResult.ok) {
+          res.status(400).json(
+            buildValidationIssuesResponse(getRequestId(res), validationResult.issues),
+          );
           return;
         }
 
-        const parseResult = createAuditEntryBodySchema.safeParse(req.body);
-
+        const entry = service.log(validationResult.data);
         if (!parseResult.success) {
           const requestId = getRequestIdFromUtils(res);
           const correlationId = getCorrelationId(res);

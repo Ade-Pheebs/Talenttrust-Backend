@@ -48,6 +48,9 @@
  */
 
 import { z } from 'zod';
+import { AUDIT_ACTIONS, AUDIT_SEVERITIES, decodeCursor } from './types';
+
+export { AUDIT_ACTIONS, AUDIT_SEVERITIES };
 import { decodeCursor } from './types';
 import { AUDIT_ACTIONS, AUDIT_SEVERITIES } from './types';
 import {
@@ -95,32 +98,18 @@ export const AUDIT_METADATA_VALUE_MAX_LENGTH = 4096;
  * rather than rejected — a deliberate behaviour preserved from the previous
  * implementation to keep existing callers compatible.
  */
-const metadataSchema = z
-  .record(z.unknown())
-  .refine((value) => Object.keys(value).length <= MAX_METADATA_KEYS, {
-    message: `metadata must contain at most ${MAX_METADATA_KEYS} keys`,
+export const createAuditEntryBodySchema = z
+  .object({
+    action: auditActionSchema,
+    severity: auditSeveritySchema,
+    actor: z.string().min(1, 'actor must not be empty'),
+    resource: z.string().min(1, 'resource must not be empty'),
+    resourceId: z.string().min(1, 'resourceId must not be empty'),
+    metadata: z.record(z.unknown()).optional().default({}),
+    ipAddress: z.string().min(1).optional(),
+    correlationId: z.string().min(1).optional(),
   })
-  .refine(
-    (value) => {
-      try {
-        return JSON.stringify(value).length <= MAX_METADATA_BYTES;
-      } catch {
-        return false;
-      }
-    },
-    { message: `metadata must serialize to at most ${MAX_METADATA_BYTES} characters` },
-  );
-
-export const createAuditEntryBodySchema = z.object({
-  action: auditActionSchema,
-  severity: auditSeveritySchema,
-  actor: z.string().min(1, 'actor must not be empty').max(AUDIT_FIELD_MAX_LENGTH, `actor must be at most ${AUDIT_FIELD_MAX_LENGTH} characters`),
-  resource: z.string().min(1, 'resource must not be empty').max(AUDIT_FIELD_MAX_LENGTH, `resource must be at most ${AUDIT_FIELD_MAX_LENGTH} characters`),
-  resourceId: z.string().min(1, 'resourceId must not be empty').max(AUDIT_FIELD_MAX_LENGTH, `resourceId must be at most ${AUDIT_FIELD_MAX_LENGTH} characters`),
-  metadata: boundedMetadataSchema.optional().default({}),
-  ipAddress: z.string().min(1).max(AUDIT_FIELD_MAX_LENGTH, `ipAddress must be at most ${AUDIT_FIELD_MAX_LENGTH} characters`).optional(),
-  correlationId: z.string().min(1).max(AUDIT_FIELD_MAX_LENGTH, `correlationId must be at most ${AUDIT_FIELD_MAX_LENGTH} characters`).optional(),
-});
+  .strict();
 
 export type CreateAuditEntryBody = z.infer<typeof createAuditEntryBodySchema>;
 

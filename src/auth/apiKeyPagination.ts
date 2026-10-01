@@ -1,3 +1,22 @@
+/**
+ * @module auth/apiKeyPagination
+ * @description Signed, opaque cursor pagination for the API-keys listing.
+ *
+ * Invariants (preserved across errors, empty data, and upgrades):
+ * - Ordering is deterministic and newest-first: `createdAt` DESC, then `id` DESC.
+ *   The tie-break keeps cursors stable when several keys share a timestamp.
+ * - Cursors are opaque, versioned, HMAC-signed, and bounded in length. A
+ *   malformed, tampered, or oversized cursor is rejected with
+ *   {@link InvalidApiKeyCursorError} rather than yielding a partial page.
+ * - Pagination is idempotent: replaying the same cursor returns the same page,
+ *   so retries cannot skip or duplicate records.
+ * - Page size is bounded to [1, {@link API_KEYS_MAX_PAGE_SIZE}]; missing or
+ *   invalid values fall back to {@link API_KEYS_DEFAULT_PAGE_SIZE}. Numeric and
+ *   string inputs are parsed identically.
+ * - `paginateApiKeys` never mutates the caller-supplied array.
+ * - A `null` `nextCursor` means there are no more items.
+ */
+
 import { createHmac, timingSafeEqual } from 'node:crypto';
 
 export const API_KEYS_DEFAULT_PAGE_SIZE = 20;
@@ -140,12 +159,27 @@ export function decodeApiKeyCursor(cursor: string): ApiKeyCursorPosition {
   }
 }
 
+/**
+ * Parse a raw `limit` value into a bounded page size.
+ *
+ * Accepts both query-string values (e.g. `"50"`) and already-parsed numbers
+ * (e.g. `50`) so callers that coerce `req.query` first remain compatible.
+ * Missing, non-numeric, non-integer, or non-positive values fall back to
+ * {@link API_KEYS_DEFAULT_PAGE_SIZE}; larger values are clamped to
+ * {@link API_KEYS_MAX_PAGE_SIZE}. Never throws.
+ */
 export function parseApiKeyPageSize(value: unknown): number {
   if (value === undefined || value === null || value === '') {
     return API_KEYS_DEFAULT_PAGE_SIZE;
   }
 
-  const parsed = typeof value === 'string' ? Number(value) : NaN;
+  const parsed =
+    typeof value === 'number'
+      ? value
+      : typeof value === 'string'
+        ? Number(value)
+        : Number.NaN;
+
   if (!Number.isInteger(parsed) || parsed <= 0) {
     return API_KEYS_DEFAULT_PAGE_SIZE;
   }

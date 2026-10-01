@@ -65,6 +65,66 @@ export interface CacheConfig {
 }
 
 /**
+ * Deterministic failure-recovery policy for cache configuration.
+ *
+ * Invariants:
+ *  - `loadCacheConfig` MUST be a pure function of `env`; repeated calls with the
+ *    same input return structurally-equal output. No hidden mutable state.
+ *  - Invalid or out-of-range values MUST NOT throw. They fall back to the
+ *    documented default so that a bad env var cannot take down the process or
+ *    silently disable caching.
+ *  - Warnings are emitted at most once per distinct (variable, value) pair per
+ *    process to avoid log flooding under retry storms.
+ */
+const DEFAULT_CONTRACTS_TTL_MS = 30_000;
+const DEFAULT_CONTRACTS_MAX_ENTRIES = 1000;
+const MIN_CONTRACTS_TTL_MS = 1000;
+const MIN_CONTRACTS_MAX_ENTRIES = 10;
+
+const warnedKeys = new Set<string>();
+
+function warnOnce(key: string, message: string): void {
+  if (warnedKeys.has(key)) return;
+  warnedKeys.add(key);
+  console.warn(message);
+}
+
+/**
+ * Parses an integer env var with deterministic fallback semantics.
+ *
+ * Returns `fallback` when the variable is unset, empty, non-numeric, or
+ * non-finite. Never throws.
+ */
+function parseBoundedIntEnv(
+  name: string,
+  fallback: number,
+  min: number,
+  env: NodeJS.ProcessEnv,
+): number {
+  const raw = env[name];
+  if (raw === undefined || raw === '') return fallback;
+
+  const parsed = parseIntEnv(name, fallback, env);
+  if (!Number.isFinite(parsed) || !Number.isInteger(parsed)) {
+    warnOnce(
+      `invalid:${name}:${raw}`,
+      `[cache] ${name} is not a valid integer ("${raw}"), using default ${fallback}`,
+    );
+    return fallback;
+  }
+
+  if (parsed < min) {
+    warnOnce(
+      `below-min:${name}:${parsed}`,
+      `[cache] ${name} is below minimum (${parsed} < ${min}), using default ${fallback}`,
+    );
+    return fallback;
+  }
+
+  return parsed;
+}
+
+/**
  * Loads cache configuration from environment variables.
  *
  * ## Invariants

@@ -25,6 +25,15 @@
  * - `"UNKNOWN_FIELDS"`   — request body contains unexpected keys
  * - `"OUT_OF_RANGE"`     — a value exceeds the allowed length / count bound
  * - `"INVALID_DATE"`     — `expiresAt` is not a valid ISO-8601 date
+ *
+ * ## State invariants
+ *
+ * - Ownership: only the creator (`created_by === req.user.userId`) may read,
+ *   rotate, or deactivate a key. Checked before any mutation.
+ * - Rotation/deactivation are idempotent-safe: a key that is already inactive
+ *   cannot be rotated or deactivated again; the controller returns 409.
+ * - The plaintext key is returned exactly once (create/rotate) and never
+ *   persisted in responses for list/get.
  */
 
 import { Response } from 'express';
@@ -45,8 +54,67 @@ const SCOPE_MAX_ITEMS = 20;
 const SCOPE_ITEM_MAX_LEN = 64;
 /** Allowed top-level fields on the create request body. */
 const ALLOWED_CREATE_FIELDS = new Set(['name', 'scope', 'expiresAt']);
+/** Maximum allowed length for an API key id path parameter. */
+const ID_MAX_LEN = 128;
+
+// ─── Failure observability ───────────────────────────────────────────────────
+
+/**
+ * Emits a structured, redacted error log for a controller failure.
+ *
+ * Deterministic recovery requires that every failure path be observable
+ * without leaking secrets (API key material, tokens, request bodies). We log
+ * only the operation name, the authenticated user id (if any), the request
+ * id (if the request carries one), and the error message/name — never the
+ * raw error object, request body, or headers.
+ *
+ * @param operation - Stable identifier for the failing operation.
+ * @param req - The authenticated request (used for redacted correlation ids).
+ * @param error - The thrown value; only `name`/`message` are surfaced.
+ */
+function logControllerFailure(operation: string, req: AuthenticatedRequest, error: unknown): void {
+  const err = error instanceof Error ? error : new Error(String(error));
+  console.error(
+    JSON.stringify({
+      level: 'error',
+      operation,
+      userId: req.user?.userId ?? null,
+      requestId: (req as unknown as { id?: string }).id ?? null,
+      errorName: err.name,
+      errorMessage: err.message,
+    })
+  );
+}
 
 // ─── Validation helper ───────────────────────────────────────────────────────
+
+/**
+ * Validates a path `:id` parameter for API key routes.
+ *
+ * Rejects empty, non-string, oversized, or malformed ids before they reach
+ * the store, so downstream lookups cannot be tricked into matching unintended
+ * rows or triggering unbounded work.
+ *
+ * @param id - Raw `req.params.id`.
+ * @returns `null` when valid; otherwise a 400-ready error object.
+ */
+export function validateApiKeyId(id: unknown): Record<string, unknown> | null {
+  if (typeof id !== 'string' || id.length === 0) {
+    return { code: 'INVALID_ID', error: '`id` must be a non-empty string' };
+  }
+  if (id.length > ID_MAX_LEN) {
+    return {
+      code: 'OUT_OF_RANGE',
+      error: `\`id\` must be at most ${ID_MAX_LEN} characters`,
+      maxLength: ID_MAX_LEN,
+      received: id.length,
+    };
+  }
+  if (!/^[A-Za-z0-9_-]+$/.test(id)) {
+    return { code: 'INVALID_ID', error: '`id` contains invalid characters' };
+  }
+  return null;
+}
 
 /**
  * Validates and bounds the request body for API key creation.
@@ -62,6 +130,9 @@ const ALLOWED_CREATE_FIELDS = new Set(['name', 'scope', 'expiresAt']);
  * @param body - Raw `req.body` from Express.
  * @returns `null` when the body is valid; otherwise a `{ code, error, ... }` object
  *   suitable for sending directly as a 400 JSON response.
+ *
+ * Invariant: this function is pure — it never mutates `body` and never
+ * touches the store. Callers must invoke it before any state transition.
  */
 export function validateApiKeyRequestBody(body: unknown): Record<string, unknown> | null {
   if (typeof body !== 'object' || body === null || Array.isArray(body)) {
@@ -169,6 +240,15 @@ export function validateApiKeyRequestBody(body: unknown): Record<string, unknown
         received: obj['expiresAt'],
       };
     }
+    // Invariant: an already-expired key must not be created — it would be
+    // unusable on arrival and would silently violate the "active key" contract.
+    if (d.getTime() <= Date.now()) {
+      return {
+        code: 'INVALID_DATE',
+        error: '`expiresAt` must be in the future',
+        received: obj['expiresAt'],
+      };
+    }
   }
 
   return null; // valid
@@ -187,6 +267,12 @@ export function validateApiKeyRequestBody(body: unknown): Record<string, unknown
  */
 export async function createApiKeyController(req: AuthenticatedRequest, res: Response): Promise<void> {
   try {
+    // Auth check first: never validate/echo body for unauthenticated callers.
+    if (!req.user) {
+      res.status(401).json({ error: 'Not authenticated' });
+      return;
+    }
+
     const validationError = validateApiKeyRequestBody(req.body);
     if (validationError) {
       res.status(400).json(validationError);
@@ -194,11 +280,6 @@ export async function createApiKeyController(req: AuthenticatedRequest, res: Res
     }
 
     const { name, scope, expiresAt } = req.body as { name: string; scope: string[]; expiresAt?: string };
-
-    if (!req.user) {
-      res.status(401).json({ error: 'Not authenticated' });
-      return;
-    }
 
     const result = await createApiKey({
       name,
@@ -213,7 +294,7 @@ export async function createApiKeyController(req: AuthenticatedRequest, res: Res
       info: result.info,
     });
   } catch (error) {
-    console.error('Error creating API key:', error);
+    logControllerFailure('createApiKey', req, error);
     res.status(500).json({ error: 'Internal server error' });
   }
 }
@@ -273,7 +354,7 @@ export async function listApiKeysController(req: AuthenticatedRequest, res: Resp
       limit: pageResult.limit
     });
   } catch (error) {
-    console.error('Error listing API keys:', error);
+    logControllerFailure('listApiKeys', req, error);
     res.status(500).json({ error: 'Internal server error' });
   }
 }
@@ -293,6 +374,12 @@ export async function rotateApiKeyController(req: AuthenticatedRequest, res: Res
       return;
     }
 
+    const idError = validateApiKeyId(id);
+    if (idError) {
+      res.status(400).json(idError);
+      return;
+    }
+
     // First check if the key belongs to the user
     const existingKey = await database.getApiKeyById(id);
     if (!existingKey) {
@@ -302,6 +389,13 @@ export async function rotateApiKeyController(req: AuthenticatedRequest, res: Res
 
     if (existingKey.created_by !== req.user.userId) {
       res.status(403).json({ error: 'Access denied' });
+      return;
+    }
+
+    // Invariant: rotating an inactive key would resurrect it, violating the
+    // deactivation contract. Reject explicitly instead of silently rotating.
+    if (!existingKey.is_active) {
+      res.status(409).json({ error: 'API key is inactive and cannot be rotated' });
       return;
     }
 
@@ -317,7 +411,7 @@ export async function rotateApiKeyController(req: AuthenticatedRequest, res: Res
       info: result.info
     });
   } catch (error) {
-    console.error('Error rotating API key:', error);
+    logControllerFailure('rotateApiKey', req, error);
     res.status(500).json({ error: 'Internal server error' });
   }
 }
@@ -337,6 +431,12 @@ export async function deactivateApiKeyController(req: AuthenticatedRequest, res:
       return;
     }
 
+    const idError = validateApiKeyId(id);
+    if (idError) {
+      res.status(400).json(idError);
+      return;
+    }
+
     // First check if the key belongs to the user
     const existingKey = await database.getApiKeyById(id);
     if (!existingKey) {
@@ -346,6 +446,14 @@ export async function deactivateApiKeyController(req: AuthenticatedRequest, res:
 
     if (existingKey.created_by !== req.user.userId) {
       res.status(403).json({ error: 'Access denied' });
+      return;
+    }
+
+    // Invariant: deactivation is a one-way transition. Repeating it must not
+    // silently succeed (which would mask a lost/duplicated request) nor
+    // mutate state again.
+    if (!existingKey.is_active) {
+      res.status(409).json({ error: 'API key is already inactive' });
       return;
     }
 
@@ -359,7 +467,7 @@ export async function deactivateApiKeyController(req: AuthenticatedRequest, res:
       message: 'API key deactivated successfully'
     });
   } catch (error) {
-    console.error('Error deactivating API key:', error);
+    logControllerFailure('deactivateApiKey', req, error);
     res.status(500).json({ error: 'Internal server error' });
   }
 }
@@ -376,6 +484,12 @@ export async function getApiKeyController(req: AuthenticatedRequest, res: Respon
 
     if (!req.user) {
       res.status(401).json({ error: 'Not authenticated' });
+      return;
+    }
+
+    const idError = validateApiKeyId(id);
+    if (idError) {
+      res.status(400).json(idError);
       return;
     }
 
@@ -404,7 +518,7 @@ export async function getApiKeyController(req: AuthenticatedRequest, res: Respon
 
     res.json(safeKey);
   } catch (error) {
-    console.error('Error getting API key:', error);
+    logControllerFailure('getApiKey', req, error);
     res.status(500).json({ error: 'Internal server error' });
   }
 }

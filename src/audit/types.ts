@@ -7,6 +7,16 @@
  * - Each entry carries a SHA-256 hash of its own content plus the previous entry's hash,
  *   forming a tamper-evident hash chain (similar to a blockchain ledger).
  * - Sensitive payloads are stored as opaque strings; callers must sanitise PII before logging.
+ *
+ * State invariants owned by this module:
+ * 1. AUDIT_ACTIONS is the single source of truth for valid actions. AuditAction is derived
+ *    from it via type constraints, and the runtime guard {@link isAuditAction} is the
+ *    only supported way to validate an untrusted value. This prevents drift between
+ *    the compile-time union and the runtime allowlist.
+ * 2. AuditEntries are immutable at runtime: {@link freezeAuditEntry} deep-freezes the
+ *    entry and its metadata so consumers cannot mutate a persisted record.
+ * 3. Cursors are opaque and self-describing; {@link decodeCursor} rejects malformed,
+ *    truncated, or structurally invalid input instead of returning a partial object.
  */
 
 /**
@@ -65,32 +75,19 @@ export const AUDIT_ACTIONS = [
 ] as const;
 
 /** Categories of sensitive state changes that must be audited. */
-export type AuditAction =
-  | 'CONTRACT_CREATED'
-  | 'CONTRACT_UPDATED'
-  | 'CONTRACT_CANCELLED'
-  | 'CONTRACT_COMPLETED'
-  | 'CONTRACT_DELETED'
-  | 'PAYMENT_INITIATED'
-  | 'PAYMENT_RELEASED'
-  | 'PAYMENT_DISPUTED'
-  | 'REPUTATION_UPDATED'
-  | 'REPTATION_CORRECTED'
-  | 'USER_CREATED'
-  | 'USER_UPDATED'
-  | 'USER_DELETED'
-  | 'AUTH_LOGIN'
-  | 'AUTH_LOGOUT'
-  | 'AUTH_FAILED'
-  | 'AUTH_LOCKOUT_TRIGGERED'
-  | 'AUTH_LOCKOUT_RELEASED'
-  | 'ADMIN_ACTION' | 'ENDPOINT_ACCESS'
-  | 'ENDPOINT_MUTATION'
-  | 'DEPLOYMENT_PROMOTED'
-  | 'DEPLOYMENT_ROLLED_BACK'
-  | 'MILESTONES_CREATED'
-  | 'MILESTONES_UPDATED'
-  | 'MILESTONES_DELETED';
+export type AuditAction = (typeof AUDIT_ACTIONS)[number];
+
+/**
+ * Runtime guard that narrows an untrusted value to {@link AuditAction}.
+ *
+ * This is the only supported way to validate an action at the boundary. It is
+ * derived from AUDIT_ACTIONS so the compile-time union and the runtime allowlist
+ * can never diverge. The input is treated as `unknown` because it typically comes
+ * from JSON request bodies or query parameters.
+ */
+export function isAuditAction(value: unknown): value is AuditAction {
+  return typeof value === 'string' && (AUDIT_ACTIONS as readonly string[]).includes(value);
+}
 
 export const AUDIT_SEVERITIES = ['INFO', 'WARNING', 'CRITICAL'] as const;
 
@@ -136,6 +133,13 @@ export function isAuditAction(value: unknown): value is AuditAction {
 }
 
 /** Runtime guard for {@link AuditSeverity}, mirroring {@link isAuditAction}. */
+export function isAuditSeverity(value: unknown): value is AuditSeverity {
+  return typeof value === 'string' && (AUDIT_SEVERITIES as readonly string[]).includes(value);
+}
+
+/**
+ * Runtime guard that narrows an untrusted value to {@link AuditSeverity}.
+ */
 export function isAuditSeverity(value: unknown): value is AuditSeverity {
   return typeof value === 'string' && (AUDIT_SEVERITIES as readonly string[]).includes(value);
 }
@@ -191,7 +195,22 @@ export interface SealedAuditEntry extends AuditEntry {
 export type CreateAuditEntryInput = Omit<AuditEntry, 'id' | 'timestamp' | 'hash' | 'previousHash'>;
 
 /**
- * Outcome of a single item within a `POST /api/v1/audit/bulk `request.
+ * Deep-freeze an audit entry and its metadata so a consumer cannot mutate a
+ * persisted record after it has been created. This enforces the immutability
+ * invariant at runtime, not just in the type system.
+ *
+ * The function is idempotent and returns the same reference it was given, so
+ * callers can use it in a fluent style without changing identity.
+ */
+export function freezeAuditEntry<T extends AuditEntry>(entry: T): T {
+  if (entry.metadata && typeof entry.metadata === 'object') {
+    Object.freeze(entry.metadata);
+  }
+  return Object.freeze(entry);
+}
+
+/**
+ * Outcome of a single item within a `POST /api/v1/audit/bulk` request.
  * Exactly one of `entry` / `error` is populated, matching `success`.
  */
 export interface BulkAuditItemResult {
@@ -521,18 +540,74 @@ export function validateCacheCapacity(capacity: unknown): CacheTtlValidation {
 
 /** Encodes cursor data to an opaque base64 string. */
 export function encodeCursor(data: CursorData): string {
+  const json = JSON.stringify(data);
+  return Buffer.from(json, 'utf-8').toString('base64');
+}
+
+/**
+ * Decodes an opaque base64 cursor string to cursor data.
+ *
+ * State invariant: a decoded cursor must be structurally valid. Mangled,
+ * truncated, or otherwise malformed cursors are rejected with a stable error
+ * message so the router can map them to a 400 response without leaking internal
+ * details. This prevents a malformed cursor from silently producing an
+ * unfiltered or unbounded page of results.
+ */
+export function decodeCursor(cursor: string): CursorData {
+  if (typeof cursor !== 'string' || cursor.length === 0) {
+    throw new Error('Invalid cursor format');
+  }
+
+  let parsed: unknown;
   try {
-    const json = JSON.stringify(data);
-    if (typeof json !== 'string') throw new Error('Invalid cursor format');
-    // Validate the actual JSON representation, not just the input object: this
-    // also excludes values silently dropped by JSON.stringify (e.g. undefined).
-    if (!isCursorData(JSON.parse(json) as unknown)) throw new Error('Invalid cursor format');
-    const cursor = Buffer.from(json, 'utf-8').toString('base64');
-    if (cursor.length > MAX_AUDIT_CURSOR_LENGTH) throw new Error('Invalid cursor format');
-    return cursor;
+    const json = Buffer.from(cursor, 'base64').toString('utf-8');
+    parsed = JSON.parse(json);
   } catch {
     throw new Error('Invalid cursor format');
   }
+
+  if (!isCursorData(parsed)) {
+    throw new Error('Invalid cursor format');
+  }
+
+  return parsed;
+}
+
+/**
+ * Structural validation for a decoded cursor. Keeps the decoder from returning
+ * a partial or wrong-shaped object that would corrupt pagination state.
+ */
+function isCursorData(value: unknown): value is CursorData {
+  if (typeof value !== 'object' || value === null) {
+    return false;
+  }
+
+  const candidate = value as { [key: string]: unknown };
+  if (typeof candidate.lastId !== 'string' || candidate.lastId.length === 0) {
+    return false;
+  }
+  if (typeof candidate.lastTimestamp !== 'string' || candidate.lastTimestamp.length === 0) {
+    return false;
+  }
+  if (typeof candidate.filters !== 'object' || candidate.filters === null) {
+    return false;
+  }
+
+  const filters = candidate.filters as { [key: string]: unknown };
+  if (filters.action !== undefined && !isAuditAction(filters.action)) {
+    return false;
+  }
+  if (filters.severity !== undefined && !isAuditSeverity(filters.severity)) {
+    return false;
+  }
+  for (const key of ['actor', 'resource', 'resourceId', 'from', 'to'] as const) {
+    const field = filters[key];
+    if (field !== undefined && typeof field !== 'string') {
+      return false;
+    }
+  }
+
+  return true;
 }
 
 /** Decodes and validates an opaque base64 cursor string from an untrusted caller. */

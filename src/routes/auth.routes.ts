@@ -222,7 +222,7 @@ router.post(
   '/bulk',
   authLimiter,
   idempotencyMiddleware,
-  validateSchema(bulkAuthSchema),
+  validateSchema(z.object({ body: z.array(z.object({ operation: z.enum(['login', 'register', 'refresh']), payload: z.unknown() })) })),
   async (req: Request, res: Response) => {
     const batch = req.body as Array<{
       operation: 'login' | 'register' | 'refresh';

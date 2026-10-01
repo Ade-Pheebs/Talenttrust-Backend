@@ -43,7 +43,7 @@ import eventsRouter from './routes/events.routes';
 import { createDisputesRouter } from './routes/disputes.routes';
 import { createMetricsRouter } from './routes/metrics.routes';
 import { metricsAuthMiddleware } from './middleware/metricsAuth';
-import reputationRouter, { createReputationRouter } from './routes/reputation.routes';
+import reputationRouter from './routes/reputation.routes';
 import authRouter from './routes/auth.routes';
 import configRouter from './routes/config.routes';
 import dependencyScanRouter from './routes/dependency-scan.routes';

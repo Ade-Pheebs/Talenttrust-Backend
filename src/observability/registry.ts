@@ -43,12 +43,16 @@ export function getMetricsService(): MetricsServiceLike {
     return {
       contentType: 'text/plain',
       trackHttpRequest: () => {},
+      trackApiKeysRequest: () => {},
+      trackAuthRequest: () => {},
       getMetrics: async () => '',
+      recordReputationRequest: () => {},
       recordHealthStatus: () => {},
       recordWebhookDelivery: () => {},
       setWebhookDlqDepth: () => {},
-      recordCacheHit: () => {},
-      recordCacheMiss: () => {},
+      recordDisputesRequest: () => {},
+      recordContractsRequest: () => {},
+      recordMilestoneOperation: () => {},
     };
   }
   return _metricsService;

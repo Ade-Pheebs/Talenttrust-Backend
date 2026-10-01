@@ -130,6 +130,200 @@ import { logger } from '../logger';
 /** Express request extended with API key info. */
 export interface ApiKeyAuthenticatedRequest extends Request {
   apiKey?: ApiKeyInfo;
+  /**
+   * In-flight deduplication slot for API key validation.
+   *
+   * Holds the promise for the current request's validation so that
+   * concurrent or repeated invocations of {@link authenticateApiKey} on the
+   * same request object do not trigger duplicate validation work.
+   */
+  _apiKeyValidationPromise?: Promise<ApiKeyInfo | null>;
+}
+
+/** Maximum accepted length of an `X-API-Key` header value. */
+const MAX_API_KEY_LENGTH = 512;
+
+/** Regex describing a single scope token accepted by this module. */
+const SCOPE_TOKEN_RE = /^[A-Za-z0-9_.*-]+$/;
+
+/**
+ * Normalize the raw `x-api-key` header value into a single trimmed
+ * string, or ``null`` when no usable credential is present.
+ *
+ * Express may give us `string`, `string[]`, or `undefined`. A multi-value
+ * header is ambiguous and must not be silently collapsed into one of its
+ * values, so we reject it as missing. This is deterministic and avoids a
+ * class of header-smuggling bugs.
+ */
+function extractApiKeyHeader(value: unknown): string | null {
+  if (typeof value !== 'string') {
+    return null;
+  }
+  const trimmed = value.trim();
+  if (trimmed.length === 0 || trimmed.length > MAX_API_KEY_LENGTH) {
+    return null;
+  }
+  return trimmed;
+}
+
+/**
+ * Default number of attempts for transient validation failures.
+ * Total attempts = 1 initial + (API_KEY_MAX_RETRIES) retries.
+ */
+const API_KEY_MAX_RETRIES = 2;
+
+/** Base delay in milliseconds between retries (exponential backoff). */
+const API_KEY_RETRY_BASE_DELAY_MS = 25;
+
+/** Maximum delay in milliseconds between retries. */
+const API_KEY_RETRY_MAX_DELAY_MS = 200;
+
+/**
+ * Error class for non-retryable API key validation failures.
+ *
+ * Thrown by the validator when the failure is deterministic (e.g.
+ * malformed key format, invalid hash encoding) and retrying would not help.
+ */
+export class ApiKeyValidationError extends Error {
+  constructor(message: string, public readonly code: string = 'API_KEY_VALIDATION_FAILED') {
+    super(message);
+    this.name = 'ApiKeyValidationError';
+  }
+}
+
+/**
+ * Resolves the validator to use for a request.
+ *
+ * This indirection exists so that tests can inject a deterministic
+ * validator (including failure/retry behavior) without mock module
+ * registry globals. It is intentionally not exported from the module's
+ * public surface.
+ */
+interface ApiKeyValidatorContext {
+  validator?: (key: string) => Promise<ApiKeyInfo | null>;
+}
+
+function resolveValidator(ctx?: ApiKeyValidatorContext): (key: string) => Promise<ApiKeyInfo | null> {
+  return ctx?.validator ?? validateApiKey;
+}
+
+/**
+ * Returns true when an error is transient and the validation call
+ * may be safely retried.
+ *
+ * The classification is deterministic and conservative:
+ *   - ApiKeyValidationError is always non-retryable.
+ *   - Errors with a code indicating a client/programming fault
+ *     (e.g. ERROR_INVALID_ARG) are non-retryable.
+ *   - Everything else (DB, network, timeout) is treated as transient.
+ */
+function isRetryableError(err: unknown): boolean {
+  if (err instanceof ApiKeyValidationError) return false;
+  if (err && typeof err === 'object') {
+    const code = (err as { code?: unknown }).code;
+    if (code === 'ERROR_INVALID_ARG' || code === 'API_KEY_VALIDATION_FAILED') {
+      return false;
+    }
+  }
+  return true;
+}
+
+/** Delay helper used for backoff between retries. */
+function delay(ms: number): Promise<void> {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+/**
+ * Validates an API key with bounded retries for transient failures.
+ *
+ * Invariants:
+ *   - A successful validation returns the resolved ApiKeyInfo exactly once.
+ *   - A definitive null result (key not found/expired/deactivated) is
+ *     returned immediately and is never retried.
+ *   - Non-retryable errors propagate immediately.
+ *   - Retryable errors are retried up to API_KEY_MAX_RETRIES times with
+ *     exponential backoff, then the last error is rethrown.
+ */
+async function validateWithRetry(
+  key: string,
+  validator: (key: string) => Promise<ApiKeyInfo | null>,
+): Promise<ApiKeyInfo | null> {
+  let lastError: unknown;
+
+  for (let attempt = 0; attempt <= API_KEY_MAX_RETRIES; attempt++) {
+    try {
+      return await validator(key);
+    } catch (err) {
+      lastError = err;
+      if (!isRetryableError(err) || attempt === API_KEY_MAX_RETRIES) {
+        throw err;
+      }
+      const backoff = Math.min(
+        API_KEY_RETRY_BASE_DELAY_MS * 2 ** attempt,
+        API_KEY_RETRY_MAX_DELAY_MS,
+      );
+      await delay(backoff);
+    }
+  }
+
+  // Unreachable: the loop either returns or throws on the last attempt.
+  throw lastError instanceof Error
+    ? lastError
+    : new Error('API key validation failed');
+}
+
+/** Canonical header carrying the API key credential. */
+const API_KEY_HEADER = 'x-api-key';
+
+/**
+ * Reads the API key credential from the request.
+ *
+ * INV3: the header must be present exactly once as a single non-empty string. A
+ * repeated header arrives as `string[]`, and an absent, empty or whitespace-only
+ * value is indistinguishable from "no credential", so all of those return
+ * `null` and are rejected as unauthenticated. A malformed header is therefore
+ * classified as missing credentials rather than being handed to
+ * `validateApiKey`, where a non-string value would raise and surface as a 500.
+ *
+ * The value is returned untouched: API keys are opaque, so surrounding
+ * whitespace must never be silently trimmed into a different key.
+ */
+function readApiKeyHeader(req: ApiKeyAuthenticatedRequest): string | null {
+  const raw = req.headers?.[API_KEY_HEADER];
+  if (typeof raw !== 'string') return null;
+  if (raw.trim().length === 0) return null;
+  return raw;
+}
+
+/**
+ * Drops any API key identity from the request.
+ *
+ * INV2: called at the start of every authentication attempt and on every
+ * rejection path, so an attempt that fails can never leave a usable identity
+ * behind for a later authorization check.
+ */
+function clearApiKey(req: ApiKeyAuthenticatedRequest): void {
+  delete req.apiKey;
+}
+
+/**
+ * Narrows a validation result to a usable identity.
+ *
+ * INV4: authorization is only ever decided from an identity that actually has
+ * the fields `requireApiKeyScope` reads, so a malformed or partially populated
+ * object is treated as "not authenticated" instead of throwing from inside the
+ * scope check.
+ */
+function isWellFormedApiKeyInfo(value: unknown): value is ApiKeyInfo {
+  if (typeof value !== 'object' || value === null) return false;
+  const candidate = value as Partial<ApiKeyInfo>;
+  return (
+    typeof candidate.id === 'string' &&
+    candidate.id.length > 0 &&
+    Array.isArray(candidate.scope) &&
+    candidate.scope.every(scope => typeof scope === 'string' && scope.length > 0) &&
+    candidate.isActive === true
+  );
 }
 
 /**
@@ -423,6 +617,7 @@ export function authenticateApiKey(
   req: ApiKeyAuthenticatedRequest,
   res: Response,
   next: NextFunction,
+  ctx?: ApiKeyValidatorContext,
 ): void {
   const result = readApiKeyHeader(req.headers['x-api-key']);
 
@@ -443,7 +638,16 @@ export function authenticateApiKey(
         return;
       }
 
-      req.apiKey = keyInfo;
+  req._apiKeyValidationPromise
+    .then(keyInfo => {
+      if (!req.apiKey) {
+        if (!keyInfo) {
+          req._apiKeyValidationPromise = undefined;
+          res.status(401).json({ error: 'Invalid API key' });
+          return;
+        }
+        req.apiKey = keyInfo;
+      }
       next();
     })
     .catch(err => {
@@ -481,12 +685,51 @@ function isScopeSegment(value: unknown): value is string {
  * that the previous prefix/suffix rules would have accepted — grants
  * nothing.
  *
+ * The match is strict and deterministic: the comparison is byte-exact and
+ * the components are never interpreted as regex or path globs. A scope token
+ * that does not match the allowed character set is rejected rather than
+ * being treated as a wildcard.
+ */
+export function scopeSatisfies(
+  scope: string,
+  resource: string,
+  action: string,
+): boolean {
+  if (typeof scope !== 'string' || !SCOPE_TOKEN_RE.test(scope)) {
+    return false;
+  }
+
+  const requiredScope = `${resource}:${action}`;
+
+  // Exact match
+  if (scope === requiredScope) return true;
+
+  // Full wildcard
+  if (scope === '*') return true;
+
+  // Wildcard action (e.g. "contracts:*")
+  if (scope.endsWith(':*') && scope.slice(0, -2) === resource) return true;
+
+  // Wildcard resource (e.g. "*:read")
+  if (scope.startsWith('*:') && scope.slice(2) === action) return true;
+
+  return false;
+}
+
+/**
+ * Factory that returns Express middleware enforcing a specific API key scope.
+ *
  * Error paths:
  * - **401** — `req.apiKey` is not set (caller skipped `authenticateApiKey`).
  * - **403** — Key is present but none of its scopes match the requirement, or
  *   its `scope` value is not a readable list of strings. The response
  *   includes `required` and `provided` for debugging by the key owner; no
  *   internal implementation detail is exposed.
+ *
+ * Invariants:
+ * - Fail-closed: any non-match results in 403 and never calls `next()`.
+ * - The required scope is computed once at factory creation time and is
+ *   not influenced by request data.
  *
  * @param resource - The resource being accessed (e.g. `'contracts'`).
  * @param action   - The action being performed (e.g. `'read'`).
@@ -507,7 +750,12 @@ export function requireApiKeyScope(resource: string, action: string) {
   }
 
   return (req: ApiKeyAuthenticatedRequest, res: Response, next: NextFunction): void => {
-    if (!req.apiKey) {
+    // INV4: authorize only against a well-formed identity. A malformed one is
+    // discarded and reported as unauthenticated rather than throwing a
+    // TypeError out of the scope scan.
+    const keyInfo = req.apiKey;
+    if (!isWellFormedApiKeyInfo(keyInfo)) {
+      clearApiKey(req);
       res.status(401).json({ error: 'Not authenticated with API key' });
       return;
     }
@@ -571,6 +819,13 @@ export function requireApiKeyScope(resource: string, action: string) {
  * Use this on endpoints that must be accessible by both human users (JWT) and
  * automated internal services (API key).
  *
+ * Invariants:
+ * - At most one credential type is attached to the request as a result of
+ *   this middleware. When the JWT path is taken, `req.apiKey` is cleared so a
+ *   stale API key from an earlier middleware cannot bypass scope checks.
+ * - A malformed `Authorization` header (e.g. `Bearer` with no token) is
+ *   treated as absent and falls through to the API key path or 401.
+ *
  * @param req  - Express request supporting both `user` and `apiKey` fields.
  * @param res  - Express response.
  * @param next - Called by the delegated middleware on success.
@@ -580,6 +835,10 @@ export function authenticateEither(
   res: Response,
   next: NextFunction,
 ): void {
+  // INV2: every request starts from a clean identity slate, whichever
+  // credential it ends up presenting.
+  clearApiKey(req as ApiKeyAuthenticatedRequest);
+
   // Check for JWT token first
   const authHeader = req.headers.authorization;
   if (typeof authHeader === 'string' && authHeader.startsWith(BEARER_PREFIX)) {

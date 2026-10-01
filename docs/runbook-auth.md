@@ -780,6 +780,9 @@ All the following must pass before declaring the auth subsystem healthy:
 src/auth/
   authenticate.ts       — Legacy base64 bearer token middleware
   authenticate.test.ts  — Tests for legacy auth + JWT algorithm hardening
+  authenticate.validation-boundaries.test.ts
+                         — Accepted / rejected / duplicate / boundary / regression
+                           tests for the legacy bearer path (issue #1411)
   authorize.ts          — Legacy `isAllowed` function (uses ACCESS_CONTROL_MATRIX)
   roles.ts              — Legacy matrix + role/resource/action types
   jwtConfig.ts          — Algorithm pinning, frozen verify options

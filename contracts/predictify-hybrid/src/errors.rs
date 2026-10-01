@@ -16,24 +16,55 @@ use soroban_contracterror;
 /// rolls back all writes and events of a failed invocation, so an error
 /// never leaves a consumed key or a half-applied batch behind.
 ///
-/// All variants map to a stable `u32` discriminant that clients can
-/// pattern-match on after invoking the contract.  **Do not renumber
-/// existing variants** — that would break on-chain consumers.  New
-/// variants must take the next free discriminant.
+/// All variants map to a **stable `u32` discriminant** that clients and
+/// off-chain tooling can pattern-match on after invoking the contract.
+///
+/// # Compatibility contract
+///
+/// The discriminant assigned to every variant is **frozen** once the contract
+/// is deployed.  Changing or reusing a number would silently break any
+/// on-chain or off-chain consumer that branches on the raw error code.
+///
+/// Rules:
+/// * **Never renumber** an existing variant.
+/// * **Never remove** a variant (the slot is permanently reserved).
+/// * **Always append** new variants with the next unused discriminant.
+/// * **Document** every reserved slot if a variant is logically deprecated
+///   so future authors know not to reclaim its number.
+///
+/// Currently reserved discriminants: 1–5.
+/// The next available discriminant is: **6**.
+///
+/// # Retry guidance
+///
+/// | Error                          | Retryable with same args? |
+/// |-------------------------------|---------------------------|
+/// | `IdempotentBatchAlreadyApplied` | No — generate a fresh key |
+/// | `EmptyBatch`                   | No — fix the request      |
+/// | `BatchTooLarge`                | No — split the batch      |
+/// | `AmountMustBePositive`         | No — fix the request      |
+/// | `MarketIdInvalid`              | No — fix the market_id    |
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum Error {
-    /// The supplied `idempotency_key` was already used in a previouse
+    // ──────────────────────────────────────────────────────────────────────
+    // Discriminants 1–2: original release — frozen, must not be renumbered.
+    // ──────────────────────────────────────────────────────────────────────
+
+    /// The supplied `idempotency_key` was already used in a previous
     /// `place_bets` call that completed successfully.  The original batch
-    /// has already been applied; the caller should not retry with the same
-    /// token.  Generate a fresh `BytesN32<` for a new batch.
+    /// has already been applied; retrying within the retention window cannot
+    /// apply it again. Generate a fresh `BytesN<32>` for a new batch.
     IdempotentBatchAlreadyApplied = 1,
 
-    /// The `bets` vector was empty.  At least one bet is required.
-    /// The idempotency key is not consumed in this case.
+    /// The `bets` vector was empty.  At least one [`Bet`] entry is required.
+    ///
+    /// Discriminant: **2** (stable).
+    ///
+    /// [`Bet`]: crate::bets::Bet
     EmptyBatch = 2,
 
-    /// A bet amount was not strictly positive.  Zero or negative
-    /// amounts are rejected before any state is mutated.
-    InvalidAmount = 3,
+    /// The ledger range or network maximum TTL cannot preserve the full
+    /// replay-protection window. No token or batch effects were committed.
+    IdempotencyRetentionUnavailable = 3,
 }

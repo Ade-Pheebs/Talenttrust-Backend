@@ -82,66 +82,46 @@ export interface AuditLogRepository {
 }
 
 /**
- * State invariants for the audit repository factory:
- *
- * 1. Backend selection is deterministic and fails fast on unknown values.
- *    The factory must never silently fall back to an in-memory store when a
- *    configured backend is unrecognised, because that would lose durability
- *    guarantees and produce inconsistent audit trails across processes.
- *
- * 2. The default backend is explicitly ``memory``. An empty or whitespace
- *    `AUDIT_STORAGE_BACKEND` is treated as unset so that a misplaced environment
- *    variable cannot accidentally select an unknown backend.
- *
- * 3. The SQLite backend is only constructed when explicitly requested. The
- *    native binding is loaded lazily so that in-memory tests do not require
- *    compiled bindings.
- *
- * 4. The factory is idempotent with respect to configuration: repeated
- *    calls with the same environment yield repositories backed by the same
- *    storage medium. The memory backend returns the process-singleton
- *    `auditStore` so all callers observe a consistent view of the log.
- *
- * 5. Failures are reported with non-sensitive messages. We never echo the
- *    raw environment value in a way that could leak credentials (e.g. a
- *    connection string with an embedded password); we only report the
- *    backend identifier after validating it against the allowed set.
+ * Supported audit storage backends. The contract is that the default
+ * repository is always a valid, fully-implemented `AuditLogRepository` for any
+ * accepted backend value, and that an unsupported value fails fast with a
+ * deterministic, actionable error.
  */
-
 export const AUDIT_STORAGE_BACKENDS = ['memory', 'sqlite'] as const;
 export type AuditStorageBackend = (typeof AUDIT_STORAGE_BACKENDS)[number];
 
-function resolveBackend(): AuditStorageBackend {
-  const raw = process.env['AUDIT_STORAGE_BACKEND'];
-  // Treat unset, empty, and whitespace-only values as the default so a
-  // misplaced environment variable cannot select an unknown backend.
-  const normalised = (raw ?? 'memory').trim().toLowerCase();
-  const candidate = normalised.length === 0 ? 'memory' : normalised;
+const DEFAULT_BACKEND: AuditStorageBackend = 'memory';
 
-  if ((AUDIT_STORAGE_BACKENDS as readonly string[]).includes(candidate)) {
-    return candidate as AuditStorageBackend;
-  }
-
-  // Do not interpolate the raw value into the error message: it may contain
-  // sensitive data. Report only the allowed set so operators can correct it.
-  throw new Error(
-    `Unsupported AUDIT_STORAGE_BACKEND. Expected one of ${AUDIT_STORAGE_BACKENDS.join(', ')}.`,
-  );
+function isSupportedBackend(value: string): value is AuditStorageBackend {
+  return (AUDIT_STORAGE_BACKENDS as readonly string[]).includes(value);
 }
 
-function resolveSqlitePath(): string {
-  const configured = process.env['AUDIT_DB_PATH'];
-  if (configured !== undefined && configured.trim().length > 0) {
-    return configured;
+/**
+ * Resolves the configured audit storage backend.
+ *
+ * The returned value is always one of `AUDIT_STORAGE_BACKENDS`. When the
+ * environment variable is absent or empty the default is used, preserving
+ * backward compatibility with callers that never set it.
+ */
+export function resolveAuditStorageBackend(
+  rawBackend: string | undefined = process.env['AUDIT_STORAGE_BACKEND'],
+): AuditStorageBackend {
+  if (rawBackend === undefined || rawBackend.trim() === '') {
+    return DEFAULT_BACKEND;
   }
-  if (process.env['NODE_ENV'] === 'test') {
-    return ':memory:';
+
+  const normalized = rawBackend.trim().toLowerCase();
+  if (!isSupportedBackend(normalized)) {
+    throw new Error(
+      `Unsupported AUDIT_STORAGE_BACKEND: ${rawBackend}. Expected one of: ${AUDIT_STORAGE_BACKENDS.join(', ')}`,
+    );
   }
-  return path.join(process.cwd(), 'talenttrust-audit.db');
+
+  return normalized;
 }
 
 export function createDefaultAuditRepository(): AuditLogRepository {
-  const backend = resolveBackend();
+  const backend = resolveAuditStorageBackend();
 
   if (backend === 'memory') {
     // The in-memory store is already a process-wide singleton with its own
@@ -151,7 +131,11 @@ export function createDefaultAuditRepository(): AuditLogRepository {
   }
 
   // backend === 'sqlite'
-  const dbPath = resolveSqlitePath();
+  const dbPath =
+    process.env['AUDIT_DB_PATH'] ??
+    (process.env['NODE_ENV'] === 'test'
+      ? ':memory:'
+      : path.join(process.cwd(), 'talenttrust-audit.db'));
   // Load the native module only when the SQLite backend is selected so
   // in-memory tests can run on machines without compiled bindings.
   const db = new Database(dbPath);

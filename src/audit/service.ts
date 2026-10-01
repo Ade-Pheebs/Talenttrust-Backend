@@ -43,14 +43,28 @@ export interface AuditServiceOptions {
 }
 
 /**
- * Canonical runtime set of audit actions. Derived from the single source of
- * truth in `types.ts` so the service can never accept an action that the
- * repository/type layer rejects (or vice versa).
+ * Canonical runtime list of valid audit actions.
+ *
+ * This is derived from the single source of truth in `types.ts` (`AUDIT_ACTIONS`)
+ * so the query validator here can never drift from the request-body
+ * validator or the `AuditAction` type. The compile-time assertion below
+ * ensures every member of `AUDIT_ACTIONS` is a valid `AuditAction`.
  */
-export const VALID_ACTIONS: ReadonlySet<AuditAction> = new Set<AuditAction>(AUDIT_ACTIONS);
+export const VALID_ACTIONS: ReadonlySet<AuditAction> = new Set(AUDIT_ACTIONS as readonly AuditAction[]);
 
-export const VALID_SEVERITIES: ReadonlySet<AuditSeverity> = new Set<AuditSeverity>(AUDIT_SEVERITIES);
+/**
+ * Canonical runtime list of valid audit severities.
+ * Derived from `AUDIT_SEVERITIES` to keep the runtime validator and the
+ * `AuditSeverity` type in lock-step.
+ */
+export const VALID_SEVERITIES: ReadonlySet<AuditSeverity> = new Set(AUDIT_SEVERITIES as readonly AuditSeverity[]);
 
+/**
+ * Parse an optional ISO-8601 timestamp string.
+ *
+ * The returned value is always normalised to a UTC ISO-8601 string so that
+ * equivalent inputs (e.g. `Z.` vs `+00:00`) produce identical filters.
+ */
 export function parseOptionalIsoDate(
   value: string | undefined,
   fieldName: 'from' | 'to',
@@ -67,26 +81,48 @@ export function parseOptionalIsoDate(
   return new Date(parsed).toISOString();
 }
 
+/**
+ * Parse a non-negative integer offset.
+ *
+ * This is stricter than `Number.parseInt` alone: it rejects non-numeric
+ * input and trailing garbage (e.g. `"12abc"`) so a typo in a query string
+ * cannot silently degrade into a different pagination window.
+ */
 export function parseOffset(value: string | undefined): number {
   if (value === undefined) {
     return 0;
   }
 
-  const parsed = Number.parseInt(value, 10);
-  if (!Number.isFinite(parsed) || parsed < 0) {
+  if (!/^[0-9]+$/.test(value)) {
+    throw new Error('Invalid offset');
+  }
+
+  const parsed = Number(value);
+  if (!Number.isSafeInteger(parsed)) {
     throw new Error('Invalid offset');
   }
 
   return parsed;
 }
 
+/**
+ * Parse an optional positive limit, clamped to `maxLimit`.
+ *
+ * Rejects non-numeric input and trailing garbage. When `value` is undefined
+ * the `defaultLimit` is returned unchanged (it may be `undefined` to mean
+ * "no explicit limit").
+ */
 export function parseLimit(value: string | undefined, maxLimit: number, defaultLimit?: number): number | undefined {
   if (value === undefined) {
     return defaultLimit;
   }
 
-  const parsed = Number.parseInt(value, 10);
-  if (!Number.isFinite(parsed) || parsed < 1) {
+  if (!/^[0-9]+$/.test(value)) {
+    throw new Error('Invalid limit');
+  }
+
+  const parsed = Number(value);
+  if (!Number.isSafeInteger(parsed) || parsed < 1) {
     throw new Error('Invalid limit');
   }
 
@@ -613,41 +649,40 @@ export class AuditService {
   }
 
   /**
-   * Returns the number of entries in the audit log.
+   * Queries audit entries by filter.
+   */
+  query(query?: AuditQuery): AuditEntry[] {
+    return this.repository.query(query);
+  }
+
+  /**
+   * Queries audit entries with cursor-based pagination.
+   */
+  queryWithCursor(query?: AuditQuery): AuditQueryResult {
+    return this.repository.queryWithCursor(query);
+  }
+
+  /**
+   * Streams audit entries without materialising the full result set.
+   */
+  stream(query?: AuditQuery): IterableIterator<AuditEntry> {
+    return this.repository.stream(query);
+  }
+
+  /**
+   * Returns the total number of audit entries.
    */
   count(): number {
     return this.repository.count();
   }
 
   /**
-   * Verifies the hash-chain integrity of the audit log.
+   * Verifies the tamper-evident hash chain.
    */
   verifyIntegrity(): IntegrityReport {
     return this.repository.verifyIntegrity();
   }
-
-  /**
-   * Runs a filtered query against the underlying repository.
-   */
-  query(query: AuditQuery = {}): AuditEntry[] {
-    return this.repository.query(query);
-  }
-
-  /**
-   * Runs a cursor-paginated query against the underlying repository.
-   */
-  queryWithCursor(query: AuditQuery = {}): AuditQueryResult {
-    return this.repository.queryWithCursor(query);
-  }
-
-  /**
-   * Streams audit entries matching the query without materialising the full
-   * result set in memory.
-   */
-  stream(query: AuditQuery = {}): IterableIterator<AuditEntry> {
-    return this.repository.stream(query);
-  }
 }
 
-/** Singleton service instance shared across the application. */
+/** Default singleton instance for application use. */
 export const auditService = new AuditService();

@@ -42,8 +42,16 @@ export const DEFAULT_EXPORT_PAGE_SIZE = 100;
  * Every audited action, as a runtime value list.
  *
  * This is the single source of truth: {@link AuditAction} is derived from it,
- * and request-body, query-filter and service validators consume this array so
- * an action cannot be accepted by one path and rejected by another.
+ * and both the request-body validator (`audit/inputValidation`) and the query
+ * filter validator (`audit/router`) validate against this same array, so a new
+ * action can never be accepted by one path and rejected by the other.
+ *
+ * Compatibility contract:
+ * - This array is the canonical runtime enumeration of every accepted action.
+ * - The `AuditAction` type is derived from it, so type and runtime cannot drift.
+ * - Adding a new action is backward-compatible (only widens the union).
+ * - Removing or renaming an action is a breaking change and requires a
+ *   migration plan because persisted entries may reference it.
  */
 export const AUDIT_ACTIONS = [
   'CONTRACT_CREATED',
@@ -78,12 +86,11 @@ export const AUDIT_ACTIONS = [
 export type AuditAction = (typeof AUDIT_ACTIONS)[number];
 
 /**
- * Runtime guard that narrows an untrusted value to {@link AuditAction}.
+ * Runtime membership check for audit actions.
  *
- * This is the only supported way to validate an action at the boundary. It is
- * derived from AUDIT_ACTIONS so the compile-time union and the runtime allowlist
- * can never diverge. The input is treated as `unknown` because it typically comes
- * from JSON request bodies or query parameters.
+ * Exposed so that both the request-body validator and the query-filter validator
+ * share exactly the same acceptance rule, preserving the compatibility contract
+ * between the two paths. Narrowing behavior is a type guard, not a coercion.
  */
 export function isAuditAction(value: unknown): value is AuditAction {
   return typeof value === 'string' && (AUDIT_ACTIONS as readonly string[]).includes(value);
@@ -117,29 +124,7 @@ export const AUDIT_ACTIONS: readonly AuditAction[] = [
 /** Severity level of the audit event. */
 export type AuditSeverity = (typeof AUDIT_SEVERITIES)[number];
 
-/** Array of all valid AuditSeverity values for validation. */
-export const AUDIT_SEVERITIES: readonly AuditSeverity[] = ['INFO', 'WARNING', 'CRITICAL'] as const;
-
-/**
- * Runtime guard for {@link AuditAction}.
- *
- * Use at trust boundaries that receive an action from untyped input (queues,
- * config, decoded payloads) instead of casting with `as AuditAction`: unlike a
- * cast, this actually checks the value against the {@link AUDIT_ACTIONS}
- * vocabulary and narrows the type only when the check succeeds.
- */
-export function isAuditAction(value: unknown): value is AuditAction {
-  return typeof value === 'string' && (AUDIT_ACTIONS as readonly string[]).includes(value);
-}
-
-/** Runtime guard for {@link AuditSeverity}, mirroring {@link isAuditAction}. */
-export function isAuditSeverity(value: unknown): value is AuditSeverity {
-  return typeof value === 'string' && (AUDIT_SEVERITIES as readonly string[]).includes(value);
-}
-
-/**
- * Runtime guard that narrows an untrusted value to {@link AuditSeverity}.
- */
+/** Runtime membership check for audit severities. */
 export function isAuditSeverity(value: unknown): value is AuditSeverity {
   return typeof value === 'string' && (AUDIT_SEVERITIES as readonly string[]).includes(value);
 }

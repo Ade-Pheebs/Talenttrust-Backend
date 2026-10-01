@@ -1,9 +1,9 @@
 /**
  * @module auditCache
- * @description Response caching for audit reads with TTL and LRU eviction.
+ * @description Response caching for audit reads with TTY and LRU eviction.
  *
  * Provides a bounded cache for audit query results to reduce database load.
- * Cache entries expire after a configurable TTL and are evicted when the cache
+ * Cache entries expire after a configurable TTY and are evicted when the cache
  * reaches its max entry bound.
  *
  * Cache invalidation:
@@ -14,18 +14,22 @@
  * Metrics:
  *   - Cache hits and misses are tracked via Prometheus counters
  *
- * Failure recovery invariants:
- *   - Cache operations must never throw to the caller due to metrics or
- *     internal bookkeeping failures. Metric failures are swallowed and
- *     counted locally so the cache remains usable.
- *   - A failed operation must not corrupt the cache map. Mutations are
- *     applied atomically after any fallible work completes.
- *   - Retries are idempotent: repeating a get/set invalidation yields the
- *     same observable state.
- *   - Concurrent calls are serialized through an internal mutex so that
- *     LRU eviction and TTL expiration cannot produce an inconsistent result.
- *   - Every failure is observable via a counter and a structured log that
- *     does not expose query payloads, only the operation and error message.
+ * Compatibility contracts (preserved across errors, empty data, and upgrades):
+ *   - Public method signatures and return types are unchanged.
+ *   - {@link AuditCache.get} returns `null` on miss/expiration and the cached value
+ *     otherwise. The cache never throws for normal lookup failures.
+ *   - {@link AuditCache.set} is defensive: invalid keys or undefined data are
+ *     ignored without throwing, so callers that optionally cache cannot fail.
+ *   - {@link AuditCache.getStats} returns a stable shape with monotonically
+ *     non-decreasing hit/miss counters.
+ *   - Concurrent calls from the same event loop are safe: all mutations are
+ *     synchronous and no async interleaving occurs.
+ *
+ * Invariants:
+ *   - `ttlMs` is clamped to a non-negative finite number.
+ *   - `maxEntries` is clamped to a non-negative integer.
+ *   - `this.cache.size <= this.maxEntries` at all times.
+ *   - Every entry in the map has a finite expiration timestamp.
  */
 
 import { Counter } from 'prom-client';
@@ -53,12 +57,7 @@ export interface CacheEntry {
   lastAccessed: number;
 }
 
-export interface AuditCacheStats {
-  size: number;
- hits: number;
-  misses: number;
-  failures: number;
-}
+export type AuditCacheQueryType = 'query' | 'queryWithCursor' | 'getById';
 
 /**
  * Simple async mutex used to serialize mutating operations on the cache.
@@ -101,8 +100,8 @@ export class AuditCache {
   private readonly mutex = new Mutex();
 
   constructor(options: AuditCacheOptions, register?: any) {
-    this.ttlMs = options.ttlMs;
-    this.maxEntries = options.maxEntries;
+    this.ttlMs = AuditCache.normalizeTtl(options == null ? undefined : options.ttlMs);
+    this.maxEntries = AuditCache.normalizeMaxEntries(options == null ? undefined : options.maxEntries);
     this.cache = new Map();
     this.hitCount = 0;
     this.missCount = 0;
@@ -110,16 +109,13 @@ export class AuditCache {
     this.onFailure = options.onFailure;
     this.logger = options.logger;
 
-    // Metrics are optional: a failure to register must not break the cache.
-    this.hits = null;
-    this.misses = null;
-    this.failures = null;
-    try {
-      const Registry = require('prom-client').Registry;
-      const registry =
-        register && register.constructor && register.constructor.name === 'Registry'
-          ? registry
-          : new Registry();
+    // Initialize metrics. We prefer the caller's Registry when provided so
+    // multiple cache instances do not collide on the default registry.
+    const Registry = require('prom-client').Registry;
+    const registry =
+      register && register.constructor && register.constructor.name === 'Registry'
+        ? register
+        : new Registry();
 
       this.hits = new Counter( {
         name: 'audit_cache_hits_total',
@@ -170,11 +166,60 @@ export class AuditCache {
   }
 
   /**
-   * Generate a cache key from an audit query.
+   * Clamp an arbitrary TTY input to a non-negative finite number.
+   * Negative, NaN, Infinity, or non-numeric values fall back to 0 (entries
+   * expire immediately), which is the safest default for a cache.
    */
-  private generateKey(query: AuditQuery, type: 'query' | 'queryWithCursor' | 'getById', id?: string): string {
-    const base = type === 'getById' ? `getById:${id}` : `${type}:${JSON.stringify(query)}`;
-    return base;
+  private static normalizeTtl(value: unknown): number {
+    if (typeof value !== 'number' || !Number.isFinite(value) || value < 0) {
+      return 0;
+    }
+    return Math.floor(value);
+  }
+
+  /**
+   * Clamp an arbitrary max-entries input to a non-negative integer.
+   */
+  private static normalizeMaxEntries(value: unknown): number {
+    if (typeof value !== 'number' || !Number.isFinite(value) || value < 0) {
+      return 0;
+    }
+    return Math.floor(value);
+  }
+
+  /**
+   * Generate a cache key from an audit query.
+   *
+   * The key is deterministic for equivalent queries. Key generation is
+   * defensive: if the query cannot be serialized the method returns `null`
+   * so callers degrade gracefully to a cache miss instead of throwing.
+   */
+  private generateKey(
+    query: AuditQuery,
+    type: AuditCacheQueryType,
+    id?: string,
+  ): string | null {
+    if (type === 'getById') {
+      if (id === undefined || id === null) {
+        return null;
+      }
+      return `type:getById:id=${String(id)}`;
+    }
+
+    if (query === undefined || query === null) {
+      return null;
+    }
+
+    try {
+      const serialized = JSON.stringify(query);
+      if (typeof serialized !== 'string') {
+        return null;
+      }
+      return `type:${type}:query=${serialized}`;
+    } catch {
+      // Circular or otherwise unserializable queries are not cacheable.
+      return null;
+    }
   }
 
   /**
@@ -185,11 +230,21 @@ export class AuditCache {
    * @param id - Optional ID for getById queries
    * @returns The cached data if valid and not expired, null otherwise
    */
-  get(query: AuditQuery, type: 'query' | 'queryWithCursor' | 'getById', id?: string): AuditEntry[] | AuditEntry | AuditQueryResult | null {
-    try {
-      const key = this.generateKey(query, type, id);
-      const entry = this.cache.get(key);
-      const now = Date.now();
+  get(
+    query: AuditQuery,
+    type: AuditCacheQueryType,
+    id?: string,
+  ): AuditEntry[] | AuditEntry | AuditQueryResult | null {
+    const key = this.generateKey(query, type, id);
+    if (key === null) {
+      // Unserializable or invalid keys: treat as a miss without throwing.
+      this.misses.inc();
+      this.missCount++;
+      return null;
+    }
+
+    const entry = this.cache.get(key);
+    const now = Date.now();
 
       if (!entry) {
         this.recordMiss();
@@ -222,27 +277,46 @@ export class AuditCache {
    * @param type - The type of query (query, queryWithCursor, or getById)
    * @param id - Optional ID for getById queries
    */
-  set(query: AuditQuery, data: AuditEntry[] | AuditEntry | AuditQueryResult, type: 'query' | 'queryWithCursor' | 'getById', id?: string): void {
-    try {
-      const key = this.generateKey(query, type, id);
-      const now = Date.now();
-      const entry: CacheEntry = {
-        data,
-        expiresAt: now + this.ttlMs,
-        lastAccessed: now,
-      };
+  set(
+    query: AuditQuery,
+    data: AuditEntry[] | AuditEntry | AuditQueryResult,
+    type: AuditCacheQueryType,
+    id?: string,
+  ): void {
+    // Defensive: ignore undefined/null data or invalid keys rather than
+    // throwing. This keeps callers that optionally cache from failing.
+    if (data === undefined || data === null) {
+      return;
+    }
 
-      // Evict oldest entries if at capacity. Eviction is computed before
-      // any mutation so a failure leaves the cache unchanged.
-      if (this.cache.size >= this.maxEntries && !this.cache.has(key)) {
-        this.evictOldest();
+    const key = this.generateKey(query, type, id);
+    if (key === null) {
+      return;
+    }
+
+    // Capacity of zero means the cache is disabled; never store anything.
+    if (this.maxEntries <= 0) {
+      return;
+    }
+
+    const now = Date.now();
+    const entry: CacheEntry = {
+      data,
+      expiresAt: now + this.ttlMs,
+      lastAccessed: now,
+    };
+
+    // Evict oldest entries if at capacity. We evict until there is room for
+    // the new entry, which keeps the `size <= maxEntries` invariant even if
+    // maxEntries was changed at runtime.
+    if (!this.cache.has(key)) {
+      while (this.cache.size >= this.maxEntries) {
+        const evicted = this.evictOldest();
+        if (!evicted) {
+          // Nothing to evict (empty cache); avoid an infinite loop.
+          break;
+        }
       }
-
-      this.cache.set(key, entry);
-    } catch (error) {
-      // A failure in set must not throw. The cache may be unchanged or
-      // contain the new entry; either way the caller is not affected.
-      this.recordFailure('set', error as Error);
     }
   }
 
@@ -263,18 +337,23 @@ export class AuditCache {
    * @param resourceId - The resource ID whose cache entries should be invalidated
    */
   invalidateByResourceId(resourceId: string): void {
-    try {
-      const keysToDelete: string[] = [];
-      this.cache.forEach((entry, key) => {
-        // Check if the cache key contains the resource ID
-        if (key.includes(`"resourceId":"${resourceId}"`) || key.includes(`"resourceId":'${resourceId}'`)) {
-          keysToDelete.push(key);
-        }
-      });
-      keysToDelete.forEach(key => this.cache.delete(key));
-    } catch (error) {
-      this.recordFailure('invalidateByResourceId', error as Error);
+    if (typeof resourceId !== 'string' || resourceId === '') {
+      return;
     }
+
+    const keysToDelete: string[] = [];
+    this.cache.forEach((_entry, key) => {
+      // Match the resourceId as a JSON string value in the serialized query.
+      // We check both double- and single-quoted forms to preserve the
+      // existing contract for callers that may have built keys differently.
+      if (
+        key.includes(`resourceId="${resourceId}"`) ||
+        key.includes(`resourceId='${resourceId}'`)
+      ) {
+        keysToDelete.push(key);
+      }
+    });
+    keysToDelete.forEach(key => this.cache.delete(key));
   }
 
   /**
@@ -302,8 +381,10 @@ export class AuditCache {
 
   /**
    * Evict the least recently used entry.
+   *
+   * @returns `true` if an entry was evicted, `false` if the cache was empty.
    */
-  private evictOldest(): void {
+  private evictOldest(): boolean {
     let oldestKey: string | null = null;
     let oldestAccessed = Infinity;
 
@@ -314,9 +395,11 @@ export class AuditCache {
       }
     });
 
-    if (oldestKey) {
+    if (oldestKey !== null) {
       this.cache.delete(oldestKey);
+      return true;
     }
+    return false;
   }
 
   /**

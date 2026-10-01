@@ -4,6 +4,26 @@
 //! ```text
 //! cargo test -p predictify-hybrid batch_operations_tests -- --nocapture
 //! ```
+//!
+//! # Compatibility contract
+//!
+//! Everything asserted in this module is part of the contract's public
+//! behaviour. Changing any of it is a breaking change for on-chain clients:
+//!
+//! * `(caller, idempotency_key)` is the unit of deduplication. Two different
+//!   callers may reuse the exact same 32-byte token without conflict, and one
+//!   caller may use any number of distinct tokens.
+//! * The payload does not participate in the key: reusing a consumed token
+//!   with a *different* batch is still rejected.
+//! * An empty batch is rejected before any state is touched.
+//! * The `[0u8; 32]` token opts out of deduplication entirely and must not
+//!   write any state (deprecated backward-compat path).
+//! * A consumed token is rejected for `IDEM_KEY_TTL_LEDGERS` ledgers starting
+//!   at the ledger it was consumed on, and is accepted again on the first
+//!   ledger after that window. The contract instance itself stays invokable
+//!   across the whole window.
+//! * A sentinel written by an older contract version (no recorded ledger) is
+//!   a durable replay guard, never an expiring one.
 
 #![cfg(test)]
 
@@ -20,8 +40,8 @@ fn fresh_env() -> Env {
     Env::default()
 }
 
-fn register(env: &Env) -> (Address, PredictifyHybridClient) {
-    let contract_id = env.register(crate::PredictifyHybrid, ());
+fn register(env: &Env) -> (Address, PredictifyHybridClient<'_>) {
+    let contract_id = env.register_contract(None, crate::PredictifyHybrid);
     let client = PredictifyHybridClient::new(env, &contract_id);
     (contract_id, client)
 }
@@ -32,6 +52,10 @@ fn caller(env: &Env) -> Address {
 
 fn key(env: &Env, seed: u8) -> BytesN<32> {
     BytesN::from_array(env, &[seed; 32])
+}
+
+fn zero_key(env: &Env) -> BytesN<32> {
+    BytesN::from_array(env, &[0u8; 32])
 }
 
 fn one_bet(env: &Env) -> Vec<Bet> {

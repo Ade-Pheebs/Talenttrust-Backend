@@ -1,6 +1,20 @@
-use soroban_sdk::contracterror;
+use soroban_contracterror;
 
-/// Contract-level error codes returned as `Err(Error::*)`.
+/// Contract-level error codes returned as `Err(Error::)`.
+///
+/// ## Client handling (#1288)
+///
+/// | Code | Variant                         | Batch applied? | Retry with same key? |
+/// |------|---------------------------------|----------------|----------------------|
+/// | 1    | `IdempotentBatchAlreadyApplied` | yes (earlier)  | no — query `get_batch_receipt` |
+/// | 2    | `EmptyBatch`                    | no             | yes, after fixing the batch |
+/// | 3    | `InvalidAmount`                 | no             | yes, after fixing the batch |
+/// | 4    | `BatchTooLarge`                 | no             | yes, after splitting (new keys) |
+/// | 5    | `AmountOverflow`                | no             | yes, after fixing the batch |
+///
+/// Every error is returned *before* any state is written, and Soroban
+/// rolls back all writes and events of a failed invocation, so an error
+/// never leaves a consumed key or a half-applied batch behind.
 ///
 /// All variants map to a **stable `u32` discriminant** that clients and
 /// off-chain tooling can pattern-match on after invoking the contract.

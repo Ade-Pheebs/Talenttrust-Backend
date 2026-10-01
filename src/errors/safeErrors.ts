@@ -12,19 +12,27 @@
  *  Threat mitigated: information disclosure via verbose error responses
  *  (OWASP A01:2021 -- Broken Access Control / CWE-209).
  *
- * @invariants
- *  - `sanitizeErrorMessage` is total: it never throws and always returns a
- *    non-empty string, so callers can rely on it in failure paths without
- *    introducing a secondary failure.
- *  - Error codes are stable identifiers; unknown codes deterministically
- *    resolve to the `internal_error` fallback.
- *  - Sanitization is idempotent: sanitizing an already-sanitized message
- *    yields the same value, which keeps retries and re-serialization safe.
+ * @compatibility
+ *  The exported symbols in this module form a stable public contract:
+ *  `SAFE_ERROR_MESSAGES`, `containsUnsafeContent`, `safeMessageForCode`,
+ *  `sanitizeErrorMessage`, `SorobanRpcErrorClass`, `classifySorobanRpcError`,
+ *  and `shouldRetrySorobanRpcError` must remain importable with their current
+ *  signatures. New error codes may be added to `SAFE_ERROR_MESSAGES`; existing
+ *  entries must not be removed or have their messages changed without a
+ *  documented migration, since clients rely on these strings.
  */
 
 /**
  * Canonical mapping of machine codes to safe, client-facing messages.
  * Any error code not listed here gets the `internal_error` fallback.
+ *
+ * @invariant
+ *  - `internal_error` MUST always be present; it is the fallback used by
+ *    `safeMessageForCode` and `sanitizeErrorMessage`.
+ *  - Every value is a non-empty, human-readable string that contains no
+ *    internal identifiers, paths, or stack frames.
+ *  - Keys are treated as stable machine codes; adding new keys is
+ *    backward-compatible, removing or renaming keys is a breaking change.
  */
 export const SAFE_ERROR_MESSAGES: Readonly<Record<string, string>> = {
   internal_error: 'An unexpected error occurred',
@@ -56,6 +64,11 @@ export const SAFE_ERROR_MESSAGES: Readonly<Record<string, string>> = {
 /**
  * Patterns that must never appear in a client-facing error message.
  * Used by `containsUnsafeContent` to catch accidental leakage.
+ *
+ * @invariant
+ *  Each pattern is a `RegExp` with no global flag so that repeated calls to
+ *  `containsUnsafeContent` are deterministic (no `lastIndex` state carried
+ *  between invocations).
  */
 const UNSAFE_PATTERNS: ReadonlyArray<RegExp> = [
   /at\s+\S+\s+\(.*:\d+:\d+\)/,        // V8 stack frame
@@ -72,6 +85,9 @@ const UNSAFE_PATTERNS: ReadonlyArray<RegExp> = [
 /**
  * Returns `true` when `message` contains patterns that suggest internal
  * implementation details that should not reach the client.
+ *
+ * Deterministic for any input: non-string inputs are rejected by the type
+ * system, and the underlying patterns are stateless.
  */
 export function containsUnsafeContent(message: string): boolean {
   return UNSAFE_PATTERNS.some((pattern) => pattern.test(message));
@@ -80,6 +96,10 @@ export function containsUnsafeContent(message: string): boolean {
 /**
  * Returns the canonical safe message for a given error code.
  * Falls back to `internal_error` when the code is not recognised.
+ *
+ * @invariant
+ *  Always returns a non-empty string. Unknown, empty, or malformed codes
+ *  deterministically resolve to the `internal_error` message.
  */
 export function safeMessageForCode(code: string): string {
   return SAFE_ERROR_MESSAGES[code] ?? SAFE_ERROR_MESSAGES['internal_error'];
@@ -90,6 +110,12 @@ export function safeMessageForCode(code: string): string {
  * fallback for `code` when the message contains suspicious content.
  *
  * This is the primary guard used in error serialization paths.
+ *
+ * @invariant
+ *  - Returns a string that never contains unsafe content.
+ *  - If `message` is unsafe, the return value equals `safeMessageForCode(code)`.
+ *  - If `message` is safe, it is returned unchanged (identity preserved) so
+ *    callers relying on exact-match messages remain compatible.
  */
 export function sanitizeErrorMessage(message: string, code: string): string {
   // Deterministic handling of non-string / empty inputs: never throw, never
@@ -129,6 +155,10 @@ export function sanitizeErrorMessage(message: string, code: string): string {
  *
  * Provider-specific codes are preserved for auditability; message sanitization
  * is handled separately by `sanitizeErrorMessage`.
+ *
+ * @compatibility
+ *  Enum member string values are part of the public contract and must not
+ *  change; downstream retry logic and metrics rely on these exact strings.
  */
 
 export enum SorobanRpcErrorClass {
@@ -143,6 +173,10 @@ export enum SorobanRpcErrorClass {
 /**
  * A Minimal structural shape used for classification. We avoid duplicating the
  * full provider error type so this module remains dependency-free.
+ *
+ * @internal
+ *  Not exported; safe to evolve as long as `classifySorobanRpcError` keeps
+ *  its public signature.
  */
 interface SorobanRpcErrorLike {
   code?: string | number;
@@ -162,6 +196,13 @@ interface SorobanRpcErrorLike {
  *
  * @param error The error thrown by the RPC layer.
  * @returns A stable `SorobanRpcErrorClass` member.
+ *
+ * @invariant
+ *  - Deterministic: the same input always yields the same class.
+ *  - Total: never throws; `null`, `undefined`, primitives, and malformed
+ *    objects all resolve to `SorobanRpcErrorClass.UNKNOWN`.
+ *  - Classification order is stable and documented above; reordering the
+ *    checks is a behavioral change requiring a compatibility review.
  */
 export function classifySorobanRpcError(error: unknown): SorobanRpcErrorClass {
   const err = toErrorLike(error);
@@ -204,6 +245,10 @@ export function classifySorobanRpcError(error: unknown): SorobanRpcErrorClass {
 /**
  * Returns `true` when the error class indicates a retry is likely to succeed.
  * Rate-limited calls should be retried only after honoring `Retry-After`.
+ *
+ * @invariant
+ *  Pure and total: returns a boolean for every `SorobanRpcErrorClass` member,
+ *  including future additions (which default to `false`).
  */
 export function shouldRetrySorobanRpcError(errorClass: SorobanRpcErrorClass): boolean {
   return (

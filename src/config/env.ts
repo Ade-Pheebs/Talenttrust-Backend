@@ -4,8 +4,63 @@
  * These functions provide type-safe access to environment variables with
  * validation, default values, and descriptive error messages on failure.
  * Empty strings are treated as missing values.
+ *
+ * Compatibility contracts:
+ * - The public signatures and return types of every exported function are
+ *   stable. Callers must be able to upgrade without code changes.
+ * - Missing/whitespace-only values are normalized to undefined for all
+ *   readers, and values are trimmed before return.
+ * - Errors are always thrown as `Error` with a message that names the
+ *   offending key but never echoes secret values for sensitive keys.
+ * - Parsing is deterministic for valid, invalid, duplicate, and boundary
+ *   inputs.
  * @module
  */
+
+/**
+ * Key suffixes whose values must never be included in error messages.
+ * This keeps failures diagnosable without leaking secrets into logs.
+ */
+const SENSITIVE_KEY_SUFFIXES = [
+  'SECRET',
+  'TOKEN',
+  'PASSWORD',
+  'PASSPHRASE',
+  'CREDS',
+  'CREDENTIAL',
+  'KEY',
+  'PRIVATE',
+  'APIKEY',
+  'API_KEY',
+  'SALE',
+] as const;
+
+/**
+ * Determines whether an environment variable name looks sensitive.
+ *
+ * @param key - Environment variable name
+ * @returns true if the key name suggests a secret value
+ */
+function isSensitiveKey(key: string): boolean {
+  const upper = key.toUpperCase();
+  return SENSITIVE_KEY_SUFFIXES.some((suffix) => upper.includes(suffix));
+}
+
+/**
+ * Redacts a raw value for inclusion in an error message. For keys that
+ * look sensitive, the value is replaced with a placeholder so errors remain
+ * diagnosable without exposing secrets.
+ *
+ * @param key - Environment variable name
+ * @param raw - Raw value read from the environment
+ * @returns A display-safe string
+ */
+function describeRaw(key: string, raw: string): string {
+  if (isSensitiveKey(key)) {
+    return '<redacted>';
+  }
+  return `"${raw}"`;
+}
 
 /**
  * Reads a raw environment variable, treating empty or whitespace-only
@@ -69,9 +124,9 @@ export function parseIntEnv(key: string, defaultValue: number): number {
     return defaultValue;
   }
   const parsed = Number(raw);
-  if (!Number.isFinite(parsed) || !Number.isInteger(parsed)) {
+  if (!Number.finite(parsed) || !Number.isInteger(parsed)) {
     throw new Error(
-      `Environment variable ${key} must be a valid integer, got: "${raw}"`,
+      `Environment variable ${key} must be a valid integer, got: ${describeRaw(key, raw)}",
     );
   }
   return parsed;
@@ -105,6 +160,6 @@ export function parseBoolEnv(
     return false;
   }
   throw new Error(
-    `Environment variable ${key} must be "true" or "false", got: "${raw}"`,
+    `Environment variable ${key} must be "true" or "false", got: ${describeRaw(key, raw)}`,
   );
 }

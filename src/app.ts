@@ -34,15 +34,27 @@ interface AppFactoryOptions {
 }
 
 /**
- * Marker attached to an Express app once its terminal (not-found / error)
- * handlers have been installed. This makes attachment idempotent: repeated
-
- * calls to `attachTerminalHandlers` are no-ops, so a retry or concurrent
- * initialization path cannot accidentally double-register the error handler
- * (which would change response shaping and log noise).
+ * Compatibility contract for the Express application factory.
+ *
+ * @internal This interface is the public contract for {@link createApp}.
+ * It is intentionally exported so tests and consumers can depend on the
+ * factory shape without importing internal modules. Additive fields are
+ * allowed; renaming or removing existing fields is a breaking change.
  */
-const TERMINAL_HANDLERS_ATTACHED_SYMBOL = Symbol.for('talenttrust.terminalHandlersAttached');
+export interface AppFactoryOptions {
+  /**
+   * When `true` (default), the terminal not-found and error handlers are
+   * attached to the app. Set to `false` in tests that mount the app as a
+   * subscriber or that need to inspect unhandled routes.
+   */
+  includeTerminalHandlers?: boolean;
+}
 
+/**
+ * Attaches the terminal not-found and error handlers to an Express app.
+ *
+ * @param app - Express application instance
+ */
 export function attachTerminalHandlers(app: express.Application): void {
   if ((app as unknown as Record<symbol, unknown>)[TERMINAL_HANDLERS_ATTACHED_SYMBOL]) {
     return;
@@ -52,6 +64,13 @@ export function attachTerminalHandlers(app: express.Application): void {
   app.use(errorHandler);
 }
 
+/**
+ * Creates the Express application with all routes and middleware wired.
+ *
+ * @param options - Factory options. Omitting it is equivalent to passing
+ *                an empty object.
+ * @returns The configured Express application.
+ */
 export function createApp(options?: AppFactoryOptions): express.Application {
   const includeTerminalHandlers = options?.includeTerminalHandlers ?? true;
   const env = validateEnv();
@@ -119,6 +138,13 @@ export function createApp(options?: AppFactoryOptions): express.Application {
   return app;
 }
 
+/**
+ * Gracefully shuts down rate-limit stores used by the application.
+ *
+ * @internal This function is exported for tests and the process shutdown
+ * hook. It must remain idempotent and must not throw if a store is already
+ * destroyed or missing.
+ */
 export function shutdownRateLimitStore(): void {
   if (rateLimitStore && typeof (rateLimitStore as any).destroy === 'function') {
     (rateLimitStore as any).destroy();

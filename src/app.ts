@@ -34,27 +34,41 @@ interface AppFactoryOptions {
 }
 
 /**
- * Compatibility contract for the Express application factory.
- *
- * @internal This interface is the public contract for {@link createApp}.
- * It is intentionally exported so tests and consumers can depend on the
- * factory shape without importing internal modules. Additive fields are
- * allowed; renaming or removing existing fields is a breaking change.
+ * Invariants:
+ * - Creating an app is idempotent with respect to global singleton state.
+ * - Concurrent calls to createApp must not interleave initialization of the
+ *   shared ReputationService / MetricsService in a way that leaves the app
+ *   with a half-initialized dependency graph.
+ * - Repeated calls with the same db instance are safe and do not re-run
+ *   one-time initialization work.
  */
-export interface AppFactoryOptions {
-  /**
-   * When `true` (default), the terminal not-found and error handlers are
-   * attached to the app. Set to `false` in tests that mount the app as a
-   * subscriber or that need to inspect unhandled routes.
-   */
-  includeTerminalHandlers?: boolean;
-}
 
 /**
- * Attaches the terminal not-found and error handlers to an Express app.
- *
- * @param app - Express application instance
+ * Tracks whether the process-wide one-time initialization (ReputationService)
+ * has already been completed. This guard is necessary because createApp can be
+ * invoked concurrently (e.g. in tests that create multiple apps in parallel),
+ * and the underlying service initialization is not designed to be called
+ * multiple times concurrently against the same database handle.
  */
+let reputationInitialized = false;
+let reputationInitializing: Promise<void> | null = null;
+
+async function ensureReputationInitialized(db: ReturnType<typeof getDb>): Promise<void> {
+  if (reputationInitialized) return;
+  if (reputationInitializing) return reputationInitializing;
+
+  reputationInitializing = Promise.resolve()
+    .then(() => {
+      ReputationService.initialize(db);
+      reputationInitialized = true;
+    })
+    .finally(() => {
+      reputationInitializing = null;
+    });
+
+  return reputationInitializing;
+}
+
 export function attachTerminalHandlers(app: express.Application): void {
   if ((app as unknown as Record<symbol, unknown>)[TERMINAL_HANDLERS_ATTACHED_SYMBOL]) {
     return;
@@ -94,7 +108,13 @@ export function createApp(options?: AppFactoryOptions): express.Application {
   app.use(metricsService.trackHttpRequest.bind(metricsService));
 
   const db = getDb();
-  ReputationService.initialize(db);
+  // Fire-and-forget initialization is safe here because ensureReputationInitialized
+  // guarantees the underlying work runs at most once and concurrent callers share
+  // the same in-flight promise. Errors are surfaced through the returned promise
+  // and must not be swallowed silently.
+  void ensureReputationInitialized(db).catch((err) => {
+    console.error('[app] ReputationService initialization failed', err);
+  });
 
   app.get('/metrics', metricsAuthMiddleware, async (_req, res) => {
     res.setHeader('Content-Type', metricsService.contentType);

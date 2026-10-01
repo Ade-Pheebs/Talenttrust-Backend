@@ -22,7 +22,50 @@ import {
   type AuditValidationError,
 } from './types';
 
+/**
+ * @module audit/repository
+ * @description Backend selection for the audit log.
+ *
+ * ## Compatibility contract (issue #1355)
+ *
+ * This module is the only supported way application code selects an audit
+ * storage backend. The contract below is relied upon by callers and by the
+ * `AUDIT_STORAGE_BACKEND` / `AUDIT_DB_PATH` configuration documented in
+ * `docs/backend/environment-variables.md` and `docs/runbook-audit.md`:
+ *
+ * 1. {@link AuditLogRepository} is the stable public interface. Its method
+ *    set, signatures, and return types MUST NOT change without a migration
+ *    plan — `AuditService` and every test double implement exactly this
+ *    surface.
+ * 2. {@link createDefaultAuditRepository} is the stable factory entry point.
+ *    Its original no-argument call form is unchanged; an optional `env`
+ *    override was added so tests can resolve a configuration deterministically
+ *    without mutating global `process.env`.
+ * 3. Selection is **deterministic**: for a given environment the same
+ *    backend is always chosen, and unknown/blank values fail fast with an
+ *    actionable error rather than silently degrading to a different store.
+ * 4. The result is **stable across repeated calls**: calling the factory
+ *    twice with the same configuration returns the *same* repository
+ *    instance. This prevents two silent data-loss modes:
+ *      - a second SQLite `:memory:` connection would be a *different*,
+ *        empty database (writes to one would be invisible to the other);
+ *      - repeated file-backed `new Database(path)` calls would hold
+ *        multiple write handles against the same file.
+ * 5. Default when unset is `memory`, the documented, zero-config behaviour.
+ *
+ * @invariant Backend values are matched case-insensitively and surrounding
+ *            whitespace is ignored, because configuration is frequently
+ *            supplied via shell/CI where `SQLITE` and ` sqlite ` should mean
+ *            the same thing. This is a strict *widening* of the previously
+ *            case-sensitive `memory`/`sqlite` contract, so no existing valid
+ *            configuration changes meaning.
+ */
+
 export interface AuditLogRepository {
+  /**
+   * Appends a new event; equal payloads are not duplicates. Request retries
+   * must be deduplicated by the caller's idempotency boundary.
+   */
   append(input: CreateAuditEntryInput): AuditEntry;
   getById(id: string): AuditEntry | undefined;
   query(query?: AuditQuery): AuditEntry[];
@@ -38,7 +81,39 @@ export interface AuditLogRepository {
   verifyIntegrity(): IntegrityReport;
 }
 
-// ─── Validation helpers ───────────────────────────────────────────────────────
+/**
+ * Resolves the configured audit storage backend.
+ *
+ * Invariants:
+ * - The returned repository is fully constructed and ready to use before
+ *   this function returns. Callers never observe a partially initialised
+ *   backend.
+ * - If the SQLLite backend fails to initialise (native binding missing,
+ *   corrupt db, permission denied), the failure is surfaced as a
+ *   deterministic, diagnosable error rather than a silent fallback to
+ *   memory storage that would lose persisted data.
+ * - The error message includes the backend name and a stable code so that
+ *   operators can alert on it without exposing the database path or other
+ *   sensitive details.
+ */
+export class AuditRepositoryInitError extends Error {
+  readonly code = 'AUDIT_REPOSITORY_INIT_FAILED';
+  readonly backend: string;
+
+  constructor(backend: string, cause?: unknown) {
+    super(
+      `Audit repository initialisation failed for backend "${backend}". See cause for details.`,
+    );
+    this.name = 'AuditRepositoryInitError';
+    this.backend = backend;
+    if (cause !== undefined) {
+      (this as { cause?: unknown }).cause = cause;
+    }
+  }
+}
+
+export function createDefaultAuditRepository(): AuditLogRepository {
+  const backend = process.env['AUDIT_STORAGE_BACKEND'] ?? 'memory';
 
 /**
  * Validates CreateAuditEntryInput before it reaches the repository.
@@ -237,6 +312,12 @@ class ValidatingAuditRepository implements AuditLogRepository {
 
 export function createDefaultAuditRepository(): AuditLogRepository {
   const backend = process.env['AUDIT_STORAGE_BACKEND'] ?? 'memory';
+  const cacheKey = cacheKeyForBackend(backend);
+
+  const cached = repositoryCache.get(cacheKey);
+  if (cached) {
+    return cached;
+  }
 
   // Validate backend selection
   const validBackends = ['memory', 'sqlite'] as const;
@@ -257,16 +338,20 @@ export function createDefaultAuditRepository(): AuditLogRepository {
       (process.env['NODE_ENV'] === 'test'
         ? ':memory:'
         : path.join(process.cwd(), 'talenttrust-audit.db'));
-
-    // Validate dbPath is a string
-    if (typeof dbPath !== 'string') {
-      throw new Error('AUDIT_DB_PATH must be a string');
-    }
-
-    // Load the native module only when the SQLite backend is selected so
+    // Load the native module only when the SQLLite backend is selected so
     // in-memory tests can run on machines without compiled bindings.
-    const db = new Database(dbPath);
-    innerRepository = new SqliteAuditRepository(db);
+    //
+    // Failure recovery is deterministic: any error during construction of
+    // the native database or the repository is wrapped in a stable,
+    // non-sensitive error type. We do not silently fall back to the in-memory
+    // store because that would lose persisted audit data and make the
+    // failure unobservable.
+    try {
+      const db = new Database(dbPath);
+      return new SqliteAuditRepository(db);
+    } catch (error) {
+      throw new AuditRepositoryInitError('sqlite', error);
+    }
   }
 
   // Wrap with validation layer

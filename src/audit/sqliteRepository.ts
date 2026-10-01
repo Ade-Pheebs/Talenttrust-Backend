@@ -1,6 +1,6 @@
 import { randomUUID } from 'crypto';
 import Database from "../db/betterSqlite3";
-import { computeEntryHash, GENESIS_HASH } from './store';
+import { computeEntryHash, GENESIS_HASH, CURSOR_FILTER_MISMATCH_MESSAGE } from './store';
 import type { AuditEntry, AuditQuery, CreateAuditEntryInput, IntegrityReport, AuditQueryResult, CursorData } from './types';
 import { encodeCursor, decodeCursor } from './types';
 import type { AuditLogRepository } from './repository';
@@ -225,6 +225,37 @@ export class SqliteAuditRepository implements AuditLogRepository {
       // Always release the guard — even on error — so the caller can recover.
       this._appendInProgress = false;
     }
+      this.db
+        .prepare<
+          [string, string, string, string, string, string, string, string, string | null, string | null, string, string]
+        >(
+          `INSERT INTO audit_log_entries
+           (id, timestamp, action, severity, actor, resource, resource_id, metadata_json, ip_address, correlation_id, hash, previous_hash)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+        )
+        .run(
+          entry.id,
+          entry.timestamp,
+          entry.action,
+          entry.severity,
+          entry.actor,
+          entry.resource,
+          entry.resourceId,
+          JSON.stringify(entry.metadata),
+          entry.ipAddress ?? null,
+          entry.correlationId ?? null,
+          entry.hash,
+          entry.previousHash
+        );
+
+      return entry;
+    });
+
+    // Acquire SQLite's writer lock before reading the chain tip. With a
+    // deferred transaction, competing writers can read the same snapshot and
+    // then fail while upgrading to a write lock instead of serializing cleanly.
+    const immediate = (insert as typeof insert & { immediate?: (payload: CreateAuditEntryInput) => AuditEntry }).immediate;
+    return typeof immediate === 'function' ? immediate(input) : insert(input);
   }
 
   getById(id: string): AuditEntry | undefined {
@@ -290,6 +321,24 @@ export class SqliteAuditRepository implements AuditLogRepository {
         if (lastEntryRow) {
           startIndex = lastEntryRow.seq;
         }
+        
+        // Verify filters match cursor (prevent filter drift)
+        if (cursorData.filters.action !== query.action ||
+            cursorData.filters.severity !== query.severity ||
+            cursorData.filters.actor !== query.actor ||
+            cursorData.filters.resource !== query.resource ||
+            cursorData.filters.resourceId !== query.resourceId ||
+            cursorData.filters.from !== query.from ||
+            cursorData.filters.to !== query.to) {
+          throw new Error(CURSOR_FILTER_MISMATCH_MESSAGE);
+        }
+      } catch (error) {
+        // Re-throw filter mismatch errors, but handle invalid cursor format gracefully
+        if (error instanceof Error && error.message === CURSOR_FILTER_MISMATCH_MESSAGE) {
+          throw error;
+        }
+        // If cursor is invalid (format error), start from beginning
+        startIndex = 0;
       }
     }
     

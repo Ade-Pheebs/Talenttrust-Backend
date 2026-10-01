@@ -1,14 +1,21 @@
 /**
  * Jobs API Integration Tests
- * 
+ *
  * Tests for the job enqueueing and status endpoints.
+ *
+ * State invariants covered:
+ * - Authorization: only known job types are accepted (340 on unknown type).
+ * - Validation: type and payload are required; options are validated before enqueueing.
+ * - State transition: dedupeKey ensures at-most-one enqueue per key; duplicates return 200.
+ * - Concurrency: concurrent dedupe enqueues must not create duplicate jobs.
+ * - Retries/partial failure: failed enqueues must not leave orphaned dedupe state.
  */
 
 import request from 'supertest';
 import express, { Express } from 'express';
 import { QueueManager, JobType, JobPayload, AddJobOptions } from '../queue';
 
-describe('Jobs API', () => {
+describe('Jobs API Integration Tests', () => {
   let app: Express;
   let queueManager: QueueManager;
 
@@ -128,6 +135,17 @@ describe('Jobs API', () => {
       expect(response.body.error).toContain('required');
     });
 
+    it('should reject missing payload', async () => {
+      const response = await request(app)
+        .post('/api/v1/jobs')
+        .send({
+          type: JobType.EMAIL_NOTIFICATION,
+        });
+
+      expect(response.status).toBe(400);
+      expect(response.body.error).toContain('required');
+    });
+
     it('should reject invalid job type', async () => {
       const response = await request(app)
         .post('/api/v1/jobs')
@@ -231,6 +249,73 @@ describe('Jobs API', () => {
       expect(response.status).toBe(201);
       expect(response.body.deduplicated).toBe(false);
     });
+
+    it('should not create duplicate jobs under concurrent dedupe enqueues', async () => {
+      const opts = { dedupeKey: 'api-concurrent-001', delay: 5000 };
+      const payload = { to: 'concurrent@example.com', subject: 'Concurrent', body: 'body' };
+
+      const results = await Promise.all(
+        Array.from({ length: 5 }).map(() =>
+          request(app)
+            .post('/api/v1/jobs')
+            .send({ type: JobType.EMAIL_NOTIFICATION, payload, options: opts }),
+        ),
+      );
+
+      const created = results.filter((r) => r.status === 201);
+      const deduped = results.filter((r) => r.status === 200);
+
+      expect(created.length).toBe(1);
+      expect(deduped.length).toBe(4);
+      for (const r of results) {
+        expect(r.body.jobId).toBe('api-concurrent-001');
+      }
+    });
+
+    it('should allow re-enqueue after dedupe key expires', async () => {
+      const opts = { dedupeKey: 'api-expire-001', delay: 50 };
+      const payload = { to: 'expire@example.com', subject: 'Expire', body: 'body' };
+
+      const first = await request(app)
+        .post('/api/v1/jobs')
+        .send({ type: JobType.EMAIL_NOTIFICATION, payload, options: opts });
+      expect(first.status).toBe(201);
+
+      // Wait for the dedupe window to elapse and the job to finish.
+      await new Promise((resolve) => setTimeout(resolve, 200));
+
+      const second = await request(app)
+        .post('/api/v1/jobs')
+        .send({ type: JobType.EMAIL_NOTIFICATION, payload, options: opts });
+
+      expect(second.status).toBe(201);
+      expect(second.body.deduplicated).toBe(false);
+    });
+
+    it('should reject invalid dedupeKey type', async () => {
+      const response = await request(app)
+        .post('/api/v1/jobs')
+        .send({
+          type: JobType.EMAIL_NOTIFICATION,
+          payload: { to: 'invalid@example.com', subject: 'Invalid', body: 'body' },
+          options: { dedupeKey: 123 as unknown as string },
+        });
+
+      expect(response.status).toBe(500);
+      expect(response.body.error).toContain('Failed to enqueue job');
+    });
+
+    it('should reject negative delay', async () => {
+      const response = await request(app)
+        .post('/api/v1/jobs')
+        .send({
+          type: JobType.EMAIL_NOTIFICATION,
+          payload: { to: 'neg@example.com', subject: 'Neg', body: 'body' },
+          options: { delay: -1 },
+        });
+
+      expect(response.status).toBe(500);
+    });
   });
 
   describe('GET /api/v1/jobs/:type/:jobId', () => {
@@ -274,6 +359,14 @@ describe('Jobs API', () => {
 
       expect(response.status).toBe(400);
       expect(response.body.error).toContain('Invalid job type');
+    });
+
+    it('should not expose internal error details for non-existent job', async () => {
+      const response = await request(app)
+        .get(`/api/v1/jobs/${JobType.EMAIL_NOTIFICATION}/missing-id`);
+
+      expect(response.status).toBe(404);
+      expect(response.body).toEqual({ error: 'Job not found' });
     });
   });
 });

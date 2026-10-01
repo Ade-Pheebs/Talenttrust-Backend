@@ -726,3 +726,52 @@ describe('AuditExportService — path-traversal guard', () => {
     await result.cleanup();
   });
 });
+
+describe('AuditExportService - failure invariants', () => {
+  it('cleans up temporary directory if NDJSON pipeline fails', async () => {
+    const { exportService } = makeExportService([]);
+    // Force a failure during the streaming pipeline
+    jest.spyOn(exportService['service'], 'stream').mockReturnValue((function* () {
+      yield { action: 'CONTRACT_CREATED', severity: 'INFO', actor: 'bad', resource: 'bad' };
+      throw new Error('Simulated failure during streaming');
+    })() as any);
+
+    let caughtErr: Error | undefined;
+    try {
+      await exportService.createNdjsonExport();
+    } catch (err) {
+      caughtErr = err as Error;
+    }
+
+    expect(caughtErr).toBeDefined();
+    expect(caughtErr?.message).toBe('Simulated failure during streaming');
+
+    // To verify cleanup, we must check that no leftover audit-export-* directories exist in the exportRoot
+    const exportRoot = (exportService as any).exportRoot;
+    const dirs = await fsp.readdir(exportRoot).catch(() => []);
+    expect(dirs.filter(d => d.startsWith('audit-export-'))).toHaveLength(0);
+  });
+
+  it('cleans up temporary directory if CSV pipeline fails', async () => {
+    const { exportService } = makeExportService([]);
+    // Force a failure during the streaming pipeline
+    jest.spyOn(exportService['service'], 'stream').mockReturnValue((function* () {
+      yield { action: 'CONTRACT_CREATED', severity: 'INFO', actor: 'bad', resource: 'bad' };
+      throw new Error('Simulated CSV failure');
+    })() as any);
+
+    let caughtErr: Error | undefined;
+    try {
+      await exportService.createCsvExport();
+    } catch (err) {
+      caughtErr = err as Error;
+    }
+
+    expect(caughtErr).toBeDefined();
+    expect(caughtErr?.message).toBe('Simulated CSV failure');
+
+    const exportRoot = (exportService as any).exportRoot;
+    const dirs = await fsp.readdir(exportRoot).catch(() => []);
+    expect(dirs.filter(d => d.startsWith('audit-export-'))).toHaveLength(0);
+  });
+});

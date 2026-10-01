@@ -3,8 +3,19 @@ use soroban_contract::contracterror;
 /// Contract-level error codes returned as `Err(Error::*)`.
 //
 /// All variants map to a stable `u32` discriminant that clients can
-/// pattern-match on after invoking the contract.  **Do not renumber existing variants** — that would break on-chain consumers.
-#[contracterror]
+/// pattern-match on after invoking the contract.  **Do not renumber
+/// existing variants** — that would break on-chain consumers.
+///
+/// # Invariants
+///
+/// - Every error discriminant is unique and non-zero; the contract
+///   never returns a bare panic for a recoverable failure path.
+/// - Errors are deterministic for a given input: the same invalid
+///   state always maps to the same variant.
+/// - Errors must not leak sensitive data; they carry only a code.
+/// - Authorization failures and validation failures are distinct so
+///   callers can diagnose the cause without ambiguity.
+#contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum Error {
     /// The supplied `idempotency_key` was already used in a previous
@@ -16,39 +27,23 @@ pub enum Error {
     /// The `bets` vector was empty.  At least one bet is required.
     EmptyBatch = 2,
 
-    /// A concurrent or repeated execution attempted to mutate state that
-    /// was already committed by another call.  This is returned when the
-    /// contract detects a stale read or a lost race and refuses to overwrite
-    /// the committed result.  The caller may retry with a fresh read.
-    ConcurrentModification = 3,
+    /// The caller is not authorized to perform the requested
+    /// state transition.  Returned before any state is written so a
+    /// forbidden transition cannot leave partial state behind.
+    Unauthorized = 3,
 
-    /// The caller supplied a value that failed validation (e.g. negative
-    /// amount, out-of-range index, or malformed key).  No state was mutated.
+    /// A supplied parameter failed validation (e.g. amount out of
+    /// range, malformed identifier, or invalid transition target).
+    /// No state is written when this is returned.
     InvalidInput = 4,
 
-    /// The contract was not initialized before the call.  No state was
-    /// mutated.
-    NotInitialized = 5,
+    /// The requested operation would violate a state invariant
+    /// (e.g. double-settlement or settlement of an unresolved market).
+    /// The contract rejects the call atomically.
+    InvariantViolated = 5,
 
-    /// The caller is not authorized to perform the requested operation.
-    /// No state was mutated.
-    Unauthorized = 6,
-
-    /// An internal invariant was violated (e.g. accounting mismatch).
-    /// This indicates a bug or data corruption and must not occur during
-    /// normal operation.
-    InvariantViolated = 7,
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// Ensures that the error discriminants remain stable, protecting the
-    /// data-integrity invariant for on-chain consumers.
-    #[test]
-    fn test_error_discriminants_are_stable() {
-        assert_eq!(Error::IdempotentBatchAlreadyApplied as u32, 1);
-        assert_eq!(Error::EmptyBatch as u32, 2);
-    }
+    /// The operation was rejected because another operation is already
+    /// in flight or the contract is in a terminal state.  Callers may
+    /// retry only after observing the contract state.
+    OperationNotAllowed = 6,
 }

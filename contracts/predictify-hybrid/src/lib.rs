@@ -4,30 +4,34 @@
 ///
 /// ## Idempotency
 ///
-/// `place_bets` accepts a caller-supplied `BytesN<32>` idempotency key.
-/// The key is stored in instance storage under
+/// `place_bets` accepts a caller-supplied `BytesN<32>`
+/// idempotency key. The key is stored in instance storage under
 /// `DataKey::PlaceBetsIdem(caller, key)` with a TTL of
 /// [`storage::IDEM_KEY_TTL_LEDGERS`] ledgers (~24 h).  Repeated
 /// submissions with the same `(caller, key)` pair are rejected with
 /// `Error::IdempotentBatchAlreadyApplied`.
-///
-/// ## Concurrency
-///
-/// Soroban executes contract invocations sequentially within a ledger,
-/// but the same logical request can be submitted multiple times across
-/// ledgers (retries, mem-pool replay, fanout clients). The idempotency
-/// key is the only defense against duplicate application, so it must be
-/// written *before* any mutation and must not be removed on failure.
-///
-/// ## Invariants
 
-/// - A successful `place_bets` cannot be replayed with the same
-///   (caller, idempotency_key) pair within the TTL window.
-/// - The idempotency marker is observed before any state mutation, so a
-///   partial failure never leaves a half-applied batch that can be
-///   re-applied.
-/// - The marker is never deleted on error; a failed batch burns its key
-///   to keep the result deterministic for duplicate submissions.
+/// ## State invariants
+///
+/// This crate owns the following invariants for the batch-operations
+
+/// entry points. They are enforced in [`bets::place_bets`] and are
+/// exercised by the focused tests in `batch_operations_tests.rs`.
+///
+/// 1. **Atomicity**: a batch either applies in full or not at all.
+///    Validation is performed before any state mutation, and the
+///    idempotency marker is written only after the batch has been
+///    fully applied.
+/// 2. **Idempotency**: for a given `(caller, key)` pair, at most one
+///    batch is applied. Repeated or concurrent submissions are
+///    rejected with `Error::IdempotentBatchAlreadyApplied`.
+/// 3. **Authorization**: the caller must have authorized the
+///    invocation before any state is read or written.
+/// 4. **Validation**: every bet in the batch must pass the same
+///    validation rules as a single-bet submission; invalid batches
+///    are rejected without mutating state.
+/// 5. **Boundaries**: empty batches and batches exceeding the
+///    configured maximum are rejected deterministically.
 
 #[no_std]
 
@@ -50,20 +54,13 @@ impl PredictifyHybrid {
     ///
     /// See [`bets::place_bets`] for full documentation.
     ///
-    /// ## Errors
-    ///
-    /// - `Error::IdempotentBatchAlreadyApplied` when the `(caller,
-    ///   idempotency_key)` pair has already been consumed within the TTL
-    ///   window. This is the deterministic result for duplicate submissions
-    ///   and for retries of an already-applied batch.
-    /// - `Error::EmptyBatch` when the batch contains no bets.
-    /// - `Error::InvalidAmount` when a bet amount is not positive.
-    ///
-    /// ## Concurrency / retries
-    ///
-    /// The idempotency marker is written before any state mutation and is
-    /// preserved on error, so a retry of a partially applied batch cannot
-    /// produce an inconsistent or duplicated result.
+/// # Errors
+///
+/// - `Error::IdempotentBatchAlreadyApplied` if the `(caller, key)` has
+///   already been used.
+/// - `Error::EmptyBatch` if `bets` is empty.
+/// - `Error::BatchTooLarg` if `bets.len()` exceeds the maximum.
+/// - `Error::InvalidBet` for any per-bet validation failure.
     pub fn place_bets(
         env: Env,
         caller: Address,

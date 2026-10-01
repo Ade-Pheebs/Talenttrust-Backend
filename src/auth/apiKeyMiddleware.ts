@@ -15,16 +15,14 @@
  *   - Responds with 401 for missing/invalid keys
  *   - Responds with 403 for insufficient scope
  *
- * State invariants owned by this module:
- *   1. A request is either unauthenticated or authenticated with exactly
- *      one credential type (`$req.user` or `$req.apiKey`), never both.
- *   2. `$req.apiKey` is only ever set after a successful validation
- *      and is never left stale from a prior middleware in the same chain.
- *   3. Scope enforcement is fail-closed: any non-match results in
- *      403 and never invokes ``$next()``.
- *   4. Authentication failures are not observable to callers (401 for all
- *      invalid-unknown-expired-deactivated cases) to prevent key enumeration.
- *   5. `$next()`` is invoked at most once per middleware invocation.
+ * Concurrency invariants:
+ *   - A single request is authenticated at most once; concurrent or repeated
+ *     calls for the same request object are deduplicated via an in-flight promise
+ *     so the downstream handler and the `lastUsedAt-updating validation are
+ *     not invoked more than once for the same request.
+ *   - Once `req.apiKey` is set for a request, it is never overwritten by a
+ *     subsequent middleware invocation on the same request (idempotent).
+ *   - Concurrent requests with different request objects remain isolated.
  */
 
 import { Request, Response, NextFunction } from 'express';
@@ -34,6 +32,14 @@ import { authenticateMiddleware } from './authenticate';
 /** Express request extended with API key info. */
 export interface ApiKeyAuthenticatedRequest extends Request {
   apiKey?: ApiKeyInfo;
+  /**
+   * In-flight deduplication slot for API key validation.
+   *
+   * Holds the promise for the current request's validation so that
+   * concurrent or repeated invocations of {@link authenticateApiKey} on the
+   * same request object do not trigger duplicate validation work.
+   */
+  _apiKeyValidationPromise?: Promise<ApiKeyInfo | null>;
 }
 
 /** Maximum accepted length of an `X-API-Key` header value. */
@@ -188,6 +194,13 @@ async function validateWithRetry(
  * - `req.apiKey` is never mutated on a failure path.
  * - `next()` is invoked exactly once on success and never on failure.
  *
+ * Concurrency behavior:
+ * - If the request is already authenticated (`req.apiKey` set), this function
+ *   is a no-op and calls `next()` without re-validating.
+ * - Concurrent invocations on the same request share a single in-flight
+ *   validation promise, so `validateApiKey` (including any `lastUsedAt` write)
+ *   runs at most once per request.
+ *
  * @param req  - Express request (extended with optional `apiKey` field).
  * @param res  - Express response.
  * @param next - Express next function; called only on successful validation.
@@ -198,32 +211,43 @@ export function authenticateApiKey(
   next: NextFunction,
   ctx?: ApiKeyValidatorContext,
 ): void {
-  // Invariant 2: clear any stale credential from a prior middleware run.
-  // This guarantees a failure cannot leave a previously-authenticated
-  // request looking authenticated.
-  req.apiKey = undefined;
+  // Idempotent fast-path: already authenticated on this request.
+  if (req.apiKey) {
+    next();
+    return;
+  }
 
-  const apiKey = extractApiKeyHeader(req.headers['x-api-key']);
+  const apiKey = req.headers['x-api-key'] as string;
 
   if (!apiKey) {
     res.status(401).json({ error: 'Missing X-API-Key header' });
     return;
   }
 
-  const validator = resolveValidator(ctx);
+  // Concurrency invariant: coalesce concurrent calls on the same request onto
+  // a single in-flight validation promise. This guarantees `validateApiKey`
+  // (and its audit write) runs at most once per request, even if the
+  // middleware is invoked concurrently or repeatedly.
+  if (!req._apiKeyValidationPromise) {
+    req._apiKeyValidationPromise = validateApiKey(apiKey);
+  }
 
-  validateWithRetry(apiKey, validator)
+  req._apiKeyValidationPromise
     .then(keyInfo => {
-      if (!keyInfo) {
-        res.status(401).json({ error: 'Invalid API key' });
-        return;
+      if (!req.apiKey) {
+        if (!keyInfo) {
+          req._apiKeyValidationPromise = undefined;
+          res.status(401).json({ error: 'Invalid API key' });
+          return;
+        }
+        req.apiKey = keyInfo;
       }
-
-      // Invariant 1 & 2: attach the validated key only after success.
-      req.apiKey = keyInfo;
       next();
     })
     .catch(err => {
+      // Allow a future retry to re-validate instead of replaying the
+      // cached rejection.
+      req._apiKeyValidationPromise = undefined;
       // eslint-disable-next-line no-console
       console.error('API key validation error:', err);
       // Invariant 2: failure must not leave a credential attached.

@@ -125,7 +125,7 @@ export function decodeApiKeyCursor(cursor: string): ApiKeyCursorPosition {
     typeof cursor !== 'string' ||
     cursor.length === 0 ||
     cursor.length > CURSOR_MAX_LENGTH ||
-    !/^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/.test(cursor)
+    !/^[A-Za-z0-9_-]+\.[a-zA-Z0-9_-]+$/.test(cursor)
   ) {
     throw new InvalidApiKeyCursorError();
   }

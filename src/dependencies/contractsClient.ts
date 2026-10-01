@@ -143,7 +143,7 @@ interface ClassifiedDependencyError extends DependencyError {
   retryAfter?: number;
 }
 
-function classifyError(error: unknown): DependencyError {
+function classifyError(error: unknown): ClassifiedDependencyError {
   const kind = getKindFromError(error);
   const depError = error instanceof DependencyError
     ? error
@@ -180,7 +180,7 @@ function classifyError(error: unknown): DependencyError {
     classified.retryAfter = retryAfterMs / 1000;
   }
 
-  return depError;
+  return classified;
 }
 
 function delay(ms: number): Promise<void> {
@@ -223,7 +223,7 @@ export class ContractsClient {
     options?: any,
   ): Promise<T> {
     const { maxAttempts, baseDelayMs, maxDelayMs } = this.retryOptions;
-    let lastError: DependencyError | undefined;
+    let lastError: ClassifiedDependencyError | undefined;
 
     for (let attempt = 1; attempt <= maxAttempts; attempt++) {
       try {

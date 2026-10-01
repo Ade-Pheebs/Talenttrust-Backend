@@ -235,7 +235,8 @@ export function loadRawEventRetentionConfig(
   env: NodeJS.ProcessEnv = process.env,
 ): RawEventRetentionConfig {
   const parsed = rawEventRetentionEnvSchema.safeParse(env);
-  const data = parsed.success ? parsed.data : {};
+  type ParsedData = z.infer<typeof rawEventRetentionEnvSchema>;
+  const data: Partial<ParsedData> = parsed.success ? parsed.data : {};
   const base = DEFAULT_RAW_EVENT_RETENTION_CONFIG;
   return {
     enabled: data.RAW_EVENT_RETENTION_ENABLED ?? base.enabled,

@@ -31,7 +31,7 @@ import type { RawEventRetentionRepository } from './rawEventRetention.repository
 /** Zod schema for the retention job payload. */
 export const rawEventRetentionPayloadSchema = z
   .object({
-    network: z.enum(RAW_EVENT_NETWORKS).optional(),
+    network: z.enum([...RAW_EVENT_NETWORKS] as [string, ...string[]]).optional(),
     maxEvents: z.number().int().min(1).max(RAW_EVENT_RETENTION_MAX_PER_RUN).optional(),
     dryRun: z.boolean().optional(),
     correlationId: z.string().max(256).optional(),
@@ -79,7 +79,7 @@ export async function processRawEventRetention(
     deps.service ?? createDefaultRawEventRetentionService();
 
   const summary = await service.run({
-    ...(parsed.data.network !== undefined && { network: parsed.data.network }),
+    ...(parsed.data.network !== undefined && { network: parsed.data.network as import('./rawEventRetention').RawEventNetwork }),
     ...(parsed.data.maxEvents !== undefined && { maxEvents: parsed.data.maxEvents }),
     ...(parsed.data.dryRun !== undefined && { dryRun: parsed.data.dryRun }),
     correlationId: parsed.data.correlationId,

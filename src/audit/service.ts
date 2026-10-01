@@ -9,9 +9,9 @@
  *
  * Security notes:
  * - Callers MUST sanitise metadata before passing it in — no raw PII.
- * - Logging failures are caught and reported via console.error to avoid
- *   disrupting the primary request flow, but they are also re-thrown in
- *   strict mode so tests can assert on them.
+ * - Persistence failures always propagate; appends are never retried implicitly.
+ * - Cache failures disable caching without changing a committed write's outcome.
+ * - Diagnostics contain fixed operation names, never payloads or dependency errors.
  */
 
 import type { AuditEntry, AuditQuery, AuditSeverity, CreateAuditEntryInput, IntegrityReport, AuditQueryResult } from './types';
@@ -26,17 +26,7 @@ export interface AuditServiceOptions {
   cache?: AuditCacheOptions;
 }
 
-export const VALID_ACTIONS = new Set<AuditAction>([
-  'CONTRACT_CREATED', 'CONTRACT_UPDATED', 'CONTRACT_CANCELLED', 'CONTRACT_COMPLETED',
-  'PAYMENT_INITIATED', 'PAYMENT_RELEASED', 'PAYMENT_DISPUTED',
-  'REPUTATION_UPDATED',
-  'REPUTATION_CORRECTED',
-  'USER_CREATED', 'USER_UPDATED', 'USER_DELETED',
-  'AUTH_LOGIN', 'AUTH_LOGOUT', 'AUTH_FAILED',
-  'AUTH_LOCKOUT_TRIGGERED', 'AUTH_LOCKOUT_RELEASED',
-  'ADMIN_ACTION',
-  'ENDPOINT_ACCESS', 'ENDPOINT_MUTATION',
-]);
+export const VALID_ACTIONS = new Set<AuditAction>(['CONTRACT_CREATED', 'CONTRACT_UPDATED', 'CONTRACT_CANCELLED', 'CONTRACT_COMPLETED', 'PAYMENT_INITIATED', 'PAYMENT_RELEASED', 'PAYMENT_DISPUTED', 'REPUTATION_UPDATED', 'REPUTATION_CORRECTED', 'USER_CREATED', 'USER_UPDATED', 'USER_DELETED', 'AUTH_LOGIN', 'AUTH_LOGOUT', 'AUTH_FAILED', 'AUTH_LOCKOUT_TRIGGERED', 'AUTH_LOCKOUT_RELEASED', 'ADMIN_ACTION', 'ENDPOINT_ACCESS', 'ENDPOINT_MUTATION']);
 
 export const VALID_SEVERITIES = new Set<AuditSeverity>(['INFO', 'WARNING', 'CRITICAL']);
 
@@ -140,7 +130,7 @@ export function parseAuditQuery(
  * ```ts
  * import { auditService } from './audit/service';
  *
- * await auditService.log({
+ * await auditService.log( {
  *   action: 'CONTRACT_CREATED',
  *   severity: 'INFO',
  *   actor: req.user.id,
@@ -162,14 +152,36 @@ export class AuditService {
     this.cache = options.cache ? new AuditCache(options.cache) : null;
   }
 
+  private reportFailure(operation: string): void {
+    // Dependency messages may contain SQL, credentials or audit metadata. A
+    // broken diagnostic sink must not mask the original failure or commit.
+    try {
+      console.error(`[AuditService] ${operation}`);
+    } catch { /* Preserve the operation's outcome. */ }
+  }
+
+  private useCache<T>(operation: (cache: AuditCache) => T): T | undefined {
+    if (!this.cache) return undefined;
+    try {
+      return operation(this.cache);
+    } catch {
+      // Never read possibly stale data again after an invalidation/read/write
+      // failure. Repository state remains authoritative for this instance.
+      this.cache = null;
+      this.reportFailure('Cache unavailable; caching disabled');
+      return undefined;
+    }
+  }
+
   /**
    * Records an audit event.
    *
    * @param input - Event details. metadata must be pre-sanitised.
    * @returns The persisted, immutable AuditEntry.
-   * @throws Only when options.strict is true and the store throws.
+   * @throws When the repository append fails. No automatic retry is attempted.
    */
   log(input: CreateAuditEntryInput): AuditEntry {
+    let entry: AuditEntry;
     try {
       const entry = this.repository.append(input);
 
@@ -187,9 +199,17 @@ export class AuditService {
 
       return entry;
     } catch (err) {
-      console.error('[AuditService] Failed to persist audit entry:', err);
+      // Be conservative even if a custom repository reports an ambiguous
+      // failure after committing. Never serve a stale pre-write snapshot.
+      this.useCache(cache => cache.invalidate());
+      this.reportFailure('Failed to persist audit entry');
       throw err;
     }
+    // An append changes unfiltered, actor/action and cursor queries too.
+    // This is outside the persistence failure boundary: a cache fault must
+    // never turn a committed append into a retryable failure.
+    this.useCache(cache => cache.invalidate());
+    return entry;
   }
 
   /**
@@ -268,30 +288,41 @@ export class AuditService {
 
     const exportResult = await exportService.createNdjsonExport(filters);
 
-    this.log({
-      action: 'ADMIN_ACTION',
-      severity: 'CRITICAL',
-      actor: context.actor ?? 'anonymous',
-      resource: 'audit-log',
-      resourceId: 'export',
-      metadata: {
-        operation: 'export',
-        format: 'ndjson',
-        filters: {
-          action: filters.action ?? null,
-          severity: filters.severity ?? null,
-          actor: filters.actor ?? null,
-          resource: filters.resource ?? null,
-          resourceId: filters.resourceId ?? null,
-          from: filters.from ?? null,
-          to: filters.to ?? null,
+    try {
+      this.log({
+        action: 'ADMIN_ACTION',
+        severity: 'CRITICAL',
+        actor: context.actor ?? 'anonymous',
+        resource: 'audit-log',
+        resourceId: 'export',
+        metadata: {
+          operation: 'export',
+          format: 'ndjson',
+          filters: {
+            action: filters.action ?? null,
+            severity: filters.severity ?? null,
+            actor: filters.actor ?? null,
+            resource: filters.resource ?? null,
+            resourceId: filters.resourceId ?? null,
+            from: filters.from ?? null,
+            to: filters.to ?? null,
+          },
+          recordCount: exportResult.recordCount,
+          bytesWritten: exportResult.bytesWritten,
         },
-        recordCount: exportResult.recordCount,
-        bytesWritten: exportResult.bytesWritten,
-      },
-      ipAddress: context.ipAddress,
-      correlationId: context.correlationId,
-    });
+        ipAddress: context.ipAddress,
+        correlationId: context.correlationId,
+      });
+    } catch (error) {
+      // Ownership transfers to the caller only after the compliance event is
+      // persisted. Otherwise remove this request's file, never audit records.
+      try {
+        await exportResult.cleanup();
+      } catch {
+        this.reportFailure('Failed to clean up rejected audit export');
+      }
+      throw error;
+    }
 
     return exportResult;
   }
@@ -306,7 +337,7 @@ export class AuditService {
     metadata: Record<string, unknown> = {},
     context: { ipAddress?: string; correlationId?: string } = {},
   ): AuditEntry {
-    return this.log({
+    return this.log( {
       action,
       severity: 'INFO',
       actor,
@@ -360,7 +391,7 @@ export class AuditService {
     metadata: Record<string, unknown> = {},
     context: { ipAddress?: string; correlationId?: string } = {},
   ): AuditEntry {
-    return this.log({
+    return this.log( {
       action,
       severity: 'CRITICAL',
       actor,
@@ -376,7 +407,7 @@ export class AuditService {
    * AUTH_FAILED is WARNING; others are INFO.
    */
   logAuthEvent(
-    action: Extract<AuditAction, `AUTH_${string}`>,
+    action: Extract<AuditAction, `AUTH_${string|`>,
     actor: string,
     metadata: Record<string, unknown> = {},
     context: { ipAddress?: string; correlationId?: string } = {},
@@ -531,35 +562,36 @@ export class AuditService {
    * Retrieves a single entry by ID (alias method).
    */
   getEntry(id: string): AuditEntry | undefined {
-    return this.getById(id);
+    return this.repository.findById(id);
   }
 
   /**
-   * Returns the total number of audit entries.
+   * Queries audit entries with the given filters.
    */
-  count(): number {
-    return this.repository.count();
+  query(query: AuditQuery): AuditEntry[] {
+    return this.repository.query(query);
   }
 
   /**
-   * Verifies the integrity of the entire hash chain.
-   * Should be called by a scheduled monitoring job.
-   *
-   * @returns IntegrityReport — escalate immediately if valid === false.
+   * Queries audit entries using cursor-based pagination.
+   */
+  queryWithCursor(query: AuditQuery): AuditQueryResult {
+    return this.repository.queryWithCursor(query);
+  }
+
+  /**
+   * Verifies the integrity of the audit log chain.
    */
   verifyIntegrity(): IntegrityReport {
     return this.repository.verifyIntegrity();
   }
 
   /**
-   * Checks hash chain integrity and returns report with HTTP status code.
+   * Returns the total count of audit entries.
    */
-  checkIntegrity(): { report: IntegrityReport; status: number } {
-    const report = this.verifyIntegrity();
-    const status = report.valid ? 200 : 409;
-    return { report, status };
+  count(): number {
+    return this.repository.count();
   }
 }
 
-/** Singleton service instance. */
 export const auditService = new AuditService();

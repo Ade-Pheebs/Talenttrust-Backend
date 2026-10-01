@@ -43,7 +43,7 @@ export function decodeCursor(cursor: string): CursorPosition {
     throw new Error('Invalid pagination cursor: malformed');
   }
 
-  // Base64url strict charset (RFC 4648 §5). Rejects padding =), whitespace, or other encodings.
+  // Base64url strict charset (RFC 4648 §5). Rejects padding (=), whitespace, or other encodings.
   if (!/^[A-Za-z0-9_-]+$/.test(cursor)) {
     throw new Error('Invalid pagination cursor: malformed');
   }
@@ -121,7 +121,7 @@ export interface CursorQueryError {
  * decode-then-catch block.
  *
  * @param rawCursor - The raw `req.query['cursor']` value (usually `string | undefined`).
- * @returns `{ ok: true, cursor }`when the value is absent or decodes successfully,
+ * @returns `{ ok: true, cursor }` when the value is absent or decodes successfully,
  *   otherwise `{ ok: false, message }` with the same message `decodeCursor` throws.
  */
 export function resolveCursorQueryParam(rawCursor: unknown): CursorQueryOk | CursorQueryError {
@@ -239,6 +239,7 @@ export class InMemoryCursorRepository implements CursorRepository {
       // No cursor to rewind — create one at the target sequence.
       const now = new Date().toISOString();
       const cursor: IndexerCursor = {
+        ...parseSourceId(sourceId),
         sourceId,
         lastSequence: toSequence,
         updatedAt: now,

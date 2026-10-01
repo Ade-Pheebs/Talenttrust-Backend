@@ -17,8 +17,14 @@ jest.mock('../utils/webhook-signing.util', () => ({
 describe('Webhook Delivery Tenant Isolation', () => {
   let webhookService: WebhookService;
   let repo: SqliteWebhookSubscriptionRepository;
+  let originalSsrfAllow: string | undefined;
 
   beforeAll(() => {
+    // Save original SSRF setting and disable it for this test suite
+    // to ensure localhost URLs are blocked by SSRF protection
+    originalSsrfAllow = process.env.SSRF_ALLOW_PRIVATE_HOSTS;
+    delete process.env.SSRF_ALLOW_PRIVATE_HOSTS;
+    
     // Force in-memory fresh DB
     getDb(':memory:', { runMigrations: true });
     repo = new SqliteWebhookSubscriptionRepository(getDb());
@@ -26,6 +32,12 @@ describe('Webhook Delivery Tenant Isolation', () => {
   });
 
   afterAll(() => {
+    // Restore original SSRF setting
+    if (originalSsrfAllow === undefined) {
+      delete process.env.SSRF_ALLOW_PRIVATE_HOSTS;
+    } else {
+      process.env.SSRF_ALLOW_PRIVATE_HOSTS = originalSsrfAllow;
+    }
     closeDb();
   });
 

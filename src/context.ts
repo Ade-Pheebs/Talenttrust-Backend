@@ -16,6 +16,15 @@
  * @security
  *  - Values live only for the duration of the `run()` callback; nothing is
  *    persisted globally, so context cannot leak across unrelated requests.
+ *
+ * @compatibility
+ *  - `getContext()` MUST return `undefined` (never throw, never a fresh empty
+ *    object) when called outside an active `run()` scope. Callers rely on this
+ *    to distinguish "no request context" from "context present but empty".
+ *  - The store is returned by reference, not copied. Mutating the returned
+ *    object mutates the active context; this is intentional and preserved.
+ *  - `requestContextStorage` is exported as a stable singleton so middleware
+ *    and services share one store instance across module reloads.
  */
 
 import { AsyncLocalStorage } from 'async_hooks';
@@ -43,6 +52,8 @@ export const requestContextStorage = new AsyncLocalStorage<RequestContext>();
  *          `requestContextStorage.run()` callback.
  */
 export function getContext(): RequestContext | undefined {
+  // Contract: returns the live store by reference, or `undefined` when no
+  // context is active. Never throws and never fabricates a default object.
   return requestContextStorage.getStore();
 }
 

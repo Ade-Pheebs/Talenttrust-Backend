@@ -103,16 +103,22 @@ describe('Webhook Delivery Tenant Isolation', () => {
   });
 
   it('invalid URL: logs failure and does not crash', async () => {
-    await repo.create({
-      tenantId: 'tenant-invalid',
-      eventType: 'event.invalid',
-      url: 'http://localhost/invalid', // SSRF/invalid
-      secret: 'sec',
-    });
+    const prev = process.env.SSRF_ALLOW_PRIVATE_HOSTS;
+    delete process.env.SSRF_ALLOW_PRIVATE_HOSTS;
+    try {
+      await repo.create({
+        tenantId: 'tenant-invalid',
+        eventType: 'event.invalid',
+        url: 'http://localhost/invalid', // SSRF/invalid
+        secret: 'sec',
+      });
 
-    await expect(webhookService.trigger('event.invalid', {}, undefined, 'tenant-invalid')).resolves.toBeUndefined();
-    await new Promise((r) => setTimeout(r, 100));
-    expect(axios.post).not.toHaveBeenCalled();
+      await expect(webhookService.trigger('event.invalid', {}, undefined, 'tenant-invalid')).resolves.toBeUndefined();
+      await new Promise((r) => setTimeout(r, 100));
+      expect(axios.post).not.toHaveBeenCalled();
+    } finally {
+      if (prev !== undefined) process.env.SSRF_ALLOW_PRIVATE_HOSTS = prev;
+    }
   });
 
   it('delivery after deletion: does not deliver if subscription is inactive or deleted', async () => {

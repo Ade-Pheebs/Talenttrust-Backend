@@ -202,6 +202,9 @@ export interface CursorRepository {
 export class InMemoryCursorRepository implements CursorRepository {
   private readonly cursorsBySourceId = new Map<string, IndexerCursor>();
 
+  // Checkpoint store keyed by "network:contract"
+  private readonly checkpoints = new Map<string, { network: string; contract: string; ledger: number; eventSequence: number }>();
+
   async getCursor(sourceId: string): Promise<IndexerCursor | null> {
     return this.cursorsBySourceId.get(sourceId) ?? null;
   }
@@ -269,4 +272,17 @@ export class InMemoryCursorRepository implements CursorRepository {
   async deleteCursor(sourceId: string): Promise<boolean> {
     return this.cursorsBySourceId.delete(sourceId);
   }
+
+  async getCheckpoint(network: string, contract: string): Promise<{ network: string; contract: string; ledger: number; eventSequence: number } | null> {
+    return this.checkpoints.get(`${network}:${contract}`) ?? null;
+  }
+
+  async updateCheckpoint(network: string, contract: string, ledger: number, eventSequence: number): Promise<void> {
+    this.checkpoints.set(`${network}:${contract}`, { network, contract, ledger, eventSequence });
+  }
+
+  async listCheckpoints(): Promise<Array<{ network: string; contract: string; ledger: number; eventSequence: number }>> {
+    return Array.from(this.checkpoints.values());
+  }
 }
+

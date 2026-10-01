@@ -351,3 +351,4 @@ npm test
 **Type:** Performance Enhancement  
 **Impact:** Reduces database load on hot endpoints; improves P95 latency  
 **Risk:** Low (transparent caching, well-tested invalidation, backwards compatible)
+...

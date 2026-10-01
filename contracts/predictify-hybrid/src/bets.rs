@@ -137,7 +137,7 @@ use soroban_sdk::{Address, Bytes, BytesN, Env, Symbol, Vec};
 
 use crate::{
     errors::Error,
-    storage::{DataKey, IDEM_KEY_TTL_LEDGERS, INSTANCE_TTL_LEDGERS},
+    storage::{is_idempotency_key_consumed, DataKey, IDEM_KEY_TTL_LEDGERS},
 };
 
 /// Maximum number of bets accepted in a single [`place_bets`] call.
@@ -214,12 +214,12 @@ fn validate_bets(bets: &Vec<Bet>) -> Result<(), Error> {
 ///
 /// # Arguments
 ///
-/// * `env` – Soroban host environment.
-/// * `caller` – Address of the submitting account; `require_auth` is called
-///   to authenticate the caller.
-/// * `bets` – Non-empty vector of [`Bet`] entries.
+/// * `env`             – Soroban host environment.
+/// * `caller`          – Address of the submitting account; `require_auth` is
+///   called to authenticate the caller.
+/// * `bets`            – Non-empty vector of [`Bet`] entries.
 /// * `idempotency_key` – 32-byte caller-generated token that makes this
-///   submission unique.  The key is bound to `caller` so the same token may be
+///   submission unique. The key is bound to `caller` so the same token may be
 ///   used by different callers without conflict.
 ///
 /// # Errors
@@ -227,6 +227,8 @@ fn validate_bets(bets: &Vec<Bet>) -> Result<(), Error> {
 /// * [`Error::EmptyBatch`] – `bets` is empty.
 /// * [`Error::IdempotentBatchAlreadyApplied`] – the `(caller, idempotency_key)`
 ///   pair has already been consumed.
+/// * [`Error::InvalidIdempotencyState`]       – the saved marker is malformed;
+///   no state is repaired or replaced.
 ///
 /// # Idempotency semantics
 ///
@@ -316,35 +318,8 @@ pub fn place_bets(
         let idem_ledger_key = DataKey::PlaceBetsIdemLedger(caller.clone(), idempotency_key.clone());
         let now = env.ledger().sequence();
 
-        if env.storage().instance().has(&idem_key) {
-            // Instance storage shares the contract instance's TTL entry, so a
-            // consumed key cannot simply be evicted when its own window
-            // elapses: the window has to be enforced in contract code from the
-            // ledger recorded next to the sentinel.
-            let consumed_at = env
-                .storage()
-                .instance()
-                .get::<DataKey, u32>(&idem_ledger_key);
-
-            match consumed_at {
-                // A sentinel with no recorded ledger was written by an older
-                // contract version that stored only `true`. Treat it as a
-                // durable replay guard: an upgrade must never make a token
-                // that was already consumed replayable again.
-                None => return Err(Error::IdempotentBatchAlreadyApplied),
-
-                // Still inside the replay window.
-                Some(consumed_at) if now < consumed_at.saturating_add(IDEM_KEY_TTL_LEDGERS) => {
-                    return Err(Error::IdempotentBatchAlreadyApplied)
-                }
-
-                // The window has elapsed: drop the stale sentinel and fall
-                // through so the batch is accepted as a fresh submission.
-                Some(_) => {
-                    env.storage().instance().remove(&idem_key);
-                    env.storage().instance().remove(&idem_ledger_key);
-                }
-            }
+        if is_idempotency_key_consumed(env, &idem_key)? {
+            return Err(Error::IdempotentBatchAlreadyApplied);
         }
 
         // Mark the key as consumed before applying the batch so that

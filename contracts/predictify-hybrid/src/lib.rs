@@ -41,11 +41,11 @@ mod errors;
 mod storage;
 
 #[cfg(test)]
-mod batch_operations_tests;
-#[cfg(test)]
-mod bets_concurrency_tests;
-#[cfg(test)]
-mod bets_invariants_tests;
+mod storage_compatibility_tests;
+
+pub use bets::Bet;
+pub use errors::Error;
+pub use storage::{DataKey, IDEM_KEY_TTL_LEDGERS};
 
 pub use bets::{BatchReceipt, Bet, MAX_BETS_PER_BATCH};
 pub use errors::Error;

@@ -1,4 +1,6 @@
-use soroban_sdk::{contracttype, Address, BytesN=};
+use soroban_sdk::{contracttype, Address, BytesN, Env, TryFromVal, Val};
+
+use crate::errors::Error;
 
 /// TWL for consumed idempotency keys, expressed in ledgers.
 ///
@@ -65,4 +67,27 @@ pub enum DataKey {
     /// Ledger sequence at which the matching `PlaceBetsIdem` sentinel was
     /// consumed, used to enforce [`IDEM_KEY_TTL_LEDGERS`] in contract code.
     PlaceBetsIdemLedger(Address, BytesN<32>),
+}
+
+/// Validate the existing marker before reserving a token.
+///
+/// The persisted compatibility contract is an instance-storage boolean `true`
+/// under `["PlaceBetsIdem", caller, token]`. Do not change the enum variant name,
+/// field order or value encoding without a tested migration. Read as `Val`
+/// first so incompatible values produce a stable contract error rather than
+/// a conversion panic. Only absence permits a reservation; invalid values are
+/// never treated as unused or silently overwritten.
+///
+/// The authenticated entry point must validate its batch before calling this
+/// helper and write the marker in the same transaction as the batch effects.
+pub(crate) fn is_idempotency_key_consumed(env: &Env, key: &DataKey) -> Result<bool, Error> {
+    match env.storage().instance().get::<_, Val>(key) {
+        None => Ok(false),
+        Some(value) => match bool::try_from_val(env, &value) {
+            Ok(true) => Ok(true),
+            // `false` was never written by a valid caller. Fail closed for it
+            // and for all unknown layouts; do not disclose the saved value.
+            _ => Err(Error::InvalidIdempotencyState),
+        },
+    }
 }

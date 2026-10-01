@@ -46,25 +46,13 @@ import { isAuthorized, isValidRole } from "../lib/authorization";
 import type { Action, User, Resource, Role, AuthenticatedRequest } from "../lib/types";
 import { JWT_VERIFY_OPTIONS } from "../auth/jwtConfig";
 import { extractBearerToken, sendUnauthorized, sendForbidden } from "../lib/authHelpers";
+import { sharedTokenCache } from "../auth/tokenCache";
 
 // ─── JWT configuration ────────────────────────────────────────────────────────
 
 // Read lazily at call time so test suites can set process.env.JWT_SECRET before
 // making requests without module-load-order issues.
 const getJwtSecret = () => process.env.JWT_SECRET ?? "";
-
-/**
- * Shape of the decoded JWT payload expected by this platform.
- * `sub` carries the user id (standard JWT claim).
- */
-interface JwtPayload {
-  sub:   string;
-  email: string;
-  role:  unknown; // validated against ALL_ROLES before use
-  iat?:  number;
-  exp?:  number;
-}
-
 
 
 // ─── requireAuth ─────────────────────────────────────────────────────────────
@@ -80,6 +68,11 @@ interface JwtPayload {
  *  - Required claims: `sub` (user id), `email`, and `role`.
  *  - `role` is validated against the platform allowlist (admin, auditor, client, freelancer).
  *  - `alg: none` and other algorithms are rejected before signature verification.
+ *  - Results are memoized via `sharedTokenCache` so that concurrent requests
+ *    bearing the same token trigger at most one `jwt.verify()` call per TTL
+ *    window. In-flight coalescing ensures that N simultaneous requests for the
+ *    same token complete as soon as the first verification resolves — no
+ *    duplicate CPU work is performed.
  *
  * Failure cases (all → HTTP 401):
  *  - Missing or malformed `Authorization` header
@@ -103,40 +96,40 @@ export function requireAuth(
     return;
   }
 
-  try {
-    // jwt.verify throws for any invalid token (bad signature, expired,
-    // wrong algorithm, etc.). Passing JWT_VERIFY_OPTIONS pins the
-    // accepted signature algorithms to JWT_ALLOWED_ALGORITHMS so that
-    // alg: none and HS/RS confusion attempts cannot succeed.
-    const decoded = jwt.verify(token, getJwtSecret(), JWT_VERIFY_OPTIONS) as JwtPayload;
+  // Use the shared token cache for memoized, coalesced JWT verification.
+  // The cache deduplicates concurrent requests for the same token so that
+  // only one jwt.verify() call is in flight at any time per distinct token.
+  sharedTokenCache
+    .verify(token, getJwtSecret(), JWT_VERIFY_OPTIONS)
+    .then((decoded) => {
+      // Guard required claims — a well-formed token always carries these.
+      if (!decoded.sub || !decoded.email) {
+        sendUnauthorized(res, "Token is missing required claims.");
+        return;
+      }
 
-    // Guard required claims — a well-formed token always carries these.
-    if (!decoded.sub || !decoded.email) {
-      sendUnauthorized(res, "Token is missing required claims.");
-      return;
-    }
+      // Re-validate the role claim against the platform allowlist.
+      if (!isValidRole(decoded.role)) {
+        sendUnauthorized(res, "Token carries an unrecognised role.");
+        return;
+      }
 
-    // Re-validate the role claim against the platform allowlist.
-    if (!isValidRole(decoded.role)) {
-      sendUnauthorized(res, "Token carries an unrecognised role.");
-      return;
-    }
+      req.user = {
+        id:    decoded.sub,
+        email: decoded.email,
+        role:  decoded.role,
+      } satisfies User;
 
-    req.user = {
-      id:    decoded.sub,
-      email: decoded.email,
-      role:  decoded.role,
-    } satisfies User;
-
-    next();
-  } catch (err) {
-    if (err instanceof jwt.TokenExpiredError) {
-      sendUnauthorized(res, "Token has expired.");
-      return;
-    }
-    // Covers JsonWebTokenError (bad signature, malformed) and NotBeforeError.
-    sendUnauthorized(res, "Invalid token.");
-  }
+      next();
+    })
+    .catch((err: unknown) => {
+      if (err instanceof jwt.TokenExpiredError) {
+        sendUnauthorized(res, "Token has expired.");
+        return;
+      }
+      // Covers JsonWebTokenError (bad signature, malformed) and NotBeforeError.
+      sendUnauthorized(res, "Invalid token.");
+    });
 }
 
 // ─── requireRole ─────────────────────────────────────────────────────────────

@@ -35,6 +35,25 @@
  * `res.locals.requestId`) is used as the `correlationId` on every entry,
  * enabling end-to-end request tracing across logs.
  *
+ * ## Validation boundaries (enforced in the finish listener)
+ *
+ * | Field         | Rule                                                           |
+ * |---------------|----------------------------------------------------------------|
+ * | actor         | Truncated to {@link MAX_ACTOR_LENGTH} chars; falls back to     |
+ * |               | `'anonymous'` when absent or non-string.                       |
+ * | resource      | Truncated to {@link MAX_RESOURCE_LENGTH} chars; falls back to  |
+ * |               | `'endpoint'` when the URL yields nothing useful.               |
+ * | resourceId    | Truncated to {@link MAX_RESOURCE_ID_LENGTH} chars; falls back  |
+ * |               | to `''` when the URL contains no id segment.                   |
+ * | ipAddress     | Sanitised via {@link sanitizeIpAddress} (clamped to 45 chars). |
+ * | correlationId | Sanitised via {@link sanitizeCorrelationId} (control chars     |
+ * |               | stripped, charset-validated, discarded on violation).          |
+ *
+ * Truncation (not rejection) is deliberate for automatically-derived fields:
+ * the entry is still useful for tracing and incident response even when a
+ * path segment is unexpectedly long, while a missing entry would be worse
+ * than a slightly truncated one.
+ *
  * @security
  * - Audit failures are silently swallowed (with a console.error) so that a
  *   logging fault never breaks the primary request path.
@@ -57,8 +76,46 @@ import type { AuthenticatedRequest } from '../auth/authenticate';
 import { buildAuditMetadata } from './redact';
 import { auditService, AuditService } from './service';
 import { validateEnv } from '../config/env.schema';
+import { sanitizeCorrelationId, sanitizeIpAddress } from './middleware';
+
+// ─── Field-length bounds ──────────────────────────────────────────────────────
+
+/**
+ * Maximum length of the `actor` field stored in an automatically-generated
+ * audit entry.  User IDs are bounded by the authentication system, but this
+ * guard prevents an arbitrarily long value from reaching the store when the
+ * service evolves or a non-standard auth path is added.
+ */
+export const MAX_ACTOR_LENGTH = 128;
+
+/**
+ * Maximum length of the `resource` field derived from the URL path.
+ * A URL segment is at most 2048 chars in practice; 128 is generous for
+ * any real resource type name while preventing oversized store writes.
+ */
+export const MAX_RESOURCE_LENGTH = 128;
+
+/**
+ * Maximum length of the `resourceId` field derived from the URL path.
+ * UUIDs are 36 chars; slugs are typically under 64.  256 allows for all
+ * realistic IDs while bounding the field against path-injection attempts.
+ */
+export const MAX_RESOURCE_ID_LENGTH = 256;
 
 // ─── Internal helpers ─────────────────────────────────────────────────────────
+
+/**
+ * Truncate a string to at most `max` characters.
+ * Returns `fallback` when the value is absent, non-string, or empty.
+ *
+ * Truncation is preferred over rejection here because this middleware
+ * emits fire-and-forget entries: an entry with a truncated field is
+ * more useful for incident response than a missing entry.
+ */
+function truncate(value: unknown, max: number, fallback: string): string {
+  if (typeof value !== 'string' || value.length === 0) return fallback;
+  return value.length <= max ? value : value.slice(0, max);
+}
 
 /**
  * Map HTTP method + final status code to an AuditAction.
@@ -151,17 +208,32 @@ export function createProtectedEndpointAuditMiddleware(
 
     res.on('finish', () => {
       try {
-        // req.user is populated by authenticateMiddleware after this runs
-        const actor =
-          (req as AuthenticatedRequest).user?.userId ?? 'anonymous';
+        // req.user is populated by authenticateMiddleware after this runs.
+        // Truncate to MAX_ACTOR_LENGTH to keep the store entry bounded even
+        // when a non-standard auth path produces an unexpectedly long userId.
+        const rawActor = (req as AuthenticatedRequest).user?.userId ?? 'anonymous';
+        const actor = truncate(rawActor, MAX_ACTOR_LENGTH, 'anonymous');
 
         const action = deriveAction(req.method, res.statusCode);
         const severity = deriveSeverity(action, res.statusCode);
-        const resource = deriveResource(req.path);
-        const resourceId = deriveResourceId(req.path);
+
+        // Truncate URL-derived fields to prevent oversized store writes when
+        // paths contain unusually long segments (e.g. a UUID concatenated with
+        // extra characters, or a path-traversal attempt).
+        const resource = truncate(deriveResource(req.path), MAX_RESOURCE_LENGTH, 'endpoint');
+        const resourceId = truncate(deriveResourceId(req.path), MAX_RESOURCE_ID_LENGTH, '');
+
         const requestId = res.locals['requestId'] as string | undefined;
-        const ipAddress =
-          (req.ip ?? req.socket?.remoteAddress) as string | undefined;
+
+        // Sanitise the IP address to prevent oversized values from reaching
+        // the store when a long X-Forwarded-For chain is present.
+        const ipAddress = sanitizeIpAddress(req.ip ?? req.socket?.remoteAddress);
+
+        // Sanitise the requestId before using it as a correlationId: it comes
+        // from res.locals which is set by our own middleware, but defensive
+        // sanitisation keeps the invariant clear and prevents an unexpected
+        // value (e.g. injected via a malicious proxy) from reaching the store.
+        const correlationId = sanitizeCorrelationId(requestId);
 
         const metadata = buildAuditMetadata(
           req.method,
@@ -181,7 +253,7 @@ export function createProtectedEndpointAuditMiddleware(
           resourceId,
           metadata,
           ipAddress,
-          correlationId: requestId,
+          correlationId,
         });
       } catch (err) {
         // Audit failures must never disrupt the request lifecycle.

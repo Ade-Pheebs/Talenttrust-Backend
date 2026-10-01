@@ -1,7 +1,7 @@
 import { z } from 'zod';
 import { isSafeUrl } from '../utils/ssrf';
 import { parseFinalityDepths } from '../finality/policy';
-import { isIP } from 'node:net';
+import { appConfigSchema } from '../appConfiguration';
 
 
 /**
@@ -10,99 +10,24 @@ import { isIP } from 'node:net';
  * This schema defines the structure and validation rules for all 
  * required and optional environment variables used by the application.
  * 
+ * Validation boundaries for `src/appConfiguration.ts` are enforced here:
+ * the `APP_CONFIG` variable is parsed through `appConfigSchema`, which
+ * defines the accepted shape, rejects unknown keys, and applies
+ * deterministic defaults for boundary/duplicate inputs.
+ *
  * @security
  *  - Do not log secret values in error messages.
  *  - Use transformations to sanitize inputs.
  */
-
 /**
- * Validation boundaries for environment configuration.
+ * Field-level schema (types, defaults, per-field bounds).
  *
- * These constants define the accepted numeric ranges and string shapes for
- * every bounded field in {@link envSchema}. They are exported so that tests
- * and downstream consumers can assert against the same boundaries the schema
- * enforces, avoiding drift between production validation and test fixtures.
- *
- * Invariants:
- *  - Every numeric bound is inclusive on both ends unless documented otherwise.
- *  - `PORT` and `SMTP_PORT` share the same TCP port range.
- *  - Timeout/delay bounds are expressed in milliseconds and are always >= 0.
- *  - Retry counts are always >= 0 and capped to prevent unbounded retry loops.
+ * Exported separately from {@link envSchema} so the individual field parsers can
+ * be exercised directly (e.g. asserting a default, or that a bound rejects an
+ * out-of-range value) without having to satisfy every required variable and the
+ * cross-field rules below.
  */
-export const VALIDATION_BOUNDS = Object.freeze({
-  PORT_MIN: 1,
-  PORT_MAX: 65535,
-  SMTP_PORT_MIN: 1,
-  SMTP_PORT_MAX: 65535,
-  STELLAR_RPC_TIMEOUT_MS_MIN: 1,
-  STELLAR_RPC_TIMEOUT_MS_MAX: 120_000,
-  STELLAR_RPC_MAX_RETRIES_MIN: 0,
-  STELLAR_RPC_MAX_RETRIES_MAX: 10,
-  STELLAR_RPC_RETRY_DELAY_MS_MIN: 0,
-  STELLAR_RPC_RETRY_DELAY_MS_MAX: 60_000,
-  QUEUE_FAILED_THRESHOLD_MIN: 0,
-  QUEUE_FAILED_THRESHOLD_MAX: 10_000,
-  QUEUE_BACKLOG_THRESHOLD_MIN: 0,
-  QUEUE_BACKLOG_THRESHOLD_MAX: 1_000_000,
-  QUEUE_PROBE_TIMEOUT_MS_MIN: 1,
-  QUEUE_PROBE_TIMEOUT_MS_MAX: 30_000,
-  WEBHOOK_DELIVERY_TIMEOUT_MS_MIN: 100,
-  WEBHOOK_DELIVERY_TIMEOUT_MS_MAX: 120_000,
-  WEBHOOK_MAX_PAYLOAD_SIZE_BYTES_MIN: 1024,
-  WEBHOOK_MAX_PAYLOAD_SIZE_BYTES_MAX: 10_485_760,
-  DISPUTES_CACHE_TTL_MS_MIN: 1,
-  DISPUTES_CACHE_TTL_MS_MAX: 300_000,
-  DISPUTES_CACHE_SWR_MS_MIN: 0,
-  DISPUTES_CACHE_SWR_MS_MAX: 600_000,
-  DISPUTES_CACHE_MAX_ENTRIES_MIN: 1,
-  DISPUTES_CACHE_MAX_ENTRIES_MAX: 10_000,
-  HTTP_METRICS_ROUTE_LABEL_LIMIT_MIN: 1,
-  HTTP_METRICS_ROUTE_LABEL_LIMIT_MAX: 10_000,
-  EMAIL_SEND_TIMEOUT_MS_MIN: 1000,
-  EMAIL_SEND_TIMEOUT_MS_MAX: 120_000,
-  FINALITY_DEFAULT_DEPTH_MIN: 0,
-  FINALITY_DEFAULT_DEPTH_MAX: 1000,
-  REPUTATION_DECAY_LAMBDA_MIN_EXCLUSIVE: 0,
-  REPUTATION_DECAY_LAMBDA_MAX: 1,
-  COMPLIANCE_AUDIT_SECRET_MIN_LENGTH: 32,
-  JWT_SECRET_MIN_LENGTH_PRODUCTION: 32,
-} as const);
-
-/**
- * Parses a string into a base-10 integer, returning `undefined` for empty or
- * whitespace-only input. This is the single canonical numeric coercion used
- * by the schema so that `''`, `'  '`, and `undefined` behave identically.
- */
-function parseOptionalInt(val: string | undefined): number | undefined {
-  if (val === undefined) return undefined;
-  const trimmed = val.trim();
-  if (trimmed === '') return undefined;
-  return parseInt(trimmed, 10);
-}
-
-/**
- * Parses a string into a base-10 integer with a default fallback for empty
- * or whitespace-only input.
- */
-function parseIntOrDefault(val: string | undefined, fallback: number): number {
-  const parsed = parseOptionalInt(val);
-  return parsed === undefined ? fallback : parsed;
-}
-
-/**
- * Parses a boolean-ish string. Accepts `true`/`1` as true and
- * `false`/`0` as false. Any other value (including empty) yields `undefined`
- * so callers can apply their own default.
- */
-function parseOptionalBool(val: string | undefined): boolean | undefined {
-  if (val === undefined) return undefined;
-  const lower = val.trim().toLowerCase();
-  if (lower === 'true' || lower === '1') return true;
-  if (lower === 'false' || lower === '0') return false;
-  return undefined;
-}
-
-export const envSchema = z.object({
+export const envObjectSchema = z.object({
   // Server Configuration
   PORT: z.string()
     .default('3001')
@@ -294,6 +219,36 @@ export const envSchema = z.object({
     .transform((val) => parseInt(val, 10))
     .pipe(z.number().int().min(VALIDATION_BOUNDS.DISPUTES_CACHE_MAX_ENTRIES_MIN, 'DISPUTES_CACHE_MAX_ENTRIES must be a positive integer').max(VALIDATION_BOUNDS.DISPUTES_CACHE_MAX_ENTRIES_MAX)),
 
+  // Auth Cache Configuration
+  AUTH_CACHE_TTL_MS: z.string()
+    .default('5000')
+    .transform((val) => parseInt(val, 10))
+    .pipe(z.number().int().positive('AUTH_CACHE_TTL_MS must be a positive integer').max(300_000)),
+
+  AUTH_CACHE_MAX_ENTRIES: z.string()
+    .default('100')
+    .transform((val) => parseInt(val, 10))
+    .pipe(z.number().int().positive('AUTH_CACHE_MAX_ENTRIES must be a positive integer').max(10000)),
+
+  // API-key auth cache configuration.
+  //
+  // `src/auth/apiKeys.ts` has always read these two values off the validated
+  // environment, but they were never declared here, so they arrived as
+  // `undefined`: `expiresAt` became `Date.now() + undefined = NaN` (which is
+  // *never* past, so entries never expired) and the capacity check
+  // `size >= undefined` was always false (so nothing was ever evicted). The
+  // shared auth cache was therefore unbounded and immortal. Declaring them here
+  // with explicit bounds restores both TTL and LRU eviction.
+  AUTH_CACHE_TTL_MS: z.string()
+    .default('300000')
+    .transform((val) => parseInt(val, 10))
+    .pipe(z.number().int().positive('AUTH_CACHE_TTL_MS must be a positive integer').max(3_600_000)),
+
+  AUTH_CACHE_MAX_ENTRIES: z.string()
+    .default('1000')
+    .transform((val) => parseInt(val, 10))
+    .pipe(z.number().int().positive('AUTH_CACHE_MAX_ENTRIES must be a positive integer').max(100_000)),
+
   RATE_LIMIT_STORE_TYPE: z.enum(['memory', 'redis'])
     .default('memory'),
   REDIS_URL: z.string().optional(),
@@ -360,6 +315,29 @@ export const envSchema = z.object({
 
   REPUTATION_SCORE_ALGORITHM_VERSION: z.string()
     .default('exp-decay-v1'),
+
+  // Reputation Read Cache Configuration
+  /**
+   * Time-to-live (ms) for cached auth validation results (API keys).
+   * Default: 300 000 (5 min).
+   */
+  AUTH_CACHE_TTL_MS: z.string()
+    .default('300000')
+    .transform((val) => parseInt(val, 10))
+    .pipe(z.number()
+      .int('AUTH_CACHE_TTL_MS must be an integer')
+      .positive('AUTH_CACHE_TTL_MS must be greater than 0')),
+
+  /**
+   * Maximum number of auth validation results to hold in the LRU cache.
+   * Default: 1000.
+   */
+  AUTH_CACHE_MAX_ENTRIES: z.string()
+    .default('1000')
+    .transform((val) => parseInt(val, 10))
+    .pipe(z.number()
+      .int('AUTH_CACHE_MAX_ENTRIES must be an integer')
+      .positive('AUTH_CACHE_MAX_ENTRIES must be greater than 0')),
 
   // Reputation Read Cache Configuration
   /**
@@ -488,7 +466,13 @@ export const envSchema = z.object({
     .transform((val) => parseOptionalBool(val))
     .pipe(z.boolean().optional()),
 
-}).superRefine((obj, ctx) => {
+});
+
+/**
+ * Full environment schema: the field-level shape plus cross-field constraints
+ * (provider-specific requirements, production safety rails, ...).
+ */
+export const envSchema = envObjectSchema.superRefine((obj, ctx) => {
   const requireForEmailProvider = (field: keyof typeof obj, message: string): void => {
     if (!obj[field]) {
       ctx.addIssue({ code: z.ZodIssueCode.custom, path: [field], message });

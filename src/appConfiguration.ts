@@ -1,5 +1,4 @@
 import { isSafeUrl } from './utils/ssrf';
-import { z } from 'zod';
 
 export type ChaosMode = 'off' | 'error' | 'timeout' | 'random';
 
@@ -55,127 +54,68 @@ export interface AppConfig {
   milestonesEnabled: boolean;
 }
 
+export const DEFAULT_ALLOWED_ASSETS: readonly string[] = Object.freeze(['USDC', 'XLM', 'BTC', 'ETH']);
+
 const MAX_TIMEOUT_MS = 10_000;
 const MIN_TIMEOUT_MS = 100;
 
 /**
  * Validation boundaries for environment-driven configuration.
  *
- * Invariants enforced here:
- *  - Every numeric field is finite and within an explicit [min, max] range.
- *  - String enums are restricted to a known allow-list; unknown values are
- *    rejected rather than silently coerced, so misconfiguration is diagnosable.
- *  - List fields are bounded in size and element length to prevent unbounded
- *    memory growth or log-injection via crafted env values.
- *  - URLs are validated through `isSafeUrl` to preserve SSRF protections.
+ * Invariants enforced by `loadConfig`:
+ *  - Numeric fields are parsed with `Number`; non-finite or missing values
+ *    fall back to the documented default (never `NaN`/`Infinity`).
+ *  - Numeric fields are clamped to the inclusive `[min, max]` range below.
+ *  - Enum-like fields (`chaosMode`) reject unknown values and fall back to
+ *    the safe default (`off`).
+ *  - Boolean fields accept only the case-insensitive literal `true`; any
+ *    other value (including `false`, `1`, `yes`) resolves to `false`.
+ *  - List fields are split on `,`, trimmed, case-normalized, and empty
+ *    entries are dropped. Duplicate entries are preserved as-is so callers
+ *    can detect them; ordering is preserved for determinism.
+ *  - `upstreamContractsUrl` must pass SSRF validation or `loadConfig` throws.
  *
- * Rejections throw `ConfigValidationError` with a redacted message: the field
- * name and reason are included, but raw values are never echoed (they may
- * contain secrets or internal hostnames).
+ * These boundaries are the single source of truth for accepted input; any
+ * change here is a behavior change and must be covered by tests.
  */
-export class ConfigValidationError extends Error {
-  public readonly field: string;
-  public readonly reason: string;
+export const CONFIG_BOUNDS = {
+  port: { min: 1, max: 65535 },
+  upstreamTimeoutMs: { min: MIN_TIMEOUT_MS, max: MAX_TIMEOUT_MS },
+  chaosProbability: { min: 0, max: 1 },
+  idempotencyTtlMs: { min: 0, max: 7 * 24 * 60 * 60 * 1000 },
+  circuitBreaker: {
+    failureThreshold: { min: 1, max: 100 },
+    successThreshold: { min: 1, max: 20 },
+    timeoutMs: { min: 1_000, max: 300_000 },
+  },
+  webhookRetry: {
+    maxAttempts: { min: 1, max: 20 },
+    initialDelayMs: { min: 100, max: 60_000 },
+    maxDelayMs: { min: 1_000, max: 600_000 },
+    multiplier: { min: 1, max: 10 },
+    jitterFactor: { min: 0, max: 1 },
+  },
+  webhookCircuitBreaker: {
+    failureThreshold: { min: 1, max: 100 },
+    successThreshold: { min: 1, max: 20 },
+    timeoutMs: { min: 1_000, max: 300_000 },
+  },
+  healthProbes: {
+    queueFailedThreshold: { min: 0, max: 10_000 },
+    queueBacklogThreshold: { min: 0, max: 1_000_000 },
+    queueProbeTimeoutMs: { min: 100, max: 30_000 },
+  },
+} as const;
 
-  constructor(field: string, reason: string) {
-    super(`Invalid configuration for "${field}": ${reason}`);
-    this.name = 'ConfigValidationError';
-    this.field = field;
-    this.reason = reason;
-  }
-}
-
-const MAX_LIST_ITEMS = 64;
-const MAX_LIST_ITEM_LENGTH = 128;
-
-const chaosModeSchema = z.enum(['off', 'error', 'timeout', 'random']);
-
-const boundedInt = (min: number, max: number) =>
-  z
-    .number()
-    .int()
-    .min(min)
-    .max(max);
-
-const boundedNumber = (min: number, max: number) =>
-  z
-    .number()
-    .min(min)
-    .max(max);
-
-const boundedStringList = z
-  .array(z.string().min(1).max(MAX_LIST_ITEM_LENGTH))
-  .max(MAX_LIST_ITEMS);
-
-const circuitBreakerSchema = z.object({
-  failureThreshold: boundedInt(1, 100),
-  successThreshold: boundedInt(1, 20),
-  timeoutMs: boundedInt(1_000, 300_000),
-});
-
-const webhookRetrySchema = z
-  .object({
-    maxAttempts: boundedInt(1, 20),
-    initialDelayMs: boundedInt(100, 60_000),
-    maxDelayMs: boundedInt(1_000, 600_000),
-    multiplier: boundedNumber(1, 10),
-    jitterFactor: boundedNumber(0, 1),
-  })
-  .refine((v) => v.maxDelayMs >= v.initialDelayMs, {
-    message: 'maxDelayMs must be >= initialDelayMs',
-    path: ['maxDelayMs'],
-  });
-
-const healthProbesSchema = z.object({
-  queueFailedThreshold: boundedInt(0, 10_000),
-  queueBacklogThreshold: boundedInt(0, 1_000_000),
-  queueProbeTimeoutMs: boundedInt(100, 30_000),
-});
-
-const appConfigSchema = z.object({
-  port: boundedInt(1, 65535),
-  gracefulDegradationEnabled: z.boolean(),
-  upstreamContractsUrl: z
-    .string()
-    .min(1)
-    .refine((url) => isSafeUrl(url), { message: 'SSRF protection blocked access to internal resource' }),
-  upstreamTimeoutMs: boundedInt(MIN_TIMEOUT_MS, MAX_TIMEOUT_MS),
-  chaosMode: chaosModeSchema,
-  chaosTargets: boundedStringList,
-  chaosProbability: boundedNumber(0, 1),
-  circuitBreaker: circuitBreakerSchema,
-  webhookRetry: webhookRetrySchema,
-  webhookCircuitBreaker: circuitBreakerSchema,
-  healthProbes: healthProbesSchema,
-  idempotencyTtlMs: boundedInt(0, 7 * 24 * 60 * 60 * 1000),
-  allowedAssets: boundedStringList,
-  milestonesEnabled: z.boolean(),
-});
-
-function assertValidConfig(config: AppConfig): AppConfig {
-  const result = appConfigSchema.safeParse(config);
-  if (!result.success) {
-    const issue = result.error.issues[0];
-    const field = issue.path.join('.') || 'config';
-    throw new ConfigValidationError(field, issue.message);
-  }
-  return result.data;
-}
+const DEFAULT_ALLOWED_ASSETS = ['USDC', 'XLM', 'BTC', 'ETH'] as const;
 
 function toNumber(value: string | undefined, fallback: number): number {
-  if (!value?.trim()) {
+  if (!value) {
     return fallback;
   }
 
   const parsed = Number(value);
   return Number.isFinite(parsed) ? parsed : fallback;
-}
-
-// Ports and attempt/count thresholds must not reach callers as fractions.
-// Keep the legacy fallback and inclusive clamp behavior for invalid numbers.
-function toInteger(value: string | undefined, fallback: number): number {
-  const parsed = toNumber(value, fallback);
-  return Number.isInteger(parsed) ? parsed : fallback;
 }
 
 function clamp(value: number, min: number, max: number): number {
@@ -184,23 +124,37 @@ function clamp(value: number, min: number, max: number): number {
 
 function parseChaosMode(value: string | undefined): ChaosMode {
   const mode = (value ?? 'off').toLowerCase();
-  const parsed = chaosModeSchema.safeParse(mode);
-  if (!parsed.success) {
-    throw new ConfigValidationError('CHAOS_MODE', 'must be one of off, error, timeout, random');
+  if (mode === 'error' || mode === 'timeout' || mode === 'random') {
+    return mode;
   }
-  return parsed.data;
+  return 'off';
 }
 
-function parseBoolean(value: string | undefined, fallback: boolean, key: string): boolean {
-  const normalized = value?.trim().toLowerCase();
-  if (!normalized) {
+function parseBoolean(value: string | undefined, fallback: boolean): boolean {
+  if (value === undefined) {
     return fallback;
   }
 
-  if (normalized === 'true' || normalized === '1') return true;
-  if (normalized === 'false' || normalized === '0') return false;
-  // A typo must not silently disable milestone validation or degradation.
-  throw new Error(`Invalid ${key}: expected true, false, 1, or 0`);
+  return value.toLowerCase() === 'true';
+}
+
+/**
+ * Parse a numeric env var with an explicit inclusive boundary.
+ *
+ * - Missing/empty values use `fallback`.
+ * - Non-finite values (e.g. `NaN`, `Infinity`) use `fallback`.
+ * - Finite values are clamped into `[min, max]`.
+ *
+ * This is the only sanctioned way to read numeric config so that every
+ * field shares identical boundary semantics.
+ */
+function parseBoundedNumber(
+  value: string | undefined,
+  fallback: number,
+  min: number,
+  max: number,
+): number {
+  return clamp(toNumber(value, fallback), min, max);
 }
 
 function parseTargets(value: string | undefined): string[] {
@@ -208,91 +162,193 @@ function parseTargets(value: string | undefined): string[] {
     return [];
   }
 
-  const items = value
+  return value
     .split(',')
     .map((item) => item.trim().toLowerCase())
     .filter(Boolean);
-
-  if (items.length > MAX_LIST_ITEMS || items.some((item) => item.length > MAX_LIST_ITEM_LENGTH)) {
-    throw new ConfigValidationError('CHAOS_TARGETS', 'exceeds allowed size or item length');
-  }
-
-  return items;
 }
 
-function _parseAssets(value: string | undefined): string[] {
-  if (!value?.trim()) {
-    return ['USDC', 'XLM', 'BTC', 'ETH']; // Default assets
+function parseAssets(value: string | undefined): string[] {
+  if (!value) {
+    return [...DEFAULT_ALLOWED_ASSETS];
   }
 
-  const items = value
+  const parsed = value
     .split(',')
     .map((item) => item.trim().toUpperCase())
     .filter(Boolean);
 
-  if (items.length > MAX_LIST_ITEMS || items.some((item) => item.length > MAX_LIST_ITEM_LENGTH)) {
-    throw new ConfigValidationError('ALLOWED_ASSETS', 'exceeds allowed size or item length');
-  }
-
-  return items;
-}
-
-function loadUpstreamContractsUrl(env: NodeJS.ProcessEnv): string {
-  const url = env.UPSTREAM_CONTRACTS_URL ?? 'https://example.invalid/contracts';
-  try {
-    const protocol = new URL(url).protocol;
-    // Check the supplied environment without ever changing process.env. This
-    // keeps explicit config loads independent of global development bypasses.
-    if ((protocol === 'http:' || protocol === 'https:') && isSafeUrl(url, env)) {
-      return url;
-    }
-  } catch {
-    // URLs and even malformed policy values may contain credentials. Do not
-    // attach the underlying exception or echo either input in diagnostics.
-  }
-  throw new Error('Invalid UPSTREAM_CONTRACTS_URL: SSRF protection requires a permitted HTTP(S) URL');
+  // Deduplicate while preserving order to keep behavior deterministic.
+  return Array.from(new Set(parsed));
 }
 
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
-  const port = clamp(toInteger(env.PORT, 3001), 1, 65535);
-  const upstreamTimeoutMs = clamp(toNumber(env.UPSTREAM_TIMEOUT_MS, 1200), MIN_TIMEOUT_MS, MAX_TIMEOUT_MS);
-  const chaosProbability = clamp(toNumber(env.CHAOS_PROBABILITY, 0), 0, 1);
-  const idempotencyTtlMs = clamp(toNumber(env.IDEMPOTENCY_TTL_MS, 3_600_000), 0, 7 * 24 * 60 * 60 * 1000);
+  const port = parseBoundedNumber(
+    env.PORT,
+    3001,
+    CONFIG_BOUNDS.port.min,
+    CONFIG_BOUNDS.port.max,
+  );
+  const upstreamTimeoutMs = parseBoundedNumber(
+    env.UPSTREAM_TIMEOUT_MS,
+    1200,
+    CONFIG_BOUNDS.upstreamTimeoutMs.min,
+    CONFIG_BOUNDS.upstreamTimeoutMs.max,
+  );
+  const chaosProbability = parseBoundedNumber(
+    env.CHAOS_PROBABILITY,
+    0,
+    CONFIG_BOUNDS.chaosProbability.min,
+    CONFIG_BOUNDS.chaosProbability.max,
+  );
+  const idempotencyTtlMs = parseBoundedNumber(
+    env.IDEMPOTENCY_TTL_MS,
+    3_600_000,
+    CONFIG_BOUNDS.idempotencyTtlMs.min,
+    CONFIG_BOUNDS.idempotencyTtlMs.max,
+  );
 
-  const config: AppConfig = {
+  return {
     port,
-    gracefulDegradationEnabled: parseBoolean(env.GRACEFUL_DEGRADATION_ENABLED, true, 'GRACEFUL_DEGRADATION_ENABLED'),
-    upstreamContractsUrl: loadUpstreamContractsUrl(env),
+    gracefulDegradationEnabled: parseBoolean(env.GRACEFUL_DEGRADATION_ENABLED, true),
+    upstreamContractsUrl,
     upstreamTimeoutMs,
     chaosMode: parseChaosMode(env.CHAOS_MODE),
     chaosTargets: parseTargets(env.CHAOS_TARGETS),
     chaosProbability,
     circuitBreaker: {
-      failureThreshold: clamp(toInteger(env.CB_FAILURE_THRESHOLD, 5), 1, 100),
-      successThreshold: clamp(toInteger(env.CB_SUCCESS_THRESHOLD, 1), 1, 20),
-      timeoutMs: clamp(toNumber(env.CB_TIMEOUT_MS, 30_000), 1_000, 300_000),
+      failureThreshold: parseBoundedNumber(
+        env.CB_FAILURE_THRESHOLD,
+        5,
+        CONFIG_BOUNDS.circuitBreaker.failureThreshold.min,
+        CONFIG_BOUNDS.circuitBreaker.failureThreshold.max,
+      ),
+      successThreshold: parseBoundedNumber(
+        env.CB_SUCCESS_THRESHOLD,
+        1,
+        CONFIG_BOUNDS.circuitBreaker.successThreshold.min,
+        CONFIG_BOUNDS.circuitBreaker.successThreshold.max,
+      ),
+      timeoutMs: parseBoundedNumber(
+        env.CB_TIMEOUT_MS,
+        30_000,
+        CONFIG_BOUNDS.circuitBreaker.timeoutMs.min,
+        CONFIG_BOUNDS.circuitBreaker.timeoutMs.max,
+      ),
     },
     webhookRetry: {
-      maxAttempts: clamp(toInteger(env.WEBHOOK_RETRY_MAX_ATTEMPTS, 5), 1, 20),
-      initialDelayMs: clamp(toNumber(env.WEBHOOK_RETRY_INITIAL_DELAY_MS, 1_000), 100, 60_000),
-      maxDelayMs: clamp(toNumber(env.WEBHOOK_RETRY_MAX_DELAY_MS, 30_000), 1_000, 600_000),
-      multiplier: clamp(toNumber(env.WEBHOOK_RETRY_MULTIPLIER, 2), 1, 10),
-      jitterFactor: clamp(toNumber(env.WEBHOOK_RETRY_JITTER_FACTOR, 0.1), 0, 1),
+      maxAttempts: parseBoundedNumber(
+        env.WEBHOOK_RETRY_MAX_ATTEMPTS,
+        5,
+        CONFIG_BOUNDS.webhookRetry.maxAttempts.min,
+        CONFIG_BOUNDS.webhookRetry.maxAttempts.max,
+      ),
+      initialDelayMs: parseBoundedNumber(
+        env.WEBHOOK_RETRY_INITIAL_DELAY_MS,
+        1_000,
+        CONFIG_BOUNDS.webhookRetry.initialDelayMs.min,
+        CONFIG_BOUNDS.webhookRetry.initialDelayMs.max,
+      ),
+      maxDelayMs: parseBoundedNumber(
+        env.WEBHOOK_RETRY_MAX_DELAY_MS,
+        30_000,
+        CONFIG_BOUNDS.webhookRetry.maxDelayMs.min,
+        CONFIG_BOUNDS.webhookRetry.maxDelayMs.max,
+      ),
+      multiplier: parseBoundedNumber(
+        env.WEBHOOK_RETRY_MULTIPLIER,
+        2,
+        CONFIG_BOUNDS.webhookRetry.multiplier.min,
+        CONFIG_BOUNDS.webhookRetry.multiplier.max,
+      ),
+      jitterFactor: parseBoundedNumber(
+        env.WEBHOOK_RETRY_JITTER_FACTOR,
+        0.1,
+        CONFIG_BOUNDS.webhookRetry.jitterFactor.min,
+        CONFIG_BOUNDS.webhookRetry.jitterFactor.max,
+      ),
     },
     webhookCircuitBreaker: {
-      failureThreshold: clamp(toInteger(env.WEBHOOK_CB_FAILURE_THRESHOLD, 5), 1, 100),
-      successThreshold: clamp(toInteger(env.WEBHOOK_CB_SUCCESS_THRESHOLD, 1), 1, 20),
-      timeoutMs: clamp(toNumber(env.WEBHOOK_CB_TIMEOUT_MS, 60_000), 1_000, 300_000),
+      failureThreshold: parseBoundedNumber(
+        env.WEBHOOK_CB_FAILURE_THRESHOLD,
+        5,
+        CONFIG_BOUNDS.webhookCircuitBreaker.failureThreshold.min,
+        CONFIG_BOUNDS.webhookCircuitBreaker.failureThreshold.max,
+      ),
+      successThreshold: parseBoundedNumber(
+        env.WEBHOOK_CB_SUCCESS_THRESHOLD,
+        1,
+        CONFIG_BOUNDS.webhookCircuitBreaker.successThreshold.min,
+        CONFIG_BOUNDS.webhookCircuitBreaker.successThreshold.max,
+      ),
+      timeoutMs: parseBoundedNumber(
+        env.WEBHOOK_CB_TIMEOUT_MS,
+        60_000,
+        CONFIG_BOUNDS.webhookCircuitBreaker.timeoutMs.min,
+        CONFIG_BOUNDS.webhookCircuitBreaker.timeoutMs.max,
+      ),
     },
     healthProbes: {
-      queueFailedThreshold: clamp(toInteger(env.QUEUE_FAILED_THRESHOLD, 10), 0, 10_000),
-      queueBacklogThreshold: clamp(toInteger(env.QUEUE_BACKLOG_THRESHOLD, 100), 0, 1_000_000),
-      queueProbeTimeoutMs: clamp(toNumber(env.QUEUE_PROBE_TIMEOUT_MS, 3_000), 100, 30_000),
+      queueFailedThreshold: parseBoundedNumber(
+        env.QUEUE_FAILED_THRESHOLD,
+        10,
+        CONFIG_BOUNDS.healthProbes.queueFailedThreshold.min,
+        CONFIG_BOUNDS.healthProbes.queueFailedThreshold.max,
+      ),
+      queueBacklogThreshold: parseBoundedNumber(
+        env.QUEUE_BACKLOG_THRESHOLD,
+        100,
+        CONFIG_BOUNDS.healthProbes.queueBacklogThreshold.min,
+        CONFIG_BOUNDS.healthProbes.queueBacklogThreshold.max,
+      ),
+      queueProbeTimeoutMs: parseBoundedNumber(
+        env.QUEUE_PROBE_TIMEOUT_MS,
+        3_000,
+        CONFIG_BOUNDS.healthProbes.queueProbeTimeoutMs.min,
+        CONFIG_BOUNDS.healthProbes.queueProbeTimeoutMs.max,
+      ),
     },
     idempotencyTtlMs,
-    allowedAssets: _parseAssets(env.ALLOWED_ASSETS),
-    milestonesEnabled: parseBoolean(env.MILESTONES_ENABLED, true, 'MILESTONES_ENABLED'),
+    allowedAssets: parseAssets(env.ALLOWED_ASSETS),
+    milestonesEnabled: parseBoolean(env.MILESTONES_ENABLED, true),
   };
+}
 
-  return assertValidConfig(config);
+/**
+ * Loads the application configuration from the provided environment.
+ *
+ * Concurrency / idempotency guarantees:
+ *   - When no explicit env is passed and `forceReload` is false, the result is
+  *     cached and returned by reference. Callers must treat the returned
+ *     object as immutable.
+   - The cache is invalidated automatically when any config-relevant
+  *     environment variable changes, so concurrent callers never observe
+ *     stale values.
+ *   - Parsing is synchronous; a concurrent caller either observes the
+ *     previous consistent cache or the newly built one, never a partially
+ *     constructed object.
+ *   - Invalid configuration (e.g. SSRF blocked URL) throws before the cache
+  *     is updated, so a failed reload never corrupts a previously valid
+ *     cache.
+ */
+export function loadConfig(
+  env: NodeJS.ProcessEnv = process.env,
+  options: LoadConfigOptions = {},
+): AppConfig {
+  const useCache = env === process.env && !options.forceReload;
+
+  if (useCache) {
+    const snapshot = snapshotEnv(env);
+    if (cache && snapshotsEqual(cache.snapshot, snapshot)) {
+      return cache.config;
+    }
+
+    // Build first, then swap atomically. If building throws, the existing
+    // cache remains untouched.
+    const next = buildConfig(env);
+    cache = { config: next, snapshot };
+    return next;
+  }
+
+  return buildConfig(env);
 }

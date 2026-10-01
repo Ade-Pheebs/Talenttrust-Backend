@@ -9,6 +9,10 @@ import {
   EventQuarantineStorage,
   getEventQuarantineStorage,
 } from '../events/eventQuarantine';
+import {
+  EventIngestionBackpressure,
+  DEFAULT_MAX_PENDING_EVENTS,
+} from '../events/backpressure';
 import { getCorrelationId } from '../utils/correlationId';
 import { validateSchema } from '../middleware/validate.middleware';
 import { requireAuth, requireRole } from '../middleware/authorization';
@@ -131,6 +135,7 @@ export function createEventsRouter(
   const router = Router();
   const quarantine = options.quarantineStorage ?? getEventQuarantineStorage();
   const knownSchemaVersions = options.knownSchemaVersions ?? [LEGACY_SCHEMA_VERSION];
+  const backpressure = options.backpressure ?? new EventIngestionBackpressure({ maxPendingEvents: DEFAULT_BACKPRESSURE_MAX_PENDING });
 
   // Expire any held ordering events whose gap never filled before handling
   // new traffic. Bounded sweep — each call examines only held entries.
@@ -162,7 +167,7 @@ export function createEventsRouter(
       );
     }
 
-    const admission = backpressure.tryAdmit(validation.event);
+    const admission = backpressure.tryAdmit(boundary.event as unknown as import('../events/types').ContractEvent);
     if (!admission.admitted) {
       res.setHeader('Retry-After', '1');
       return fail(

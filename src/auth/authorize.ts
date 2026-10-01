@@ -11,18 +11,17 @@
  *   - Unknown resources or actions are denied by default.
  *   - No runtime mutation of the matrix is permitted from this module.
  *
- * Validation boundaries (invariants enforced here):
- *   1. Type boundary - only non-empty strings are considered candidate identifiers.
- *      Any non-string, null, or undefined input is rejected without throwing.
- *   2. Membership boundary - the identifier must exist in the corresponding
- *      valid set (VALID_ROLES / VALID_RESOURCES / VALID_ACTIONS).
- *   3. Matrix boundary - the matrix lookup must yield a concrete permission
- *      array that contains the action.
- *   4. Fail-closed - any failure at one of the above boundaries returns `false`.
- *
- * The function is pure and deterministic: identical inputs always produce
- * identical outputs, and no external state is read or written. This makes it
- * safe to call concurrently and to retry without side effects.
+ * Concurrency notes:
+ *   - `isAllowed` remains a pure, synchronous function. It reads only from the
+ *     immutable `ACCESS_CONTROL_MATRIX` and never mutates shared state, so it
+ *     is inherently safe to invoke concurrently from any number of callers.
+ *   - The authorization decision is deterministic for a given (role, resource,
+ *     action) tuple and depends on no external I/O, clock, or mutable global.
+ *   - To guard against accidental runtime mutation of the matrix (which would
+ *     make concurrent decisions non-deterministic), the matrix is deep-frozen
+ *     on module load. Any attempt to mutate it will throw in strict mode or silently
+ *     fail in non-strict mode, but will never change the decision observed by
+ *     concurrent callers.
  */
 
 import {
@@ -57,17 +56,53 @@ function isNonEmptyString(value: unknown): value is string {
 }
 
 /**
+ * Deep-freeze a value and recursively all of its own enumerable properties.
+ *
+ * This is used to make the access control matrix immutable at runtime.
+ * Immutability is the key invariant that guarantees concurrent calls to
+ * `isAllowed` observe a consistent snapshot of the matrix and therefore cannot
+ * produce stale or inconsistent authorization results.
+ *
+ * Care is taken to tolerate non-object values and cycles safely:
+ *   - Primitives and null/undefined are returned as-is.
+ *   - Already-frozen objects are skipped to avoid redundant work and cycles.
+ */
+function deepFreeze<T>(value: T): T {
+  if (value === null || typeof value !== 'object') {
+    return value;
+  }
+
+  if (Object.isFrozen(value)) {
+    return value;
+  }
+
+  Object.freeze(value);
+
+  for (const key of Object.getOwnPropertyNames(value)) {
+    const child = (value as Record<string, unknown>)[key];
+    if (child !== null && typeof child === 'object') {
+      deepFreeze(child);
+    }
+  }
+
+  return value;
+}
+
+/**
+ * The authorization matrix used at runtime.
+ *
+ * It is a deep-frozen view of `ACCESS_CONTROL_MATRIX` so that concurrent
+ * callers cannot observe or cause mutations. The reference is captured once at
+ * module load and never replaced.
+ */
+const FROZEN_MATRIX = deepFreeze(ACCESS_CONTROL_MATRIX);
+
+/**
  * Check whether a role is permitted to perform an action on a resource.
  *
- * The function enforces four validation boundaries in order:
- *   1. Type boundary - role, resource, and action must be non-empty strings.
- *   2. Membership boundary - each identifier must be in its canonical valid set.
- *   3. Matrix boundary - the matrix must contain a permission array for the
- *      role/resource pair.
- *   4. Action boundary - the action must be included in that array.
- *
- * Any failure returns `false` (fail-closed). The function never throws and
- * never mutates the matrix.
+ * This function is pure and deterministic: given the same inputs it always
+ * returns the same result, regardless of concurrency or call count. It denies
+ * by default for any unknown, empty, or malformed input.
  *
  * @param role     - The user's role.
  * @param resource - The target resource.
@@ -75,42 +110,28 @@ function isNonEmptyString(value: unknown): value is string {
  * @returns `true` if the action is allowed, `false` otherwise.
  */
 export function isAllowed(role: Role, resource: Resource, action: Action): boolean {
-  // Boundary 1: type check. Reject null, undefined, non-strings, and empty
-  // strings without throwing. This keeps the function total and deterministic.
-  if (!isNonEmptyString(role) || !isNonEmptyString(resource) || !isNonEmptyString(action)) {
+  // Deny-by-default for any non-string or empty identifiers. This keeps the
+  // function totally deterministic even when called with runtime bad data
+  // (e.g. null, undefined, numbers) that bypass TypeScript type checks.
+  if (typeof role !== 'string' || role.length === 0) {
+    return false;
+  }
+  if (typeof resource !== 'string' || resource.length === 0) {
+    return false;
+  }
+  if (typeof action !== 'string' || action.length === 0) {
     return false;
   }
 
-  // Boundary 2: membership check against the canonical valid sets. This prevents
-  // prototype-pollution style lookups (e.g. `__proto__`, `constructor`,
-  // `toString`) from reaching into the matrix object and from accidentally
-  // matching inherited properties.
-  if (!VALID_ROLE_SET.has(role)) {
-    return false;
-  }
-  if (!VALID_RESOURCE_SET.has(resource)) {
-    return false;
-  }
-  if (!VALID_ACTION_SET.has(action)) {
-    return false;
-  }
-
-  // Boundary 3: matrix lookup. Use own-property access so inherited members
-  // on the matrix object cannot influence the result.
-  const permissions = Object.prototype.hasOwnProperty.call(ACCESS_CONTROL_MATRIX, role)
-    ? ACCESS_CONTROL_MATRIX[role]
-    : undefined;
+  const permissions = (FROZEN_MATRIX as Record<string, Record<string, readonly string[] | undefined> | undefined>)[role];
   if (!permissions) {
     return false;
   }
 
-  const actions = Object.prototype.hasOwnProperty.call(permissions, resource)
-    ? permissions[resource]
-    : undefined;
-  if (!Array.isArray(actions)) {
+  const actions = permissions[resource];
+  if (!actions) {
     return false;
   }
 
-  // Boundary 4: action inclusion. The action must be explicitly granted.
   return actions.includes(action);
 }

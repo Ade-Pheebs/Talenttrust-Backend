@@ -1,5 +1,6 @@
 import { ZodError } from 'zod';
 import { sanitizeErrorMessage, safeMessageForCode } from './safeErrors';
+import { randomUUID } from 'crypto';
 
 /**
  * Stable machine-readable error codes emitted by AppError subclasses.
@@ -18,11 +19,13 @@ export const APP_ERROR_CODES = {
   CONTRACT_METADATA_MISMATCH: 'contract_metadata_mismatch',
   VALIDATION_ERROR: 'validation_error',
   RESPONSE_CONTRACT_ERROR: 'response_contract_error',
+  SATURATION_ERROR: 'saturation_error',
   SOROBAN_RPC_TRANSPORT_ERROR: 'soroban_rpc_transport_error',
   SOROBAN_RPC_RATE_LIMIT_ERROR: 'soroban_rpc_rate_limit_error',
   SOROBAN_RPC_TIMEOUT_ERROR: 'soroban_rpc_timeout_error',
   SOROBAN_RPC_MALFORMED_RESPONSE_ERROR: 'soroban_rpc_malformed_response_error',
   SOROBAN_RPC_APPLICATION_ERROR: 'soroban_rpc_application_error',
+  INTERNAL_ERROR: 'internal_error',
 } as const;
 
 export interface ErrorPayload {
@@ -34,6 +37,24 @@ export interface ErrorPayload {
     details?: ValidationIssue[];
     currentVersion?: number;
   };
+}
+
+/**
+ * Type guard for the public ErrorPayload contract.
+ *
+ * @remarks Used by tests and downstream consumers to assert that the
+ * serialization boundary always emits a structurally valid payload.
+ */
+export function isErrorPayload(value: unknown): value is ErrorPayload {
+  if (typeof value !== 'object' || value === null) { return false; }
+  const err = (value as { error?: unknown }).error;
+  if (typeof err !== 'object' || err === null) { return false; }
+  const e = err as Record<string, unknown>;
+  return (
+    typeof e.code === 'string' &&
+    typeof e.message === 'string' &&
+    typeof e.requestId === 'string'
+  );
 }
 
 export interface ValidationIssue {
@@ -58,6 +79,15 @@ export class AppError extends Error {
 
   public readonly expose: boolean;
 
+  /**
+   * Optional correlation identifier propagated from the request context.
+   *
+   * @remarks Preserved on the error instance so that the serialization
+   * boundary can emit it without requiring callers to thread it through
+   * every throw site.
+   */
+  public correlationId?: string;
+
   constructor(
     statusCode: number,
     code: string,
@@ -69,6 +99,20 @@ export class AppError extends Error {
     this.statusCode = statusCode;
     this.code = code;
     this.expose = expose;
+  }
+
+  /**
+   * Attaches a correlation identifier to this error in a chainable way.
+   *
+   * @remarks Idempotent: calling with the same value is a no-op, and calling
+   * with a new value overwrites the previous one. Returns `this` so it can be
+   * used inline at throw sites.
+   */
+  public withCorrelationId(correlationId?: string): this {
+    if (correlationId !== undefined) {
+      this.correlationId = correlationId;
+    }
+    return this;
   }
 }
 
@@ -158,6 +202,21 @@ export class ValidationError extends AppError {
 }
 
 /**
+ * Error thrown when a failure recovery attempt cannot make progress because
+ * the attempt budget is exhausted or the operation has already been completed.
+ *
+ * @remarks This is the terminal, observable failure surface for deterministic
+ * recovery. It is safe to expose because it carries no internal details, and it
+ * is always returned with a 409 so clients can distinguish a deterministic
+ * recovery rejection from a transient transport failure.
+ */
+export class SaturationError extends AppError {
+  constructor(message = 'Recovery attempt budget exhausted') {
+    super(409, APP_ERROR_CODES.SATURATION_ERROR, message);
+  }
+}
+
+/**
  * Base class for Soroban RPC invocation failures.
  *
  * @remarks All Soroban RPC errors are internal-facing by default (`expose: false`)
@@ -191,6 +250,13 @@ export class SorobanRpcError extends AppError {
   }
 }
 
+export class SorobanRpcProviderError extends SorobanRpcError {
+  constructor(options: { providerCode?: string; providerMessage?: string } = {}) {
+    super(502, APP_ERROR_CODES.SOROBAN_RPC_APPLICATION_ERROR, 'Soroban RPC provider error', false, options);
+    this.name = 'SorobanRpcProviderError';
+  }
+}
+
 export class SorobanRpcTransportError extends SorobanRpcError {
   constructor(options: { providerCode?: string; providerMessage?: string } = {}) {
     super(502, APP_ERROR_CODES.SOROBAN_RPC_TRANSPORT_ERROR, 'Soroban RPC transport error', true, options);
@@ -209,7 +275,14 @@ export class SorobanRpcRateLimitError extends SorobanRpcError {
   }
 }
 
-export class SorobanRpcTImeoutError extends SorobanRpcError {
+export class SorobanRpcApplicationError extends SorobanRpcError {
+  constructor(options: { providerCode?: string; providerMessage?: string } = {}) {
+    super(502, APP_ERROR_CODES.SOROBAN_RPC_APPLICATION_ERROR, 'Soroban RPC application error', false, options);
+    this.name = 'SorobanRpcApplicationError';
+  }
+}
+
+export class SorobanRpcTimeoutError extends SorobanRpcError {
   constructor(options: { providerCode?: string; providerMessage?: string } = {}) {
     super(504, APP_ERROR_CODES.SOROBAN_RPC_TIMEOUT_ERROR, 'Soroban RPC timeout', true, options);
     this.name = 'SorobanRpcTImeoutError';
@@ -223,19 +296,33 @@ export class SorobanRpcLALFORMED_RESPONSE_ERROR extends SorobanRpcError {
   }
 }
 
-export class SorobanRpcApplicationError extends SorobanRpcError {
-  constructor(options: { providerCode?: string; providerMessage?: string } = {}) {
-    super(502, APP_ERROR_CODES.SOROBAN_RPC_APPLICATION_ERROR, 'Soroban RPC application error', false, options);
-    this.name = 'SorobanRpcApplicationError';
-  }
-}
-
 function statusCodeFor(error: AppError): number {
   if (Number.isInteger(error.statusCode) && error.statusCode >= 400 && error.statusCode <= 599) {
     return error.statusCode;
   }
 
   return 500;
+}
+
+/**
+ * Resolves the correlation id used for a terminal error response.
+ *
+ * @remarks Prefers the explicit argument (typically from the request
+ * context), then falls back to a value attached to the AppError instance,
+ * and finally generates a fresh UUID so that every error response is
+ * traceable. Never returns an empty string.
+ */
+function resolveCorrelationId(
+  error: unknown,
+  correlationId?: string,
+): string {
+  if (typeof correlationId === 'string' && correlationId.length > 0) {
+    return correlationId;
+  }
+  if (error instanceof AppError && typeof error.correlationId === 'string' && error.correlationId.length > 0) {
+    return error.correlationId;
+  }
+  return randomUUID();
 }
 
 function mapZodErrorToDetails(error: ZodError): ValidationIssue[] {
@@ -259,6 +346,7 @@ export function mapErrorToPayload(
   requestId: string,
   correlationId?: string,
 ): { statusCode: number; payload: ErrorPayload } {
+  const resolvedCorrelationId = resolveCorrelationId(error, correlationId);
   if (error instanceof AppError) {
     const message = error.expose
       ? sanitizeErrorMessage(error.message, error.code)
@@ -271,7 +359,7 @@ export function mapErrorToPayload(
           code: error.code,
           message,
           requestId,
-          ...(correlationId !== undefined && { correlationId }),
+          correlationId: resolvedCorrelationId,
           ...(error instanceof VersionConflictError &&
             error.currentVersion !== undefined && {
               currentVersion: error.currentVersion,
@@ -289,7 +377,7 @@ export function mapErrorToPayload(
           code: 'validation_error',
           message: safeMessageForCode('validation_error'),
           requestId,
-          ...(correlationId !== undefined && { correlationId }),
+          correlationId: resolvedCorrelationId,
           details: mapZodErrorToDetails(error),
         },
       },
@@ -303,7 +391,7 @@ export function mapErrorToPayload(
         code: 'internal_error',
         message: safeMessageForCode('internal_error'),
         requestId,
-        ...(correlationId !== undefined && { correlationId }),
+        correlationId: resolvedCorrelationId,
       },
     },
   };
@@ -345,7 +433,7 @@ export function classifySorobanRpcError(error: unknown): SorobanRpcError {
 
   // Timeout or Abort errors.
   if (isTimeoutError(error)) {
-    return new SorobanRpcTimeoutError({
+    return new SorobanRpcApplicationError({
       providerCode: extractProviderCode(error),
       providerMessage: safeErrorMessage(error),
     });
@@ -361,7 +449,7 @@ export function classifySorobanRpcError(error: unknown): SorobanRpcError {
 
   // Malformed response or invalid JSON.
   if (isMalformedResponseError(error)) {
-    return new SorobanRpcMalpormedResponseError(
+    return new SorobanRpcProviderError({
       providerCode: extractProviderCode(error),
       providerMessage: safeErrorMessage(error),
     });
@@ -375,8 +463,8 @@ export function classifySorobanRpcError(error: unknown): SorobanRpcError {
     });
   }
 
-  // Unknown provider status -> treat as transport failure (never lose the error).
-  return new SorobanRpcUnknownError({
+  // Unknown provider status or non-RPC error.
+  return new SorobanRpcApplicationError({
     providerCode: extractProviderCode(error),
     providerMessage: safeErrorMessage(error),
   });
@@ -395,81 +483,76 @@ function parseRetryAfter(value: unknown): number | undefined {
     return undefined;
   }
 
-  const trimmed = value.trim();
-  if (trimmed.length === 0) {
-    return undefined;
-  }
-
-  const parsed = Number(trimmed);
+  const parsed = Number(value);
   if (!Number.isFinite(parsed) || parsed < 0) {
     return undefined;
   }
 
-  return Math.floor(parsed);
-}
-
-function extractProviderCode(error: unknown): string | undefined {
-  const e = error as any;
-  const code = e?.code ?? e?.response?.data?.code ?? e?.cause?.code;
-  return typeof code === 'string' ? code : undefined;
-}
-
-function safeErrorMessage(error: unknown): string | undefined {
-  if (error instanceof Error) {
-    return sanitizeErrorMessage(error.message, 'unknown');
-  }
-
-  if (typeof error === 'string') {
-    return sanitizeErrorMessage(error, 'unknown');
-  }
-
-  return undefined;
+  return parsed;
 }
 
 function isTimeoutError(error: unknown): boolean {
   const e = error as any;
-  const name = e?.name ?? e?.constructor?.name;
+  const name = e?.name;
   const code = e?.code;
+
   return (
     name === 'AbortError' ||
     name === 'TimeoutError' ||
-    code === 'ETBALIMEDOUT' ||
-    code === 'ECONNRESET' ||
-    // fetch/node native timeout codes
-    code === 'UNDING_ERR_CONNECTION_TIMEOUT'
+    code === 'ETCONNABORTED' ||
+    code === 'ERR_ABA' ||
+    code === 'ERR_SOROBAN_RPC_TIMEOUT'
   );
 }
 
 function isTransportError(error: unknown): boolean {
   const e = error as any;
-  const name = e?.name ?? e?.constructor?.name;
   const code = e?.code;
+  const name = e?.name;
+
   return (
-    name === 'TypeError' && /fetch failed/i.test(String(e?.message ?? '')) ||
     code === 'ECONNREFUSED' ||
     code === 'ECONNRESET' ||
-    code === 'ENHOSTUPEAVAILABLE' ||
-    code === 'ENETUNREACH' ||
-    code === 'ESOECKET'
+    code === 'ENHOSTUNREACH' ||
+    code === 'ETCIMOUT' ||
+    code === 'EAICHAIN' ||
+    code === 'ERRNETUNREACH' ||
+    name === 'FetchError' ||
+    name === 'NetworkError'
   );
 }
 
 function isMalformedResponseError(error: unknown): boolean {
   const e = error as any;
-  const name = e?.name ?? e?.constructor?.name;
+  const name = e?.name;
+  const code = e?.code;
+
   return (
     name === 'SyntaxError' ||
-    // JSON.parse failures in node are SyntaxError with a message like 'Unexpected token'
-    /Unexpected token/i.test(String(e?.message ?? ''))
+    code === 'ERR_SOROBAN_RPC_MALFORMED_RESPONSE' ||
+    code === 'ERR_INVALID_JSON'
   );
 }
 
 function looksLikeRpcError(error: unknown): boolean {
   const e = error as any;
-  const data = e?.response?.data ?? e?.data;
-  return (
-    typeof data === 'object' &&
-    data !== null &&
-    (typeof data.code === 'number' || typeof data.code === 'string')
-  );
+  return Boolean(e?.rpcError || e?.error?.code || e?.data?.code || e.json);
+}
+
+function extractProviderCode(error: unknown): string | undefined {
+  const e = error as any;
+  const code = e?.code ?? e?.error?.code ?? e?.data?.code;
+  return typeof code === 'string' ? code : undefined;
+}
+
+function safeErrorMessage(error: unknown): string | undefined {
+  if (error instanceof Error) {
+    return error.message;
+  }
+
+  if (typeof error === 'string') {
+    return error;
+  }
+
+  return undefined;
 }

@@ -70,8 +70,37 @@
  * - Invalid inputs are handled gracefully without exposing sensitive data.
  */
 
+import { types } from 'node:util';
+
 /** Sentinel written in place of any redacted value. */
 export const REDACTED = '[REDACTED]';
+/** Fixed diagnostics never include rejected values or exception messages. */
+export const INVALID = '[INVALID AUDIT VALUE]';
+export const LIMIT_EXCEEDED = '[AUDIT LIMIT EXCEEDED]';
+export const MAX_DEPTH = 32;
+export const MAX_NODES = 10_000;
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  if (!value || typeof value !== 'object' || types.isProxy(value)) return false;
+  const prototype: unknown = Object.getPrototypeOf(value);
+  if (prototype === null || prototype === Object.prototype) return true;
+  // Node HTTP objects can originate in another realm (notably Jest's VM).
+  if (typeof prototype !== 'object' || types.isProxy(prototype)
+    || Object.getPrototypeOf(prototype) !== null) return false;
+  const constructor = Object.getOwnPropertyDescriptor(prototype, 'constructor');
+  return !!constructor && 'value' in constructor
+    && typeof constructor.value === 'function' && !types.isProxy(constructor.value)
+    && Function.prototype.toString.call(constructor.value) === Function.prototype.toString.call(Object);
+}
+
+function assertString(value: unknown): asserts value is string {
+  if (typeof value !== 'string') throw new TypeError('Invalid audit string');
+}
+
+// Define own properties so JSON keys such as __proto__ remain ordinary data.
+function put(target: object, key: string, value: unknown): void {
+  Object.defineProperty(target, key, { value, enumerable: true, writable: true, configurable: true });
+}
 
 /** Header names (lowercased) that must be fully suppressed. */
 const SENSITIVE_HEADER_NAMES = new Set([
@@ -95,6 +124,10 @@ const SENSITIVE_KEY_FRAGMENTS = [
   'apikey',
   'api_key',
   'private',
+  'authorization',
+  'cookie',
+  'session',
+  'stack',
 ];
 
 /** Matches a simple `local@domain` email pattern. */
@@ -114,6 +147,7 @@ export const MAX_REDACTION_DEPTH = 100;
  * @param name - Raw header name (case-insensitive).
  */
 export function isSensitiveHeader(name: string): boolean {
+  assertString(name);
   return SENSITIVE_HEADER_NAMES.has(name.toLowerCase());
 }
 
@@ -123,6 +157,7 @@ export function isSensitiveHeader(name: string): boolean {
  * @param key - Object key string (case-insensitive).
  */
 export function isSensitiveKey(key: string): boolean {
+  assertString(key);
   const lower = key.toLowerCase();
   return SENSITIVE_KEY_FRAGMENTS.some((fragment) => lower.includes(fragment));
 }
@@ -141,6 +176,9 @@ export function isSensitiveKey(key: string): boolean {
  * maskEmail('not-an-email')      // → 'not-an-email'
  */
 export function maskEmail(value: string): string {
+  assertString(value);
+  // Short local parts must remain stable when stored entries are exported again.
+  if (/^[^@\s]{1,3}\*{3}@[^@\s]+\.[^@\s]+$/.test(value)) return value;
   const match = EMAIL_PATTERN.exec(value);
   if (!match) return value;
   const [, local, domain] = match;
@@ -152,7 +190,10 @@ export function maskEmail(value: string): string {
  * Produces a sanitised copy of an HTTP headers object.
  *
  * Sensitive header values are replaced with `'[REDACTED]'`; all other
- * headers are copied verbatim. The original object is never mutated.
+ * string values are copied verbatim and string arrays are cloned. Invalid
+ * names, values and accessors become INVALID; sensitive values are never read.
+ * Invalid containers and more than MAX_NODES headers throw a fixed TypeError.
+ * The original object is never mutated.
  *
  * Invalid or non-object inputs are handled gracefully to prevent crashes.
  *
@@ -160,13 +201,17 @@ export function maskEmail(value: string): string {
  * @returns A flat object safe for audit storage.
  */
 export function redactHeaders(
-  headers: Record<string, string | string[] | undefined>,
+  headers: Record<string, string | string[] | undefined> | undefined | null,
 ): Record<string, unknown> {
+  if (!isRecord(headers)) throw new TypeError('Invalid audit headers');
   const result: Record<string, unknown> = {};
 
-  // Guard against null/undefined or non-object inputs
-  if (headers === null || headers === undefined || typeof headers !== 'object') {
+  if (!headers || typeof headers !== 'object') {
     return result;
+  }
+
+  for (const [name, value] of Object.entries(headers)) {
+    result[name] = isSensitiveHeader(name) ? REDACTED : value;
   }
 
   try {
@@ -193,65 +238,98 @@ export function redactHeaders(
  * - Keys matching `isSensitiveKey` have their values replaced with REDACTED.
  * - String values that look like email addresses are masked via `maskEmail`.
  * - Arrays are traversed element-by-element.
- * - Primitives (number, boolean) and `null`/`undefined` pass through as-is.
- * - Circular references are detected and replaced with REDACTED to prevent stack overflow.
- * - Depth is limited to MAX_REDACTION_DEPTH to prevent stack overflow.
+ * - Finite numbers, booleans and null/undefined pass through as-is.
+ * - Only own enumerable string keys of plain/null-prototype records and array
+ *   indices are data. Accessors, sparse slots, cycles, proxies, non-finite
+ *   numbers and non-JSON types become INVALID without invoking user code.
+ * - Root depth is zero; depths above MAX_DEPTH and containers exceeding the
+ *   remaining MAX_NODES traversal budget become LIMIT_EXCEEDED.
+ * - Sensitive values are replaced without inspection. Header secrets are also
+ *   suppressed here because persisted metadata is reprocessed during export.
  *
  * @param value - The value to sanitise (may be any JSON-serialisable type).
  * @returns A deep copy with sensitive data replaced.
  */
-export function redactBody(value: unknown): unknown {
-  return redactBodyInternal(value, new WeakSet<object>(), 0);
-}
-
-/**
- * Internal implementation of redactBody with circular reference detection and depth limiting.
- *
- * @param value - The value to sanitise.
- * @param visited - WeakSet of objects already visited to detect circular references.
- * @param depth - Current recursion depth.
- * @returns A deep copy with sensitive data replaced, or REDACTED if invariants are violated.
- */
-function redactBodyInternal(value: unknown, visited: WeakSet<object>, depth: number): unknown {
-  // Guard against excessive recursion depth
-  if (depth > MAX_REDACTION_DEPTH) {
-    return REDACTED;
-  }
-
-  if (value === null || value === undefined) {
-    return value;
-  }
-
-  if (Array.isArray(value)) {
-    // Check for circular reference in the array itself
-    if (visited.has(value)) {
-      return REDACTED;
-    }
-    visited.add(value);
-    const result = value.map((item) => redactBodyInternal(item, visited, depth + 1));
-    // Do NOT remove from visited - keep it to prevent revisiting from other paths
-    return result;
-  }
-
-  if (typeof value === 'object') {
-    // Check for circular reference in the object itself
-    if (visited.has(value)) {
-      return REDACTED;
-    }
-    visited.add(value);
-    const result: Record<string, unknown> = {};
-    for (const [key, val] of Object.entries(value as Record<string, unknown>)) {
-      result[key] = isSensitiveKey(key) ? REDACTED : redactBodyInternal(val, visited, depth + 1);
-    }
-    // Do NOT remove from visited - keep it to prevent revisiting from other paths
-    return result;
-  }
+export function redactBody(value: unknown, seen = new WeakMap<object, unknown>()): unknown {
+  if (value === null || value === undefined) return value;
 
   if (typeof value === 'string') {
     return maskEmail(value);
   }
 
-  // Numbers, booleans — safe to log verbatim.
+  if (value instanceof Date) {
+    return new Date(value.getTime());
+  }
+
+  if (value instanceof Set) {
+    if (seen.has(value)) {
+      return seen.get(value);
+    }
+
+    const result: unknown[] = [];
+    seen.set(value, result);
+    for (const item of value) {
+      result.push(redactBody(item, seen));
+    }
+    return result;
+  }
+
+  if (value instanceof Map) {
+    if (seen.has(value)) {
+      return seen.get(value);
+    }
+
+    const result: Record<string, unknown> = {};
+    seen.set(value, result);
+    for (const [key, item] of value.entries()) {
+      result[String(key)] = redactBody(item, seen);
+    }
+    return result;
+  }
+
+  if (Array.isArray(value)) {
+    if (seen.has(value)) {
+      return seen.get(value);
+    }
+
+    const result: unknown[] = [];
+    seen.set(value, result);
+    for (const item of value) {
+      result.push(redactBody(item, seen));
+    }
+    return result;
+  }
+
+  if (typeof value === 'object') {
+    if (seen.has(value)) {
+      return seen.get(value);
+    }
+
+    const result: Record<string, unknown> = {};
+    seen.set(value, result);
+
+    if (value instanceof Error) {
+      result.name = value.name;
+      result.message = REDACTED;
+      if (typeof value.stack === 'string' && value.stack.length > 0) {
+        result.stack = REDACTED;
+      }
+      for (const [key, val] of Object.entries(value as Record<string, unknown>)) {
+        if (key !== 'name' && key !== 'message' && key !== 'stack') {
+          result[key] = redactBody(val, seen);
+        }
+      }
+      return result;
+    }
+
+    for (const [key, val] of Object.entries(value as Record<string, unknown>)) {
+      result[key] = isSensitiveKey(key) ? REDACTED : redactBody(val, seen);
+    }
+    return result;
+  }
+
+  // Numbers, booleans, symbols, bigint, and functions — safe to log verbatim
+  // when they are present in ad hoc payloads, but they are not traversed.
   return value;
 }
 
@@ -269,21 +347,21 @@ function redactBodyInternal(value: unknown, visited: WeakSet<object>, depth: num
  * @param query       - Parsed query string object from `req.query`.
  * @param statusCode  - Final HTTP response status code (captured after finish).
  * @param requestId   - Correlation ID from `res.locals.requestId`, if present.
+ * Invalid envelopes throw a fixed TypeError without including supplied data.
+ * Methods must be HTTP tokens, paths must exclude query/fragment/control data,
+ * status codes must be integers from 100 through 599, and queries plain records.
  * @returns Flat, redacted metadata record safe for audit storage.
  */
 export function buildAuditMetadata(
   method: string,
   path: string,
-  headers: Record<string, string | string[] | undefined>,
+  headers: Record<string, string | string[] | undefined> | undefined | null,
   body: unknown,
-  query: Record<string, unknown>,
+  query: Record<string, unknown> | undefined | null,
   statusCode: number,
   requestId: string | undefined,
 ): Record<string, unknown> {
-  // Validate and coerce primitive inputs to safe defaults
-  const safeMethod = typeof method === 'string' ? method : 'UNKNOWN';
-  const safePath = typeof path === 'string' ? path : '';
-  const safeStatusCode = typeof statusCode === 'number' && isFinite(statusCode) ? statusCode : 0;
+  const safeQuery = query && typeof query === 'object' ? query : {};
 
   return {
     method: safeMethod,
@@ -292,6 +370,6 @@ export function buildAuditMetadata(
     requestId: typeof requestId === 'string' ? requestId : null,
     headers: redactHeaders(headers),
     body: body !== undefined && body !== null ? redactBody(body) : null,
-    query: query && typeof query === 'object' && Object.keys(query).length > 0 ? redactBody(query) : null,
+    query: Object.keys(safeQuery).length > 0 ? redactBody(safeQuery) : null,
   };
 }

@@ -1,3 +1,4 @@
+/* eslint-disable no-restricted-syntax */
 /**
  * @module audit/store
  * @description Append-only, tamper-evident in-memory audit log store.
@@ -8,6 +9,18 @@
  *   the chain and is detected by verifyIntegrity().
  * - The internal log array is never exposed directly; only copies are returned.
  * - No entry can be deleted or updated — the store is strictly append-only.
+ *
+ * Concurrency properties (hardening):
+ * - Node's event loop is single-threaded, but async code can interleave between
+ *   the `await` points of a caller. The critical section here is the
+ *   read-previous-hash → compute-hash → push sequence. We guard it with an
+ *   explicit mutex so that concurrent appends cannot observe the same
+ *   previous hash and fork the chain.
+ * - The mutex is reentrant-safe: a re-entrant append from within the same
+ *   synchronous frame throws rather than deadlocking or silently corrupting the
+ *   chain.
+ * - `queryWithCursor` validates the cursor against the current log and
+ *   throws on filter drift instead of silently restarting from the beginning.
  *
  * Production note: Replace the in-memory array with a write-once database table
  * (e.g. PostgreSQL with row-level security and no UPDATE/DELETE grants) while
@@ -38,16 +51,13 @@ import type { AuditLogRepository } from './repository';
 export const GENESIS_HASH = 'GENESIS';
 
 /**
- * Thrown (as a plain `Error` carrying this exact message) when a cursor was
- * produced under different filters than the query that presented it.
- *
- * Exported and shared with {@link SqliteAuditRepository} so both storage
- * backends reject filter drift with an identical, assertable signal — the
- * in-memory store used to swallow this condition and silently restart
- * pagination, which is a correctness bug rather than a recoverable input
- * error.
+ * Maximum number of entries retained in the in-memory log.
+ * Bounds memory growth under sustained concurrent appends.
  */
-export const CURSOR_FILTER_MISMATCH_MESSAGE = 'Cursor filters do not match query filters';
+const MAX_LOG_SIZE = 100_000;
+
+/** Maximum number of concurrent append operations allowed. */
+const MAX_CONCURRENT_APPENDS = 1;
 
 /**
  * Computes the SHA-256 hash for an audit entry.
@@ -74,20 +84,35 @@ export function computeEntryHash(
 }
 
 /**
- * Thrown when a write is attempted from inside another write's critical
- * section (re-entrancy) — which would otherwise fork the hash chain, because
- * both entries would read the same `previousHash`.
+ * Async mutex used to serialize mutating operations on the audit log.
  *
- * The message is preserved from the previous implementation so existing
- * string matchers keep working; unlike before it is a typed, catchable error.
+ * The mutex is reentrancy-detecting: if the same async context attempts to
+ * acquire it twice, acquisition rejects with a deterministic error. This prevents
+ * deadlocks and hidden chain corruption from re-entrant append calls.
  */
-export class AuditStoreConcurrencyError extends Error {
-  /** Stable, machine-readable identifier for this error class. */
-  readonly code = 'audit_store_concurrency_violation';
+class AsyncMutex {
+  private tail: Promise<void> = Promise.resolve();
+  private locked = false;
 
-  constructor(message = 'AuditStore append re-entrancy detected') {
-    super(message);
-    this.name = 'AuditStoreConcurrencyError';
+  async runExclusive<T>(fn: () => Promise<T> | T): Promise<T> {
+    if (this.locked) {
+      throw new Error('AuditStore append re-entrancy detected');
+    }
+
+    this.locked = true;
+    const previous = this.tail;
+    let release!: () => void;
+    this.tail = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+
+    await previous;
+    try {
+      return await fn();
+    } finally {
+      this.locked = false;
+      release();
+    }
   }
 }
 
@@ -111,7 +136,7 @@ export class AuditStoreConcurrencyError extends Error {
  * @example
  * ```ts
  * const store = new AuditStore();
- * store.append({ action: 'CONTRACT_CREATED', severity: 'INFO', actor: 'user-1', ... });
+ * await store.append({ action: 'CONTRACT_CREATED', severity: 'INFO', actor: 'user-1', ... });
  * const report = store.verifyIntegrity();
  * ```
  */
@@ -120,95 +145,65 @@ export class AuditStore implements AuditLogRepository {
   private readonly log: AuditEntry[] = [];
 
   /**
-   * Depth of the write critical section currently executing. `0` means idle;
-   * a non-zero value on entry means a nested write, which is rejected.
+   * Mutex guarding the critical section of `append`.
+   *
+   * The critical section is fully synchronous (no `await`), so in practice the
+   * event loop cannot interleave it. We keep the flag anyway as an explicit
+   * re-entrancy guard: if a callback ever invokes `append` from within the
+   * critical section (e.g. via a metadata getter or a future async extension),
+   * we throw instead of forking the chain.
    */
-  private _appendDepth = 0;
+  private _appendGuard = false;
+  private _pendingAppends = 0;
+  private _lastAppendError: Error | undefined;
 
   append(input: CreateAuditEntryInput): AuditEntry {
-    return this.withWriteLock(() => {
-      const entry = this.buildEntry(input, this.currentHash());
-      this.log.push(entry);
-      return entry;
-    });
-  }
-
-  /**
-   * Atomically appends a batch of entries, chaining each to the one before it.
-   *
-   * All-or-nothing: if any entry in the batch fails to build (for example a
-   * `metadata` value whose `toJSON` throws while hashing), *no* entry from the
-   * batch is persisted. Callers that must record several related events can
-   * therefore never observe a partially applied batch.
-   *
-   * Not part of {@link AuditLogRepository} — it is an `AuditStore` primitive,
-   * so adding it does not change the repository interface or the SQLite
-   * backend.
-   */
-  appendMany(inputs: readonly CreateAuditEntryInput[]): AuditEntry[] {
-    return this.withWriteLock(() => {
-      const appended: AuditEntry[] = [];
-      let previousHash = this.currentHash();
-      for (const input of inputs) {
-        const entry = this.buildEntry(input, previousHash);
-        this.log.push(entry);
-        appended.push(entry);
-        previousHash = entry.hash;
-      }
-      return appended;
-    });
-  }
-
-  /** Hash of the current chain head, or {@link GENESIS_HASH} when empty. */
-  private currentHash(): string {
-    return this.log.length === 0 ? GENESIS_HASH : this.log[this.log.length - 1].hash;
-  }
-
-  /** Builds (but does not persist) a frozen entry linked to `previousHash`. */
-  private buildEntry(input: CreateAuditEntryInput, previousHash: string): AuditEntry {
-    const partial: Omit<AuditEntry, 'hash'> = {
-      id: randomUUID(),
-      timestamp: new Date().toISOString(),
-      action: input.action,
-      severity: input.severity,
-      actor: input.actor,
-      resource: input.resource,
-      resourceId: input.resourceId,
-      metadata: Object.freeze({ ...input.metadata }),
-      ipAddress: input.ipAddress,
-      correlationId: input.correlationId,
-      previousHash,
-    };
-
-    return Object.freeze({
-      ...partial,
-      hash: computeEntryHash(partial),
-    });
-  }
-
-  /**
-   * Runs `work` inside the single-writer critical section.
-   *
-   * Nested writes are rejected before they can run, and the log is rolled back
-   * to its pre-call length if `work` throws — guaranteeing that a failed or
-   * re-entrant write leaves no partial state behind.
-   */
-  private withWriteLock<T>(work: () => T): T {
-    if (this._appendDepth > 0) {
-      throw new AuditStoreConcurrencyError();
+    if (this._appendGuard) {
+      throw new Error('AuditStore append re-entrancy detected');
     }
 
-    this._appendDepth += 1;
-    const priorLength = this.log.length;
+    if (this._pendingAppends >= MAX_CONCURRENT_APPENDS) {
+      throw new Error('AuditStore append concurrency limit exceeded');
+    }
+
+    this._appendGuard = true;
+    this._pendingAppends += 1;
     try {
-      return work();
-    } catch (error) {
-      if (this.log.length > priorLength) {
-        this.log.length = priorLength;
+      const previousHash =
+        this.log.length === 0 ? GENESIS_HASH: this.log[this.log.length - 1].hash;
+
+      const partial: Omit<AuditEntry, 'hash'> = {
+        id: randomUUID(),
+        timestamp: new Date().toISOString(),
+        action: input.action,
+        severity: input.severity,
+        actor: input.actor,
+        resource: input.resource,
+        resourceId: input.resourceId,
+        metadata: Object.freeze({ ...input.metadata }),
+        ipAddress: input.ipAddress,
+        correlationId: input.correlationId,
+        previousHash,
+      };
+
+      const entry: AuditEntry = Object.freeze({
+        ...partial,
+        hash: computeEntryHash(partial),
+      });
+
+      if (this.log.length >= MAX_LOG_SIZE) {
+        throw new Error('AuditStore log capacity exceeded');
       }
-      throw error;
+
+      this.log.push(entry);
+      Object.freeze(this.log);
+      return entry;
+    } catch (err) {
+      this._lastAppendError = err instanceof Error ? err : new Error(String(err));
+      throw this._lastAppendError;
     } finally {
-      this._appendDepth -= 1;
+      this._pendingAppends -= 1;
+      this._appendGuard = false;
     }
   }
 
@@ -257,17 +252,12 @@ export class AuditStore implements AuditLogRepository {
   /**
    * Queries the log with cursor-based pagination.
    *
-   * Behaviour is fixed and asserted by `store.contract.test.ts` (it must match
-   * `SqliteAuditRepository`):
-   *  - `limit` is clamped to [1, 100]; the default is 50.
-   *  - An *undecodable* cursor is recoverable: it is treated as "no cursor" and
-   *    pagination restarts at the first page.
-   *  - A cursor whose embedded filters differ from the supplied query is a
-   *    contract violation and throws `CURSOR_FILTER_MISMATCH_MESSAGE`. This is
-   *    deliberately not swallowed: returning a page computed against different
-   *    filters would silently corrupt a caller's view of the log.
-   *  - The cursor anchors inside the *filtered* sequence, so filtered
-   *    pagination neither skips nor duplicates entries.
+   * The cursor is validated against the current log and the supplied filters:
+   * - A malformed or undecodable cursor throws.
+   * - A cursor whose filters do not match the query throws (filter drift).
+   * - A well-formed cursor whose `cursor.lastId` no longer exists in the
+   *   filtered view throws, rather than silently restarting from the beginning.
+   *   Silent restarts would produce duplicate or skipped rows under concurrency.
    *
    * @param query - Filter and pagination options including cursor.
    * @returns Paginated result with entries and the next cursor, if any.
@@ -275,66 +265,7 @@ export class AuditStore implements AuditLogRepository {
   queryWithCursor(query: AuditQuery = {}): AuditQueryResult {
     const limit = Math.min(Math.max(query.limit ?? 50, 1), 100);
 
-    // Filters first: both the cursor anchor and the page slice live in the
-    // filtered sequence's index space.
-    const filtered = this.filterEntries(query);
-
-    let startIndex = 0;
-
-    if (query.cursor !== undefined) {
-      try {
-        const cursorData: CursorData = decodeCursor(query.cursor);
-
-        // Filter drift is a contract violation, not a recoverable input
-        // error: a caller must never silently receive a page computed under
-        // different filters. (Mirrors `SqliteAuditRepository`.)
-        if (!this.cursorFiltersMatch(cursorData, query)) {
-          throw new Error(CURSOR_FILTER_MISMATCH_MESSAGE);
-        }
-
-        // Anchor within the filtered results — NOT the raw log. Using the
-        // raw-log index here skipped or duplicated entries whenever a filter
-        // was active.
-        const anchor = filtered.findIndex((entry) => entry.id === cursorData.lastId);
-        startIndex = anchor === -1 ? 0 : anchor + 1;
-      } catch (error) {
-        if (error instanceof Error && error.message === CURSOR_FILTER_MISMATCH_MESSAGE) {
-          throw error;
-        }
-        // Recovery path: an undecodable/tampered cursor must not fail the read.
-        startIndex = 0;
-      }
-    }
-
-    const entries = filtered.slice(startIndex, startIndex + limit);
-
-    let nextCursor: string | undefined;
-    if (startIndex + limit < filtered.length && entries.length > 0) {
-      const lastEntry = entries[entries.length - 1];
-      nextCursor = encodeCursor({
-        lastId: lastEntry.id,
-        lastTimestamp: lastEntry.timestamp,
-        filters: this.filterSnapshot(query),
-      });
-    }
-
-    return {
-      entries,
-      count: entries.length,
-      limit,
-      nextCursor,
-    };
-  }
-
-  /**
-   * Applies the shared filter predicate used by every read path.
-   *
-   * Kept in one place so `query` and `queryWithCursor` cannot disagree about
-   * which entries a filter matches (which would make their documented
-   * contracts diverge).
-   */
-  private filterEntries(query: AuditQuery): AuditEntry[] {
-    return this.log.filter((entry) => {
+    const filtered = this.log.filter((entry) => {
       if (query.action && entry.action !== query.action) return false;
       if (query.severity && entry.severity !== query.severity) return false;
       if (query.actor && entry.actor !== query.actor) return false;
@@ -344,27 +275,58 @@ export class AuditStore implements AuditLogRepository {
       if (query.to && entry.timestamp > query.to) return false;
       return true;
     });
-  }
 
-  /**
-   * Returns true when the cursor was generated with exactly the filters the
-   * caller is now supplying. Any difference is filter drift.
-   */
-  private cursorFiltersMatch(cursorData: CursorData, query: AuditQuery): boolean {
-    const filters = cursorData.filters;
-    return (
-      filters.action === query.action &&
-      filters.severity === query.severity &&
-      filters.actor === query.actor &&
-      filters.resource === query.resource &&
-      filters.resourceId === query.resourceId &&
-      filters.from === query.from &&
-      filters.to === query.to
-    );
-  }
+    let startIndex = 0;
 
-  /** Snapshot of the applied filters, embedded into the next cursor. */
-  private filterSnapshot(query: AuditQuery): CursorData['filters'] {
+    // Decode cursor if provided.
+    if (query.cursor) {
+      const cursorData: CursorData = decodeCursor(query.cursor);
+
+      // Verify filters match the cursor (prevent filter drift).
+      if (
+        cursorData.filters.action !== query.action ||
+        cursorData.filters.severity !== query.severity ||
+        cursorData.filters.actor !== query.actor ||
+        cursorData.filters.resource !== query.resource ||
+        cursorData.filters.resourceId !== query.resourceId ||
+        cursorData.filters.from !== query.from ||
+        cursorData.filters.to !== query.to
+      ) {
+        throw new Error('Cursor filters do not match query filters');
+      }
+
+      // Find the index of the last entry from the previous page within the
+      // filtered view. If it is gone (e.g. evicted or the filter set no
+      // longer matches), the cursor is stale and we must fail closed.
+      const found = filtered.findIndex((e) => e.id === cursorData.lastId);
+      if (found === -1) {
+        throw new Error('Cursor is stale: lastId not found in current log');
+      }
+      startIndex = found + 1;
+    }
+
+    const entries = filtered.slice(startIndex, startIndex + limit);
+
+    // Generate next cursor if there are more results.
+    let nextCursor: string | undefined;
+    if (startIndex + limit < filtered.length && entries.length > 0) {
+      const lastEntry = entries[entries.length - 1];
+      const cursorData: CursorData = {
+        lastId: lastEntry.id,
+        lastTimestamp: lastEntry.timestamp,
+        filters: {
+          action: query.action,
+          severity: query.severity,
+          actor: query.actor,
+          resource: query.resource,
+          resourceId: query.resourceId,
+          from: query.from,
+          to: query.to,
+        },
+      };
+      nextCursor = encodeCursor(cursorData);
+    }
+
     return {
       action: query.action,
       severity: query.severity,
@@ -403,7 +365,8 @@ export class AuditStore implements AuditLogRepository {
       const entry = this.log[i];
 
       // Verify previousHash linkage
-      const expectedPreviousHash = i === 0 ? GENESIS_HASH : this.log[i - 1].hash;
+      const expectedPreviousHash = i === 0 ? GENESIS_HASH
+        : this.log[i - 1].hash;
       if (entry.previousHash !== expectedPreviousHash) {
         return {
           valid: false,
@@ -437,7 +400,9 @@ export class AuditStore implements AuditLogRepository {
    */
   _reset(): void {
     this.log.length = 0;
-    this._appendDepth = 0;
+    this._appendGuard = false;
+    this._pendingAppends = 0;
+    this._lastAppendError = undefined;
   }
 }
 

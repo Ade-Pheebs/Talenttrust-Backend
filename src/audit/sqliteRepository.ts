@@ -1,9 +1,113 @@
+/**
+ * @module audit/sqliteRepository
+ * @description Durable, tamper-evident SQLite audit repository.
+ *
+ * ## Failure-recovery invariants
+ *
+ * Recovery in this module is **deterministic**: for a given failure the exact
+ * same bounded sequence of actions is taken on every run — there is no random
+ * jitter, no unbounded retry loop, and no dependence on wall-clock ordering.
+ *
+ * 1. **Atomic writes.** The previous-hash read and the `INSERT` run inside a
+ *    single `better-sqlite3` transaction. Any thrown error rolls the whole
+ *    transaction back, so a failure never leaves a partial row or a
+ *    half-linked hash chain.
+ * 2. **Bounded retry for transient conflicts.** Only *serialization* failures
+ *    (`SQLITE_BUSY` / `SQLITE_LOCKED`) are retried, capped at
+ *    {@link MAX_WRITE_ATTEMPTS} with a fixed backoff. The transaction re-reads
+ *    the chain tail on every attempt, so a retry can never fork or
+ *    double-append the chain.
+ * 3. **Schema self-repair.** A write failing because the schema is missing
+ *    (`no such table` / `no such column`, e.g. after a partial migration or an
+ *    out-of-band `DROP`) triggers exactly one idempotent `initSchema()` repair
+ *    and one retry. If the repair itself fails, the original error propagates.
+ * 4. **Non-retryable errors surface.** Constraint violations, disk-full,
+ *    malformed input and any other deterministic error are thrown immediately;
+ *    the retry loop never masks a real bug.
+ * 5. **Observable, never sensitive.** Each recovery attempt is logged with the
+ *    operation name, attempt number and error code only. Entry payloads and
+ *    metadata are never logged.
+ * 6. **Integrity checks never throw.** `verifyIntegrity()` converts an
+ *    unparseable row into a deterministic `{ valid: false }` report instead of
+ *    crashing the monitoring job that depends on it.
+ */
+
 import { randomUUID } from 'crypto';
 import Database from "../db/betterSqlite3";
 import { computeEntryHash, GENESIS_HASH, CURSOR_FILTER_MISMATCH_MESSAGE } from './store';
 import type { AuditEntry, AuditQuery, CreateAuditEntryInput, IntegrityReport, AuditQueryResult, CursorData } from './types';
 import { encodeCursor, decodeCursor } from './types';
 import type { AuditLogRepository } from './repository';
+import { createLogger } from '../logger';
+
+const log = createLogger({ service: 'sqlite-audit-repository' });
+
+/**
+ * Maximum number of write attempts (the first attempt plus retries) for a
+ * single logical write. Bounded so a persistent conflict can never spin
+ * forever; after this many attempts the last error is rethrown.
+ */
+export const MAX_WRITE_ATTEMPTS = 3;
+
+/** Fixed base backoff between retries (ms). Deterministic — no jitter. */
+const RETRY_BACKOFF_MS = 10;
+
+/** SQLite extended result codes that represent a transient serialization conflict. */
+const SERIALIZATION_CODES = new Set<number>([5, 6, 262, 517]); // BUSY, LOCKED, LOCKED_SHAREDCACHE, BUSY_SNAPSHOT
+const SERIALIZATION_MESSAGE_PATTERN =
+  /SQLITE_BUSY|SQLITE_LOCKED|database is locked|database table is locked/i;
+
+/** Error text emitted by SQLite when a referenced schema object is absent. */
+const MISSING_SCHEMA_PATTERN = /no such (table|column|index)/i;
+
+/**
+ * Returns true only for transient serialization conflicts (lock contention)
+ * that are safe to retry. Numeric extended codes and string messages are both
+ * checked so the predicate works with every `better-sqlite3` error shape.
+ *
+ * Exported so the retry policy can be unit-tested independently of a live DB.
+ */
+export function isSerializationError(error: unknown): boolean {
+  if (typeof error !== 'object' || error === null) {
+    return false;
+  }
+  const { code, rawCode, message } = error as {
+    code?: unknown;
+    rawCode?: unknown;
+    message?: unknown;
+  };
+  if (typeof code === 'number' && SERIALIZATION_CODES.has(code)) return true;
+  if (typeof rawCode === 'number' && SERIALIZATION_CODES.has(rawCode)) return true;
+  return typeof message === 'string' && SERIALIZATION_MESSAGE_PATTERN.test(message);
+}
+
+/**
+ * Returns true when the failure is caused by a missing schema object (table,
+ * column or index) — the one class of failure this repository can repair
+ * in-process by re-running its idempotent `initSchema()` bootstrap.
+ *
+ * Exported so the repair trigger can be unit-tested independently of a live DB.
+ */
+export function isMissingSchemaError(error: unknown): boolean {
+  return (
+    typeof error === 'object' &&
+    error !== null &&
+    typeof (error as { message?: unknown }).message === 'string' &&
+    MISSING_SCHEMA_PATTERN.test((error as { message: string }).message)
+  );
+}
+
+/**
+ * Synchronous backoff. `better-sqlite3` is synchronous, and this only runs
+ * after a bounded, already-waited busy conflict, so blocking is deliberately
+ * kept tiny ({@link RETRY_BACKOFF_MS} per attempt).
+ */
+function sleepSync(ms: number): void {
+  const deadline = Date.now() + ms;
+  while (Date.now() < deadline) {
+    // Busy-wait: only reached on a bounded retry path.
+  }
+}
 
 interface AuditRow {
   id: string;
@@ -141,6 +245,7 @@ export class SqliteAuditRepository implements AuditLogRepository {
 
   constructor(private readonly db: ReturnType<typeof Database>) {
     this.initSchema();
+    this.applyConnectionPragmas();
   }
 
   /**
@@ -251,11 +356,10 @@ export class SqliteAuditRepository implements AuditLogRepository {
       return entry;
     });
 
-    // Acquire SQLite's writer lock before reading the chain tip. With a
-    // deferred transaction, competing writers can read the same snapshot and
-    // then fail while upgrading to a write lock instead of serializing cleanly.
-    const immediate = (insert as typeof insert & { immediate?: (payload: CreateAuditEntryInput) => AuditEntry }).immediate;
-    return typeof immediate === 'function' ? immediate(input) : insert(input);
+    const immediate = (insert as typeof insert & {
+      immediate?: (payload: CreateAuditEntryInput) => AuditEntry;
+    }).immediate;
+    return immediate ? immediate(input) : insert(input);
   }
 
   getById(id: string): AuditEntry | undefined {
@@ -430,7 +534,18 @@ export class SqliteAuditRepository implements AuditLogRepository {
 
     let previousHash = GENESIS_HASH;
     for (let index = 0; index < rows.length; index += 1) {
-      const entry = toAuditEntry(rows[index]);
+      let entry: AuditEntry;
+      try {
+        entry = toAuditEntry(rows[index]);
+      } catch {
+        return {
+          valid: false,
+          totalEntries: rows.length,
+          firstCorruptedIndex: index,
+          firstCorruptedId: rows[index].id,
+          checkedAt,
+        };
+      }
 
       // --- Invariant 3: duplicate hash ---
       if (seenHashes.has(entry.hash)) {
@@ -472,6 +587,92 @@ export class SqliteAuditRepository implements AuditLogRepository {
     }
 
     return { valid: true, totalEntries: rows.length, checkedAt };
+  }
+
+  /**
+   * Executes a write with deterministic, bounded failure recovery.
+   *
+   * Recovery order is fixed:
+   *   1. missing schema → one `initSchema()` repair, then retry;
+   *   2. serialization conflict → fixed backoff, then retry;
+   *   3. anything else → rethrow immediately (never masked by a retry).
+   *
+   * After {@link MAX_WRITE_ATTEMPTS} attempts the last error is rethrown.
+   *
+   * @param operationName - Short, non-sensitive label used in recovery logs.
+   * @param operation - The transactional write to execute.
+   */
+  private runWriteWithRecovery<T>(operationName: string, operation: () => T): T {
+    const autoRepair = this.options.autoRepairSchema ?? true;
+    let schemaRepairAttempted = false;
+    let lastError: unknown;
+
+    for (let attempt = 1; attempt <= MAX_WRITE_ATTEMPTS; attempt += 1) {
+      try {
+        return operation();
+      } catch (error) {
+        lastError = error;
+
+        if (autoRepair && !schemaRepairAttempted && isMissingSchemaError(error)) {
+          schemaRepairAttempted = true;
+          log.warn('Audit SQLite schema missing; attempting deterministic repair', {
+            operation: operationName,
+            attempt,
+            maxAttempts: MAX_WRITE_ATTEMPTS,
+          });
+          try {
+            this.initSchema();
+          } catch (repairError) {
+            // Repair failed: surface the original failure rather than the
+            // repair error so the caller sees the root cause.
+            log.error('Audit SQLite schema repair failed; rethrowing original error', {
+              operation: operationName,
+              err: repairError,
+            });
+            throw error;
+          }
+          log.info('Audit SQLite schema repaired; retrying write', {
+            operation: operationName,
+            attempt,
+          });
+          continue;
+        }
+
+        if (isSerializationError(error) && attempt < MAX_WRITE_ATTEMPTS) {
+          log.warn('Audit SQLite write serialization conflict; retrying', {
+            operation: operationName,
+            attempt,
+            maxAttempts: MAX_WRITE_ATTEMPTS,
+          });
+          sleepSync(RETRY_BACKOFF_MS * attempt);
+          continue;
+        }
+
+        throw error;
+      }
+    }
+
+    throw lastError;
+  }
+
+  /**
+   * Applies deterministic locking/safety pragmas to the connection.
+   *
+   * These make lock contention recoverable rather than immediately fatal:
+   * `busy_timeout` lets SQLite wait instead of throwing `SQLITE_BUSY`,
+   * `WAL` lets readers and the single writer proceed concurrently, and
+   * `synchronous = NORMAL` is the safe pairing for WAL. Failures here are
+   * non-fatal (a read-only or in-memory connection may reject a pragma) and are
+   * logged at warn level.
+   */
+  private applyConnectionPragmas(): void {
+    try {
+      this.db.pragma('busy_timeout = 5000');
+      this.db.pragma('journal_mode = WAL');
+      this.db.pragma('synchronous = NORMAL');
+    } catch (error) {
+      log.warn('Could not apply audit SQLite connection pragmas', { err: error });
+    }
   }
 
   private initSchema(): void {

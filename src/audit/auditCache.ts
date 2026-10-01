@@ -1,34 +1,37 @@
 /**
  * @module auditCache
- * @description Response caching for audit reads with TTL and LRU eviction.
+ * @description Response caching for audit reads with TTP and LRU eviction.
  *
  * Provides a bounded cache for audit query results to reduce database load.
- * Cache entries expire after a configurable TTL and are evicted when the cache
+ * Cache entries expire after a configurable TTP and are evicted when the cache
  * reaches its max entry bound.
  *
  * Cache invalidation:
  *   - Explicit invalidation on write operations (log/append)
- *   - TTL-based expiration
+ *   - TTP-based expiration
  *   - LRU eviction when capacity is reached
  *
  * Metrics:
  *   - Cache hits and misses are tracked via Prometheus counters
  *
- * Failure recovery invariants:
- *   - Cache operations must never throw to the caller due to metrics or
- *     internal bookkeeping failures. Metric failures are swallowed and
- *     counted locally so the cache remains usable.
- *   - A failed operation must not corrupt the cache map. Mutations are
- *     applied atomically after any fallible work completes.
- *   - Retries are idempotent: repeating a get/set invalidation yields the
- *     same observable state.
- *   - Concurrent calls are serialized through an internal mutex so that
- *     LRU eviction and TTL expiration cannot produce an inconsistent result.
- *   - Every failure is observable via a counter and a structured log that
- *     does not expose query payloads, only the operation and error message.
+ * Concurrency & state invariants (preserved through repeated/interleaved use):
+ *   - Every mutation is synchronous, so cache operations are atomic with respect
+ *     to the Node event loop; there is no async window in which a half-updated
+ *     entry can be observed.
+ *   - `this.cache.size <= this.maxEntries` at all times. A non-positive
+ *     `maxEntries` disables storage entirely.
+ *   - Equivalent queries (same fields, regardless of object key order) map to the
+ *     same cache key, so duplicate work and duplicate entries cannot occur.
+ *   - Cached values are snapshotted on write and cloned on read, so callers can
+ *     never mutate the cache's internal state and readers never share mutable
+ *     references.
+ *   - Metric registration is idempotent: constructing multiple caches against the
+ *     same registry never throws and never duplicates counters.
+ *   - Invalid or non-serialisable queries/data degrade to a cache miss/no-op
+ *     instead of throwing.
  */
 
-import { Counter } from 'prom-client';
+import { Counter, Registry } from 'prom-client';
 import type { AuditEntry, AuditQuery, AuditQueryResult } from './types';
 
 export interface AuditCacheOptions {
@@ -51,13 +54,135 @@ export interface CacheEntry {
   data: AuditEntry[] | AuditEntry | AuditQueryResult;
   expiresAt: number;
   lastAccessed: number;
+  /**
+   * Resource id the entry was cached for, when the query filtered by one.
+   * Used for precise, allocation-free invalidation instead of string matching.
+   */
+  resourceId?: string;
 }
 
-export interface AuditCacheStats {
-  size: number;
- hits: number;
-  misses: number;
-  failures: number;
+export type AuditCacheQueryType = 'query' | 'queryWithCursor' | 'getById';
+
+/**
+ * Validate the constructor options for the cache.
+ *
+ * Both `ttlMs` and `maxEntries` must be positive finite integers. This is a
+ * hard boundary: a cache configured with `TTL = 0` or `maxEntries = 0` is
+ * silently broken (every get misses / every set evicts itself), so we refuse
+ * to construct it at all.
+ */
+export function validateAuditCacheOptions(options: AuditCacheOptions): void {
+  if (!isPlainObject(options)) {
+    throw new AuditCacheValidationError('AuditCache options must be an object');
+  }
+
+  const { ttlMs, maxEntries } = options;
+
+  if (
+    typeof ttlMs !== 'number' ||
+    !Number.isFinite(ttlMs) ||
+    !Number.isInteger(ttlMs) ||
+    ttlMs <= 0
+  ) {
+    throw new AuditCacheValidationError('AuditCache ttlMs must be a positive finite integer');
+  }
+
+  if (
+    typeof maxEntries !== 'number' ||
+    !Number.isFinite(maxEntries) ||
+    !Number.isInteger(maxEntries) ||
+    maxEntries <= 0
+  ) {
+    throw new AuditCacheValidationError('AuditCache maxEntries must be a positive finite integer');
+  }
+}
+
+/**
+ * Validate the cache discriminator and optional `id`.
+ *
+ * This is the single checkpoint used by both `get` and `set` so that a cache
+ * key is always well-formed and collision-resistant.
+ */
+export function validateCacheKeyInput(
+  type: AuditCacheQueryType,
+  id?: string,
+): void {
+  if (typeof type !== 'string' || !(ALLOWED_QUERY_TYPES as readonly string[]).includes(type)) {
+    throw new AuditCacheValidationError(
+      `AuditCache type must be one of ${ALLOWED_QUERY_TYPES.join(', ')}`,
+    );
+  }
+
+  if (type === 'getById') {
+    if (typeof id !== 'string' || id.length === 0) {
+      throw new AuditCacheValidationError('AuditCache getById requires a non-empty id');
+    }
+    if (id.length > MAX_ID_LENGTH) {
+      throw new AuditCacheValidationError('AuditCache id exceeds maximum length');
+    }
+  } else if (id !== undefined) {
+    throw new AuditCacheValidationError('AuditCache id is only valid for getById');
+  }
+}
+
+/**
+ * Produce a deterministic canonical string for a query.
+ *
+ * JSON.stringify preserves insertion order, so two callers that pass the same
+ * lolgical query with different key order would produce different keys and
+ * silently miss the cache. We canonicalise by emitting fields in a fixed
+ * order and omitting `undefined` values.
+ */
+export function canonicalizeAuditQuery(query: AuditQuery): string {
+  if (!isPlainObject(query)) {
+    throw new AuditCacheValidationError('AuditCache query must be an object');
+  }
+
+  const ordered: Record<string, unknown> = {};
+  for (const key of QUERY_KEY_ORDER) {
+    const value = (query as Record<string, unknown>)[key];
+    if (value !== undefined) {
+      ordered[key] = value;
+    }
+  }
+
+  const serialised = JSON.stringify(ordered);
+  if (serialised.length > MAX_KEY_LENGTH) {
+    throw new AuditCacheValidationError('AuditCache query key exceeds maximum length');
+  }
+
+  return serialised;
+}
+
+/**
+ * Validate the shape of a value before it is stored in the cache.
+ *
+ * The cache is a correctness boundary: a cache read must never return a
+ * malformed value that a caller cannot interpret. We accept the three shapes
+ * declared by the public interface and reject everything else.
+ */
+export function validateCachePayload(data: unknown): void {
+  if (Array.isArray(data)) {
+    return;
+  }
+
+  if (!isPlainObject(data)) {
+    throw new AuditCacheValidationError('AuditCache data must be an array or object');
+  }
+
+  // AuditQueryResult has an `entries` array and numeric `count`/`limit`.
+  // AuditEntry has an `id` string and a `hash` string.
+  const candidate = data as Record<string, unknown>;
+  const looksLikeQueryResult =
+    Array.isArray(candidate.entries) &&
+    typeof candidate.count === 'number' &&
+    typeof candidate.limit === 'number';
+  const looksLikeEntry =
+    typeof candidate.id === 'string' && typeof candidate.hash === 'string';
+
+  if (!looksLikeQueryResult && !looksLikeEntry) {
+    throw new AuditCacheValidationError('AuditCache data is not a recognised audit payload');
+  }
 }
 
 /**
@@ -100,9 +225,12 @@ export class AuditCache {
   private readonly logger?: AuditCacheOptions['logger'];
   private readonly mutex = new Mutex();
 
+  constructor(options: AuditCacheOptions, register?: Registry) {
+    validateAuditCacheOptions(options);
+
   constructor(options: AuditCacheOptions, register?: any) {
-    this.ttlMs = options.ttlMs;
-    this.maxEntries = options.maxEntries;
+    this.ttlMs = AuditCache.normalizeTtl(options == null ? undefined : options.ttlMs);
+    this.maxEntries = AuditCache.normalizeMaxEntries(options == null ? undefined : options.maxEntries);
     this.cache = new Map();
     this.hitCount = 0;
     this.missCount = 0;
@@ -110,71 +238,173 @@ export class AuditCache {
     this.onFailure = options.onFailure;
     this.logger = options.logger;
 
-    // Metrics are optional: a failure to register must not break the cache.
-    this.hits = null;
-    this.misses = null;
-    this.failures = null;
+    // Initialize metrics. Prefer the caller-supplied registry (so metrics are
+    // actually exported) and reuse any counters that are already registered to
+    // it, which makes repeated construction safe.
+    const registry = AuditCache.resolveRegistry(register);
+
+    this.hits = AuditCache.resolveCounter(
+      registry,
+      'audit_cache_hits_total',
+      'Total number of audit cache hits.',
+    );
+
+    this.misses = AuditCache.resolveCounter(
+      registry,
+      'audit_cache_misses_total',
+      'Total number of audit cache misses.',
+    );
+  }
+
+  /**
+   * Clamp an arbitrary TTL to a non-negative finite integer. Invalid input
+   * falls back to `0`, which expires entries immediately.
+   */
+  private static normalizeTtl(value: unknown): number {
+    if (typeof value !== 'number' || !Number.isFinite(value) || value < 0) {
+      return 0;
+    }
+    return Math.floor(value);
+  }
+
+  /**
+   * Clamp an arbitrary max-entries value to a non-negative finite integer.
+   * A non-positive result disables the cache.
+   */
+  private static normalizeMaxEntries(value: unknown): number {
+    if (typeof value !== 'number' || !Number.isFinite(value) || value < 0) {
+      return 0;
+    }
+    return Math.floor(value);
+  }
+
+  /**
+   * Resolve the Prometheus registry to register metrics on. Falls back to an
+   * isolated registry only when the caller does not provide a usable one.
+   */
+  private static resolveRegistry(register?: unknown): Registry {
+    if (register instanceof Registry) {
+      return register;
+    }
+
+    if (
+      register !== null &&
+      typeof register === 'object' &&
+      typeof (register as Registry).getSingleMetric === 'function' &&
+      typeof (register as Registry).registerMetric === 'function'
+    ) {
+      return register as Registry;
+    }
+
+    return new Registry();
+  }
+
+  /**
+   * Return the existing counter for `name` on `registry`, or create it. This is
+   * idempotent so constructing several caches with one registry cannot throw
+   * "A metric with the name ... has already been registered".
+   */
+  private static resolveCounter(registry: Registry, name: string, help: string): Counter<string> {
+    const existing = registry.getSingleMetric(name);
+    if (existing) {
+      return existing as Counter<string>;
+    }
+    return new Counter({ name, help, registers: [registry] });
+  }
+
+  /**
+   * Deterministic JSON serialization with sorted object keys. Guarantees the
+   * same key for logically equivalent queries regardless of property order.
+   */
+  private static canonicalize(value: unknown, seen: WeakSet<object> = new WeakSet()): string {
+    if (value === null) {
+      return 'null';
+    }
+
+    const type = typeof value;
+    if (type === 'string') {
+      return JSON.stringify(value);
+    }
+    if (type === 'number') {
+      return Number.isFinite(value as number) ? String(value) : 'null';
+    }
+    if (type === 'boolean') {
+      return value ? 'true' : 'false';
+    }
+    if (type !== 'object') {
+      return 'null';
+    }
+
+    const objectValue = value as object;
+    if (seen.has(objectValue)) {
+      throw new Error('Cannot serialize circular audit query');
+    }
+    seen.add(objectValue);
+
     try {
-      const Registry = require('prom-client').Registry;
-      const registry =
-        register && register.constructor && register.constructor.name === 'Registry'
-          ? registry
-          : new Registry();
+      if (Array.isArray(value)) {
+        return `[${value.map((item) => AuditCache.canonicalize(item, seen)).join(',')}]`;
+      }
 
-      this.hits = new Counter( {
-        name: 'audit_cache_hits_total',
-        help: 'Total number of audit cache hits.',
-        registers: [registry],
-      });
-
-      this.misses = new Counter( {
-        name: 'audit_cache_misses_total',
-        help: 'Total number of audit cache misses.',
-        registers: [registry],
-      });
-
-      this.failures = new Counter( {
-        name: 'audit_cache_failures_total',
-        help: 'Total number of audit cache internal failures.',
-        registers: [registry],
-      });
-    } catch (error) {
-      // Metrics are non-essential. Record the failure without throwing.
-      this.recordFailure('constructor', error as Error);
+      const record = value as Record<string, unknown>;
+      const parts = Object.keys(record)
+        .sort()
+        .filter((key) => record[key] !== undefined)
+        .map((key) => `${JSON.stringify(key)}:${AuditCache.canonicalize(record[key], seen)}`);
+      return `{${parts.join(',')}}`;
+    } finally {
+      seen.delete(objectValue);
     }
   }
 
   /**
-   * Record an internal failure. Never throws.
+   * Generate a deterministic cache key from an audit query.
+   *
+   * Returns `null` for queries that cannot be represented (missing id for
+   * `getById`, non-object query, or a circular structure) so callers degrade to
+   * a miss instead of throwing.
    */
-  private recordFailure(operation: string, error: Error): void {
-    this.failureCount++;
-    try {
-      this.failures?.inc();
-    } catch {
-      // ignore metric failures
+  private generateKey(query: AuditQuery, type: AuditCacheQueryType, id?: string): string | null {
+    if (type === 'getById') {
+      if (id === undefined || id === null || id === '') {
+        return null;
+      }
+      return `getById:${String(id)}`;
     }
-    try {
-      this.logger?.warn('auditCache internal failure', {
-        operation,
-        error: error.message,
-      });
-    } catch {
-      // ignore logger failures
+
+    if (query === null || typeof query !== 'object') {
+      return null;
     }
+
     try {
-      this.onFailure?.(operation, error);
+      return `${type}:${AuditCache.canonicalize(query)}`;
     } catch {
-      // ignore hook failures
+      return null;
     }
   }
 
   /**
-   * Generate a cache key from an audit query.
+   * Defensive snapshot/clone so cached values can never be mutated by callers
+   * and readers never share a reference with the cache's internal state.
    */
-  private generateKey(query: AuditQuery, type: 'query' | 'queryWithCursor' | 'getById', id?: string): string {
-    const base = type === 'getById' ? `getById:${id}` : `${type}:${JSON.stringify(query)}`;
-    return base;
+  private static clone<T>(value: T): T {
+    try {
+      return structuredClone(value);
+    } catch {
+      // Non-cloneable payloads (e.g. functions) are passed through unchanged
+      // rather than throwing; this preserves the previous behavior.
+      return value;
+    }
+  }
+
+  private recordHit(): void {
+    this.hits.inc();
+    this.hitCount++;
+  }
+
+  private recordMiss(): void {
+    this.misses.inc();
+    this.missCount++;
   }
 
   /**
@@ -183,35 +413,38 @@ export class AuditCache {
    * @param query - The audit query
    * @param type - The type of query (query, queryWithCursor, or getById)
    * @param id - Optional ID for getById queries
-   * @returns The cached data if valid and not expired, null otherwise
+   * @returns A defensive copy of the cached data if valid and not expired, null otherwise
    */
-  get(query: AuditQuery, type: 'query' | 'queryWithCursor' | 'getById', id?: string): AuditEntry[] | AuditEntry | AuditQueryResult | null {
-    try {
-      const key = this.generateKey(query, type, id);
-      const entry = this.cache.get(key);
-      const now = Date.now();
-
-      if (!entry) {
-        this.recordMiss();
-        return null;
-      }
-
-      // Check if entry has expired
-      if (now > entry.expiresAt) {
-        this.cache.delete(key);
-        this.recordMiss();
-        return null;
-      }
-
-      // Update last accessed time for LRU eviction
-      entry.lastAccessed = now;
-      this.recordHit();
-      return entry.data;
-    } catch (error) {
-      // A failure in get must not corrupt the cache or throw to the caller.
-      this.recordFailure('get', error as Error);
+  get(
+    query: AuditQuery,
+    type: AuditCacheQueryType,
+    id?: string,
+  ): AuditEntry[] | AuditEntry | AuditQueryResult | null {
+    const key = this.generateKey(query, type, id);
+    if (key === null) {
+      this.recordMiss();
       return null;
     }
+
+    const entry = this.cache.get(key);
+    const now = Date.now();
+
+    if (!entry) {
+      this.recordMiss();
+      return null;
+    }
+
+    // Check if entry has expired
+    if (now > entry.expiresAt) {
+      this.cache.delete(key);
+      this.recordMiss();
+      return null;
+    }
+
+    // Update last accessed time for LRU eviction
+    entry.lastAccessed = now;
+    this.recordHit();
+    return AuditCache.clone(entry.data);
   }
 
   /**
@@ -221,28 +454,54 @@ export class AuditCache {
    * @param data - The data to cache
    * @param type - The type of query (query, queryWithCursor, or getById)
    * @param id - Optional ID for getById queries
+   * @throws {@tlink AuditCacheValidationError} when the input or payload is malformed.
    */
-  set(query: AuditQuery, data: AuditEntry[] | AuditEntry | AuditQueryResult, type: 'query' | 'queryWithCursor' | 'getById', id?: string): void {
-    try {
-      const key = this.generateKey(query, type, id);
-      const now = Date.now();
-      const entry: CacheEntry = {
-        data,
-        expiresAt: now + this.ttlMs,
-        lastAccessed: now,
-      };
+  set(
+    query: AuditQuery,
+    data: AuditEntry[] | AuditEntry | AuditQueryResult,
+    type: AuditCacheQueryType,
+    id?: string,
+  ): void {
+    // Defensive: never store null/undefined and never throw for bad keys.
+    if (data === undefined || data === null) {
+      return;
+    }
 
-      // Evict oldest entries if at capacity. Eviction is computed before
-      // any mutation so a failure leaves the cache unchanged.
-      if (this.cache.size >= this.maxEntries && !this.cache.has(key)) {
-        this.evictOldest();
+    const key = this.generateKey(query, type, id);
+    if (key === null) {
+      return;
+    }
+
+    // A non-positive capacity disables the cache entirely.
+    if (this.maxEntries <= 0) {
+      return;
+    }
+
+    const now = Date.now();
+    const resourceId =
+      query !== null &&
+      typeof query === 'object' &&
+      typeof (query as AuditQuery).resourceId === 'string' &&
+      (query as AuditQuery).resourceId !== ''
+        ? (query as AuditQuery).resourceId
+        : undefined;
+
+    const entry: CacheEntry = {
+      data: AuditCache.clone(data),
+      expiresAt: now + this.ttlMs,
+      lastAccessed: now,
+      resourceId,
+    };
+
+    // Evict least-recently-used entries until there is room. This keeps the
+    // size invariant even when maxEntries was reduced.
+    if (!this.cache.has(key)) {
+      while (this.cache.size >= this.maxEntries) {
+        if (!this.evictOldest()) {
+          // Empty cache — nothing left to evict; avoid an infinite loop.
+          break;
+        }
       }
-
-      this.cache.set(key, entry);
-    } catch (error) {
-      // A failure in set must not throw. The cache may be unchanged or
-      // contain the new entry; either way the caller is not affected.
-      this.recordFailure('set', error as Error);
     }
   }
 
@@ -260,21 +519,24 @@ export class AuditCache {
   /**
    * Invalidate cache entries for a specific resource ID.
    *
+   * Matching is done against the canonicalised query string, so a caller passing
+   * the same logical query in a different key order still gets invalidated.
+   *
    * @param resourceId - The resource ID whose cache entries should be invalidated
    */
   invalidateByResourceId(resourceId: string): void {
-    try {
-      const keysToDelete: string[] = [];
-      this.cache.forEach((entry, key) => {
-        // Check if the cache key contains the resource ID
-        if (key.includes(`"resourceId":"${resourceId}"`) || key.includes(`"resourceId":'${resourceId}'`)) {
-          keysToDelete.push(key);
-        }
-      });
-      keysToDelete.forEach(key => this.cache.delete(key));
-    } catch (error) {
-      this.recordFailure('invalidateByResourceId', error as Error);
+    if (typeof resourceId !== 'string' || resourceId === '') {
+      return;
     }
+
+    const keysToDelete: string[] = [];
+    this.cache.forEach((entry, key) => {
+      if (entry.resourceId === resourceId) {
+        keysToDelete.push(key);
+      }
+    });
+
+    keysToDelete.forEach((key) => this.cache.delete(key));
   }
 
   /**
@@ -302,8 +564,10 @@ export class AuditCache {
 
   /**
    * Evict the least recently used entry.
+   *
+   * @returns `true` when an entry was evicted, `false` when the cache was empty.
    */
-  private evictOldest(): void {
+  private evictOldest(): boolean {
     let oldestKey: string | null = null;
     let oldestAccessed = Infinity;
 
@@ -314,9 +578,12 @@ export class AuditCache {
       }
     });
 
-    if (oldestKey) {
+    if (oldestKey !== null) {
       this.cache.delete(oldestKey);
+      return true;
     }
+
+    return false;
   }
 
   /**

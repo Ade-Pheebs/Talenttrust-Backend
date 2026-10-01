@@ -110,6 +110,18 @@ export const DEFAULT_RETRY_POLICIES: Record<JobType, RetryPolicy> = {
     removeOnComplete: 100,
     removeOnFail: 100,
   },
+
+  [JobType.RAW_EVENT_RETENTION]: {
+    attempts: 3,
+    backoff: {
+      type: 'exponential',
+      delay: 2000,
+      multiplier: 2,
+      jitter: 0.2,
+    },
+    removeOnComplete: 100,
+    removeOnFail: 100,
+  },
 };
 
 /**

@@ -9,14 +9,14 @@
  *
  * Security notes:
  * - Callers MUST sanitise metadata before passing it in — no raw PII.
- * - Logging failures are caught and reported via console.error to avoid
- *   disrupting the primary request flow, but they are also re-thrown in
- *   strict mode so tests can assert on them.
+ * - Persistence failures always propagate; appends are never retried implicitly.
+ * - Cache failures disable caching without changing a committed write's outcome.
+ * - Diagnostics contain fixed operation names, never payloads or dependency errors.
  */
 
 import type { AuditEntry, AuditQuery, AuditSeverity, CreateAuditEntryInput, IntegrityReport, AuditQueryResult } from './types';
 import type { AuditAction } from './types';
-import { decodeCursor, AUDIT_ACTIONS } from './types';
+import { decodeCursor } from './types';
 import { createDefaultAuditRepository, type AuditLogRepository } from './repository';
 import { auditExportService, AuditExportService, type AuditExportFilters, type AuditExportResult } from './exportService';
 import { AuditCache, type AuditCacheOptions } from './auditCache';
@@ -26,14 +26,7 @@ export interface AuditServiceOptions {
   cache?: AuditCacheOptions;
 }
 
-/**
- * The set of actions the legacy string-based query parser accepts.
- *
- * Derived from {@link AUDIT_ACTIONS} (the audit module's single source of
- * truth) so it can never drift from the type system, the HTTP schema
- * validators, or the non-HTTP input validator.
- */
-export const VALID_ACTIONS = new Set<AuditAction>(AUDIT_ACTIONS);
+export const VALID_ACTIONS = new Set<AuditAction>(['CONTRACT_CREATED', 'CONTRACT_UPDATED', 'CONTRACT_CANCELLED', 'CONTRACT_COMPLETED', 'PAYMENT_INITIATED', 'PAYMENT_RELEASED', 'PAYMENT_DISPUTED', 'REPUTATION_UPDATED', 'REPUTATION_CORRECTED', 'USER_CREATED', 'USER_UPDATED', 'USER_DELETED', 'AUTH_LOGIN', 'AUTH_LOGOUT', 'AUTH_FAILED', 'AUTH_LOCKOUT_TRIGGERED', 'AUTH_LOCKOUT_RELEASED', 'ADMIN_ACTION', 'ENDPOINT_ACCESS', 'ENDPOINT_MUTATION']);
 
 export const VALID_SEVERITIES = new Set<AuditSeverity>(['INFO', 'WARNING', 'CRITICAL']);
 
@@ -137,7 +130,7 @@ export function parseAuditQuery(
  * ```ts
  * import { auditService } from './audit/service';
  *
- * await auditService.log({
+ * await auditService.log( {
  *   action: 'CONTRACT_CREATED',
  *   severity: 'INFO',
  *   actor: req.user.id,
@@ -159,64 +152,50 @@ export class AuditService {
     this.cache = options.cache ? new AuditCache(options.cache) : null;
   }
 
+  private reportFailure(operation: string): void {
+    // Dependency messages may contain SQL, credentials or audit metadata. A
+    // broken diagnostic sink must not mask the original failure or commit.
+    try {
+      console.error(`[AuditService] ${operation}`);
+    } catch { /* Preserve the operation's outcome. */ }
+  }
+
+  private useCache<T>(operation: (cache: AuditCache) => T): T | undefined {
+    if (!this.cache) return undefined;
+    try {
+      return operation(this.cache);
+    } catch {
+      // Never read possibly stale data again after an invalidation/read/write
+      // failure. Repository state remains authoritative for this instance.
+      this.cache = null;
+      this.reportFailure('Cache unavailable; caching disabled');
+      return undefined;
+    }
+  }
+
   /**
    * Records an audit event.
    *
-   * Validation runs before any repository interaction — the same invalid input
-   * always throws `AuditValidationError` (HTTP 400, code `"validation_error"`)
-   * and is never passed to the repository. This is a permanent failure; do not
-   * retry on `AuditValidationError`.
-   *
-   * Repository write failures (I/O, lock contention, etc.) are transient and
-   * are re-thrown so the caller can decide whether to retry via `withRetry`.
-   *
-   * Validation failures are logged at `warn` level with field-level context but
-   * without exposing field values (no PII in log records). Write failures are
-   * logged at `error` level.
-   *
-   * @param input - Event details. metadata must be pre-sanitised (no raw PII).
+   * @param input - Event details. metadata must be pre-sanitised.
    * @returns The persisted, immutable AuditEntry.
-   * @throws {AuditValidationError} When input fails validation (permanent, HTTP 400).
-   * @throws {Error} When the repository write fails (transient, should be retried by caller).
+   * @throws When the repository append fails. No automatic retry is attempted.
    */
   log(input: CreateAuditEntryInput): AuditEntry {
-    const log = createLogger({ service: 'audit-service' });
-
-    // ── Step 1: Validate input deterministically ──────────────────────────
-    // Same input always produces the same result. No I/O involved.
-    // AuditValidationError is a permanent failure — do not retry.
-    let validated: CreateAuditEntryInput;
+    let entry: AuditEntry;
     try {
-      validated = validateAuditInput(input);
+      entry = this.repository.append(input);
     } catch (err) {
-      if (err instanceof AuditValidationError) {
-        // Emit a warn with structural context only — never log field values.
-        log.warn('Audit input validation failed', {
-          issueCount: err.issues.length,
-          fields: err.issues.map((i) => i.field),
-        });
-        throw err;
-      }
-      // Unexpected error from the validator itself — escalate.
-      log.error('Unexpected error during audit input validation', { err: err as Error });
+      // Be conservative even if a custom repository reports an ambiguous
+      // failure after committing. Never serve a stale pre-write snapshot.
+      this.useCache(cache => cache.invalidate());
+      this.reportFailure('Failed to persist audit entry');
       throw err;
     }
-
-    // ── Step 2: Persist the validated entry ───────────────────────────────
-    // Repository failures are transient — re-throw so callers can retry.
-    try {
-      const entry = this.repository.append(input);
-      
-      // Invalidate cache on write operations
-      if (this.cache) {
-        this.cache.invalidateByResourceId(input.resourceId);
-      }
-      
-      return entry;
-    } catch (err) {
-      log.error('[AuditService] Failed to persist audit entry', { err: err as Error });
-      throw err;
-    }
+    // An append changes unfiltered, actor/action and cursor queries too.
+    // This is outside the persistence failure boundary: a cache fault must
+    // never turn a committed append into a retryable failure.
+    this.useCache(cache => cache.invalidate());
+    return entry;
   }
 
   /**
@@ -295,30 +274,41 @@ export class AuditService {
 
     const exportResult = await exportService.createNdjsonExport(filters);
 
-    this.log({
-      action: 'ADMIN_ACTION',
-      severity: 'CRITICAL',
-      actor: context.actor ?? 'anonymous',
-      resource: 'audit-log',
-      resourceId: 'export',
-      metadata: {
-        operation: 'export',
-        format: 'ndjson',
-        filters: {
-          action: filters.action ?? null,
-          severity: filters.severity ?? null,
-          actor: filters.actor ?? null,
-          resource: filters.resource ?? null,
-          resourceId: filters.resourceId ?? null,
-          from: filters.from ?? null,
-          to: filters.to ?? null,
+    try {
+      this.log({
+        action: 'ADMIN_ACTION',
+        severity: 'CRITICAL',
+        actor: context.actor ?? 'anonymous',
+        resource: 'audit-log',
+        resourceId: 'export',
+        metadata: {
+          operation: 'export',
+          format: 'ndjson',
+          filters: {
+            action: filters.action ?? null,
+            severity: filters.severity ?? null,
+            actor: filters.actor ?? null,
+            resource: filters.resource ?? null,
+            resourceId: filters.resourceId ?? null,
+            from: filters.from ?? null,
+            to: filters.to ?? null,
+          },
+          recordCount: exportResult.recordCount,
+          bytesWritten: exportResult.bytesWritten,
         },
-        recordCount: exportResult.recordCount,
-        bytesWritten: exportResult.bytesWritten,
-      },
-      ipAddress: context.ipAddress,
-      correlationId: context.correlationId,
-    });
+        ipAddress: context.ipAddress,
+        correlationId: context.correlationId,
+      });
+    } catch (error) {
+      // Ownership transfers to the caller only after the compliance event is
+      // persisted. Otherwise remove this request's file, never audit records.
+      try {
+        await exportResult.cleanup();
+      } catch {
+        this.reportFailure('Failed to clean up rejected audit export');
+      }
+      throw error;
+    }
 
     return exportResult;
   }
@@ -333,7 +323,7 @@ export class AuditService {
     metadata: Record<string, unknown> = {},
     context: { ipAddress?: string; correlationId?: string } = {},
   ): AuditEntry {
-    return this.log({
+    return this.log( {
       action,
       severity: 'INFO',
       actor,
@@ -387,7 +377,7 @@ export class AuditService {
     metadata: Record<string, unknown> = {},
     context: { ipAddress?: string; correlationId?: string } = {},
   ): AuditEntry {
-    return this.log({
+    return this.log( {
       action,
       severity: 'CRITICAL',
       actor,
@@ -403,7 +393,7 @@ export class AuditService {
    * AUTH_FAILED is WARNING; others are INFO.
    */
   logAuthEvent(
-    action: Extract<AuditAction, `AUTH_${string}`>,
+    action: Extract<AuditAction, `AUTH_${string|`>,
     actor: string,
     metadata: Record<string, unknown> = {},
     context: { ipAddress?: string; correlationId?: string } = {},
@@ -474,20 +464,16 @@ export class AuditService {
    */
   query(query: AuditQuery = {}): AuditEntry[] {
     // Check cache first
-    if (this.cache) {
-      const cached = this.cache.get(query, 'query');
-      if (cached) {
-        return cached as AuditEntry[];
-      }
+    const cached = this.useCache(cache => cache.get(query, 'query'));
+    if (cached) {
+      return cached as AuditEntry[];
     }
 
     // Cache miss - fetch from repository
     const entries = this.repository.query(query);
 
     // Store in cache
-    if (this.cache) {
-      this.cache.set(query, entries, 'query');
-    }
+    this.useCache(cache => cache.set(query, entries, 'query'));
 
     return entries;
   }
@@ -500,20 +486,16 @@ export class AuditService {
    */
   queryWithCursor(query: AuditQuery = {}): AuditQueryResult {
     // Check cache first
-    if (this.cache) {
-      const cached = this.cache.get(query, 'queryWithCursor');
-      if (cached) {
-        return cached as AuditQueryResult;
-      }
+    const cached = this.useCache(cache => cache.get(query, 'queryWithCursor'));
+    if (cached) {
+      return cached as AuditQueryResult;
     }
 
     // Cache miss - fetch from repository
     const result = this.repository.queryWithCursor(query);
 
     // Store in cache
-    if (this.cache) {
-      this.cache.set(query, result, 'queryWithCursor');
-    }
+    this.useCache(cache => cache.set(query, result, 'queryWithCursor'));
 
     return result;
   }
@@ -530,20 +512,16 @@ export class AuditService {
    */
   getById(id: string): AuditEntry | undefined {
     // Check cache first
-    if (this.cache) {
-      const cached = this.cache.get({}, 'getById', id);
-      if (cached) {
-        return cached as AuditEntry;
-      }
+    const cached = this.useCache(cache => cache.get({}, 'getById', id));
+    if (cached) {
+      return cached as AuditEntry;
     }
 
     // Cache miss - fetch from repository
     const entry = this.repository.getById(id);
 
     // Store in cache
-    if (this.cache && entry) {
-      this.cache.set({}, entry, 'getById', id);
-    }
+    if (entry) this.useCache(cache => cache.set({}, entry, 'getById', id));
 
     return entry;
   }
@@ -552,35 +530,36 @@ export class AuditService {
    * Retrieves a single entry by ID (alias method).
    */
   getEntry(id: string): AuditEntry | undefined {
-    return this.getById(id);
+    return this.repository.findById(id);
   }
 
   /**
-   * Returns the total number of audit entries.
+   * Queries audit entries with the given filters.
    */
-  count(): number {
-    return this.repository.count();
+  query(query: AuditQuery): AuditEntry[] {
+    return this.repository.query(query);
   }
 
   /**
-   * Verifies the integrity of the entire hash chain.
-   * Should be called by a scheduled monitoring job.
-   *
-   * @returns IntegrityReport — escalate immediately if valid === false.
+   * Queries audit entries using cursor-based pagination.
+   */
+  queryWithCursor(query: AuditQuery): AuditQueryResult {
+    return this.repository.queryWithCursor(query);
+  }
+
+  /**
+   * Verifies the integrity of the audit log chain.
    */
   verifyIntegrity(): IntegrityReport {
     return this.repository.verifyIntegrity();
   }
 
   /**
-   * Checks hash chain integrity and returns report with HTTP status code.
+   * Returns the total count of audit entries.
    */
-  checkIntegrity(): { report: IntegrityReport; status: number } {
-    const report = this.verifyIntegrity();
-    const status = report.valid ? 200 : 409;
-    return { report, status };
+  count(): number {
+    return this.repository.count();
   }
 }
 
-/** Singleton service instance. */
 export const auditService = new AuditService();

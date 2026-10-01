@@ -819,42 +819,119 @@ MIGRATIONS.push({
   },
 });
 
-// Version 18: audit_download_tokens table for signed, expiring, one-time-use
-// download tokens bound to a specific export artifact and requester (issue #1222).
-//
-// NOTE: This table was originally introduced as migration version 16 by PR #1259,
-// but a subsequent change re-used version 16 for the audit event/projection
-// tables and dropped this definition. Because a version number can only be
-// applied once, the table is re-introduced here under a fresh, unused version
-// so existing databases (which already recorded version 16) still converge on
-// the correct schema. `IF NOT EXISTS` keeps it idempotent for databases where
-// the table somehow already exists.
+// Version 18: add lease columns to transactions table
 MIGRATIONS.push({
   version: 18,
-  name: "create_audit_download_tokens_table",
+  name: "add_lease_columns_to_transactions",
   checksumSource: [
-    "CREATE TABLE IF NOT EXISTS audit_download_tokens (",
-    "CREATE INDEX IF NOT EXISTS idx_audit_download_tokens_tenant",
-    "CREATE INDEX IF NOT EXISTS idx_audit_download_tokens_expires_at",
+    "ALTER TABLE transactions ADD COLUMN lease_owner TEXT",
+    "ALTER TABLE transactions ADD COLUMN lease_expires_at TEXT",
   ].join("\n"),
   up: (db) => {
+    const columns = db.pragma("table_info(transactions)") as Array<{ name: string }>;
+    const hasLeaseOwner = columns.some((col) => col.name === "lease_owner");
+    const hasLeaseExpiresAt = columns.some((col) => col.name === "lease_expires_at");
+
+    if (!hasLeaseOwner) {
+      db.exec("ALTER TABLE transactions ADD COLUMN lease_owner TEXT");
+    }
+    if (!hasLeaseExpiresAt) {
+      db.exec("ALTER TABLE transactions ADD COLUMN lease_expires_at TEXT");
+    }
+  },
+});
+
+// Version 19: add retention columns to smart_contract_events, create retention/archive/hold tables,
+//             create audit_download_tokens, and create milestone_divergence_reports
+MIGRATIONS.push({
+  version: 19,
+  name: "add_retention_and_divergence_tables",
+  checksumSource: [
+    "ALTER TABLE smart_contract_events ADD COLUMN network TEXT",
+    "ALTER TABLE smart_contract_events ADD COLUMN ledger INTEGER",
+    "ALTER TABLE smart_contract_events ADD COLUMN ingested_at TEXT",
+    "CREATE TABLE IF NOT EXISTS raw_event_archive (",
+    "CREATE TABLE IF NOT EXISTS raw_event_holds (",
+    "CREATE TABLE IF NOT EXISTS audit_download_tokens (",
+    "CREATE TABLE IF NOT EXISTS milestone_divergence_reports (",
+  ].join("\n"),
+  up: (db) => {
+    // Add missing columns to smart_contract_events
+    const sceColumns = db.pragma("table_info(smart_contract_events)") as Array<{ name: string }>;
+    const sceNames = new Set(sceColumns.map((c) => c.name));
+    if (!sceNames.has("network")) {
+      db.exec("ALTER TABLE smart_contract_events ADD COLUMN network TEXT");
+    }
+    if (!sceNames.has("ledger")) {
+      db.exec("ALTER TABLE smart_contract_events ADD COLUMN ledger INTEGER");
+    }
+    if (!sceNames.has("ingested_at")) {
+      db.exec("ALTER TABLE smart_contract_events ADD COLUMN ingested_at TEXT");
+    }
+
+    // Raw event archive (compliance copy)
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS raw_event_archive (
+        event_id     TEXT PRIMARY KEY,
+        contract_id  TEXT NOT NULL,
+        event_type   TEXT NOT NULL,
+        network      TEXT,
+        archived_at  TEXT NOT NULL,
+        payload      TEXT NOT NULL,
+        payload_hash TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_raw_event_archive_contract ON raw_event_archive(contract_id);
+      CREATE INDEX IF NOT EXISTS idx_raw_event_archive_archived ON raw_event_archive(archived_at);
+    `);
+
+    // Legal holds
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS raw_event_holds (
+        id          TEXT PRIMARY KEY,
+        scope_type  TEXT NOT NULL,
+        scope_value TEXT,
+        reason      TEXT NOT NULL,
+        actor       TEXT NOT NULL,
+        created_at  TEXT NOT NULL,
+        expires_at  TEXT
+      );
+    `);
+
+    // Audit export download tokens
     db.exec(`
       CREATE TABLE IF NOT EXISTS audit_download_tokens (
-        jti           TEXT    PRIMARY KEY,
-        tenant_id     TEXT    NOT NULL,
-        requester_id  TEXT    NOT NULL,
-        artifact_id   TEXT    NOT NULL,
-        issued_at     TEXT    NOT NULL,
-        expires_at    TEXT    NOT NULL,
-        used_at       TEXT,
-        revoked_at    TEXT
+        jti          TEXT PRIMARY KEY,
+        tenant_id    TEXT NOT NULL,
+        requester_id TEXT NOT NULL,
+        artifact_id  TEXT NOT NULL,
+        issued_at    TEXT NOT NULL,
+        expires_at   TEXT NOT NULL,
+        used_at      TEXT,
+        revoked_at   TEXT
       );
+      CREATE INDEX IF NOT EXISTS idx_audit_download_tokens_tenant ON audit_download_tokens(tenant_id);
+      CREATE INDEX IF NOT EXISTS idx_audit_download_tokens_expires ON audit_download_tokens(expires_at);
+    `);
 
-      CREATE INDEX IF NOT EXISTS idx_audit_download_tokens_tenant
-        ON audit_download_tokens(tenant_id);
-
-      CREATE INDEX IF NOT EXISTS idx_audit_download_tokens_expires_at
-        ON audit_download_tokens(expires_at);
+    // Milestone divergence reports
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS milestone_divergence_reports (
+        id                    TEXT NOT NULL,
+        run_id                TEXT NOT NULL,
+        tenant_id             TEXT NOT NULL,
+        contract_id           TEXT NOT NULL,
+        status                TEXT NOT NULL,
+        block_height          INTEGER,
+        compared_at           TEXT NOT NULL,
+        milestone_comparisons TEXT NOT NULL,
+        differences           TEXT NOT NULL,
+        rpc_error             TEXT,
+        created_at            TEXT NOT NULL,
+        UNIQUE(run_id, contract_id)
+      );
+      CREATE INDEX IF NOT EXISTS idx_milestone_divergence_tenant ON milestone_divergence_reports(tenant_id);
+      CREATE INDEX IF NOT EXISTS idx_milestone_divergence_run ON milestone_divergence_reports(run_id);
+      CREATE INDEX IF NOT EXISTS idx_milestone_divergence_compared ON milestone_divergence_reports(compared_at);
     `);
   },
 });

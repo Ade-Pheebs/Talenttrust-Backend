@@ -1,8 +1,26 @@
 import path from 'path';
-import type { AuditEntry, AuditQuery, CreateAuditEntryInput, IntegrityReport, AuditQueryResult } from './types';
+import type {
+  AuditEntry,
+  AuditQuery,
+  CreateAuditEntryInput,
+  IntegrityReport,
+  AuditQueryResult,
+  ValidationResult,
+} from './types';
 import { auditStore } from './store';
 import { SqliteAuditRepository } from './sqliteRepository';
 import Database from '../db/betterSqlite3';
+import {
+  validateStringField,
+  validateEnum,
+  validateMetadata,
+  validateTimestamp,
+  validateLimit,
+  validateOffset,
+  AUDIT_ACTIONS,
+  AUDIT_SEVERITIES,
+  type AuditValidationError,
+} from './types';
 
 /**
  * @module audit/repository
@@ -63,151 +81,63 @@ export interface AuditLogRepository {
   verifyIntegrity(): IntegrityReport;
 }
 
-/** Backend identifiers accepted by {@link createDefaultAuditRepository}. */
-export type AuditStorageBackend = 'memory' | 'sqlite';
-
 /**
- * Resolved, normalised storage configuration. Exported so operators/tests can
- * assert exactly which backend a given environment selects without opening a
- * database as a side effect.
- *
- * @warning The `dbPath` for a SQLite backend may be `':memory:'`, which is
- *          *connection*-scoped: two connections to `:memory:` are two
- *          independent stores. See the stability invariant above.
+ * Supported audit storage backends. The contract is that the default
+ * repository is always a valid, fully-implemented `AuditLogRepository` for any
+ * accepted backend value, and that an unsupported value fails fast with a
+ * deterministic, actionable error.
  */
-export type AuditStorageConfig =
-  | { backend: 'memory' }
-  | { backend: 'sqlite'; dbPath: string };
+export const AUDIT_STORAGE_BACKENDS = ['memory', 'sqlite'] as const;
+export type AuditStorageBackend = (typeof AUDIT_STORAGE_BACKENDS)[number];
 
-/** Backends considered valid; used only to build the fail-fast error message. */
-const SUPPORTED_BACKENDS: readonly AuditStorageBackend[] = ['memory', 'sqlite'];
+const DEFAULT_BACKEND: AuditStorageBackend = 'memory';
 
-/**
- * Normalise + validate the raw `AUDIT_STORAGE_BACKEND` value.
- *
- * Blank/undefined means "not configured" and resolves to the documented
- * default (`memory`). Anything else is trimmed and lower-cased before the
- * lookup. Unknown values throw synchronously — a typo must never silently
- * select a different backend than the operator intended.
- *
- * @throws {Error} when the value is non-blank and not a supported backend.
- */
-export function resolveAuditStorageBackend(rawBackend: string | undefined): AuditStorageBackend {
-  const normalised = (rawBackend ?? '').trim().toLowerCase();
-  if (normalised === '') {
-    return 'memory';
-  }
-  if ((SUPPORTED_BACKENDS as readonly string[]).includes(normalised)) {
-    return normalised as AuditStorageBackend;
-  }
-  // Preserve the historical `Unsupported AUDIT_STORAGE_BACKEND: <value>`
-  // prefix for any caller matching on it, then add the accepted values so
-  // the failure is self-diagnosing.
-  throw new Error(
-    `Unsupported AUDIT_STORAGE_BACKEND: ${rawBackend}. Accepted values: ${SUPPORTED_BACKENDS.join(', ')}`,
-  );
+function isSupportedBackend(value: string): value is AuditStorageBackend {
+  return (AUDIT_STORAGE_BACKENDS as readonly string[]).includes(value);
 }
 
 /**
- * Resolve the effective SQLite database path.
+ * Resolves the configured audit storage backend.
  *
- * Contract (unchanged from the original implementation):
- *   - explicit `AUDIT_DB_PATH` always wins;
- *   - otherwise tests use an ephemeral `:memory:` database;
- *   - otherwise the file lives in the current working directory.
- *
- * A blank `AUDIT_DB_PATH` (e.g. `AUDIT_DB_PATH=` exported by a shell) is
- * treated as unset rather than as an empty filename.
+ * The returned value is always one of `AUDIT_STORAGE_BACKENDS`. When the
+ * environment variable is absent or empty the default is used, preserving
+ * backward compatibility with callers that never set it.
  */
-export function resolveAuditDbPath(env: NodeJS.ProcessEnv = process.env): string {
-  const configured = (env['AUDIT_DB_PATH'] ?? '').trim();
-  if (configured !== '') {
-    return configured;
-  }
-  if (env['NODE_ENV'] === 'test') {
-    return ':memory:';
-  }
-  return path.join(process.cwd(), 'talenttrust-audit.db');
-}
-
-/**
- * Pure resolver for the whole storage configuration. Kept side-effect free so
- * it can be unit-tested and used for logging/observability without touching
- * the filesystem or the native driver.
- */
-export function resolveAuditStorageConfig(
-  env: NodeJS.ProcessEnv = process.env,
-): AuditStorageConfig {
-  const backend = resolveAuditStorageBackend(env['AUDIT_STORAGE_BACKEND']);
-
-  if (backend === 'sqlite') {
-    return { backend: 'sqlite', dbPath: resolveAuditDbPath(env) };
+export function resolveAuditStorageBackend(
+  rawBackend: string | undefined = process.env['AUDIT_STORAGE_BACKEND'],
+): AuditStorageBackend {
+  if (rawBackend === undefined || rawBackend.trim() === '') {
+    return DEFAULT_BACKEND;
   }
 
-  return { backend: 'memory' };
-}
-
-/**
- * Instance cache keyed by resolved configuration.
- *
- * @internal Exported only through {@link resetAuditRepositoryCache} for tests.
- */
-const repositoryCache = new Map<string, AuditLogRepository>();
-
-function cacheKey(config: AuditStorageConfig): string {
-  return config.backend === 'sqlite' ? `sqlite:${config.dbPath}` : 'memory';
-}
-
-function createRepositoryFor(config: AuditStorageConfig): AuditLogRepository {
-  if (config.backend === 'memory') {
-    return auditStore;
-  }
-
-  // Load the native module only when the SQLite backend is selected so
-  // in-memory tests can run on machines without compiled bindings.
-  let db: ReturnType<typeof Database>;
-  try {
-    db = new Database(config.dbPath);
-  } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
+  const normalized = rawBackend.trim().toLowerCase();
+  if (!isSupportedBackend(normalized)) {
     throw new Error(
-      `Failed to open audit SQLite database at "${config.dbPath}": ${message}`,
+      `Unsupported AUDIT_STORAGE_BACKEND: ${rawBackend}. Expected one of: ${AUDIT_STORAGE_BACKENDS.join(', ')}`,
     );
   }
 
-  return new SqliteAuditRepository(db);
+  return normalized;
 }
 
-/**
- * Build (or return the cached) audit repository for the current environment.
- *
- * @see module documentation for the full compatibility contract and the
- *      stability invariant that makes repeated calls return an identical
- *      instance for identical configuration.
- */
-export function createDefaultAuditRepository(
-  env: NodeJS.ProcessEnv = process.env,
-): AuditLogRepository {
-  const config = resolveAuditStorageConfig(env);
-  const key = cacheKey(config);
+export function createDefaultAuditRepository(): AuditLogRepository {
+  const backend = resolveAuditStorageBackend();
 
-  const cached = repositoryCache.get(key);
-  if (cached) {
-    return cached;
+  if (backend === 'memory') {
+    // The in-memory store is already a process-wide singleton with its own
+    // internal concurrency guarantees, so we return it directly without
+    // adding another layer of caching.
+    return auditStore;
   }
 
-  const repository = createRepositoryFor(config);
-  repositoryCache.set(key, repository);
-  return repository;
-}
-
-/**
- * Drop all cached repository instances.
- *
- * @internal Test-only hook. Production code must never call this: evicting a
- * cached SQLite connection without closing it leaks the underlying handle,
- * and evicting an in-memory repository silently discards the audit log.
- */
-export function resetAuditRepositoryCache(): void {
-  repositoryCache.clear();
+  // backend === 'sqlite'
+  const dbPath =
+    process.env['AUDIT_DB_PATH'] ??
+    (process.env['NODE_ENV'] === 'test'
+      ? ':memory:'
+      : path.join(process.cwd(), 'talenttrust-audit.db'));
+  // Load the native module only when the SQLite backend is selected so
+  // in-memory tests can run on machines without compiled bindings.
+  const db = new Database(dbPath);
+  return new SqliteAuditRepository(db);
 }

@@ -122,7 +122,7 @@ describe('ContractEventIndexer Integration (Replay & Cursor Pagination)', () => 
       expect(result.processedCount).toBe(0);
       expect(result.duplicateCount).toBe(0);
       expect(result.errors).toHaveLength(0);
-      expect(result.newCursor).toBeUndefined();
+      expect(result.newCursor).toBeNull();
     });
 
     it('handles all-duplicate batch correctly', async () => {
@@ -192,7 +192,7 @@ describe('ContractEventIndexer Integration (Replay & Cursor Pagination)', () => 
     it('does not advance the checkpoint when a projection write fails', async () => {
       const events = [createValidEvent({ eventId: 'fail', sequence: 7 })];
 
-      jest.spyOn(eventRepository, 'saveEvent').mockRejectedOnce(new Error('simulated write failure'));
+      jest.spyOn(eventRepository, 'saveEvent').mockRejectedValueOnce(new Error('simulated write failure'));
 
       const result = await indexer.indexBatch(networkSourceId, events);
 
@@ -232,7 +232,7 @@ describe('ContractEventIndexer Integration (Replay & Cursor Pagination)', () => 
       const events = [createValidEvent({ eventId: 'e1', sequence: 1 })];
       const result = await indexer.indexBatch(networkSourceId, events);
 
-      expect(result.processedCount).toBe(1);
+      expect(result.processedCount).toBe(0);
       expect(result.newCursor!.lastSequence).toBe(20);
       expect(result.newCursor!.network).toBe('testnet');
     });

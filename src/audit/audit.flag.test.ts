@@ -37,6 +37,7 @@ const MIN_ENV: NodeJS.ProcessEnv = {
 import { validateEnv } from '../config/env.schema';
 import { auditMiddleware } from './middleware';
 import { auditService } from './service';
+import { auditService } from './service';
 import { createProtectedEndpointAuditMiddleware } from './protectedEndpointMiddleware';
 import type { CreateAuditEntryInput } from './types';
 

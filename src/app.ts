@@ -33,6 +33,80 @@ interface AppFactoryOptions {
   includeTerminalHandlers?: boolean;
 }
 
+/**
+ * Route prefixes that the application is allowed to mount.
+ *
+ * @utility This list is the single source of truth for the application's
+ * public routing boundaries. It is used by the route-boundary guard to
+ * reject any attempt to mount a router outside the known surface area.
+ */
+export const ALLOWED_ROUTE_PREFIXES = [
+  '/metrics',
+  '/health',
+  '/api/config',
+  '/api/v1',
+] as const;
+
+export type AllowedRoutePrefix = (typeof ALLOWED_ROUTE_PREFIXES)[number];
+
+/**
+ * Returns true when `path` is a valid Express mount path that falls
+ * within one of the approved route prefixes.
+ *
+ * @remarks This function is deliberately pure and total: every input
+ * (including non-strings and malformed paths) returns a boolean without
+ * throwing. The guard is fail-closed: any path that cannot be proven to
+ * be within the approved surface area is rejected.
+ */
+export function isAllowedRoutePath(path: unknown): boolean {
+  if (typeof path !== 'string') {
+    return false;
+  }
+
+  const trimmed = path.trim();
+  if (trimmed === '' || !trimmed.startsWith('/')) {
+    return false;
+  }
+
+  // Reject whitespace, control characters, query strings, and fragments.
+  if (/[\s\u0000-\u001f\u007f\u0080-\u009f]/.test(trimmed)) {
+    return false;
+  }
+  if (trimmed.includes('?') || trimmed.includes('#')) {
+    return false;
+  }
+
+  // Reject traversal segments and double slashes that could bypass prefix matching.
+  if (trimmed.includes('..') || trimmed.includes('//')) {
+    return false;
+  }
+
+  // Normalize a trailing slash so '/api/v1/' matches the '/api/v1' prefix.
+  const normalized = trimmed.length > 1 ? trimmed.replace(/\/+$/, '') : trimmed;
+
+  return ALLOWED_ROUTE_PREFIXES.some(
+    (prefix) => normalized === prefix || normalized.startsWith(`${prefix}/`),
+  );
+}
+
+/**
+ * Mounts a router on the app only after validating that the mount path
+ * falls within the approved route boundaries.
+ *
+ * @throws Error when the path is invalid or outside the approved surface
+ * area. This is a developer error (fail-fast at bootstrap) rather than a
+ * runtime request error, so it must not be swallowed.
+ */
+export function mountRouter(app: express.Application, path: string, ...handlers: express.RequestHandler[]): void {
+  if (!isAllowedRoutePath(path)) {
+    throw new Error(
+      `Refusing to mount router at unapproved path "${String(path)}". Allowed prefixes: ${ALLOWED_ROUTE_PREFIXES.join(', ')}`,
+    );
+  }
+
+  app.use(path, ...handlers);
+}
+
 export function attachTerminalHandlers(app: express.Application): void {
   app.use(notFoundHandler);
   app.use(errorHandler);
@@ -68,26 +142,26 @@ export function createApp(options?: AppFactoryOptions): express.Application {
     res.status(200).send(await metricsService.getMetrics());
   });
 
-  app.use('/health', legacyHealthRouter);
-  app.use('/health', readinessHealthRouter);
-  app.use('/api/config', configRouter);
-  app.use('/api/v1', eventsRouter);
-  app.use('/api/v1/auth', metricsService.trackAuthRequest.bind(metricsService));
-  app.use('/api/v1/auth', authRouter);
-  app.use('/api/v1/api-keys', metricsService.trackApiKeysRequest.bind(metricsService));
-  app.use('/api/v1', apiKeysRouter);
-  app.use('/api/v1/contracts', createContractsRouter(metricsService));
-  app.use('/api/v1/disputes', createDisputesRouter({ metricsService }));
-  app.use('/api/v1/reputation', reputationRouter);
-  app.use('/api/v1/dependency-scan', dependencyScanRouter);
-  app.use('/api/v1', apiKeysRouter);
-  app.use('/api/v1/admin', adminRouter);
-  app.use('/api/v1/admin/deploy', deployRouter);
-  app.use('/api/v1', rpcEventsRouter);
+  mountRouter(app, '/health', legacyHealthRouter);
+  mountRouter(app, '/health', readinessHealthRouter);
+  mountRouter(app, '/api/config', configRouter);
+  mountRouter(app, '/api/v1', eventsRouter);
+  mountRouter(app, '/api/v1/auth', metricsService.trackAuthRequest.bind(metricsService));
+  mountRouter(app, '/api/v1/auth', authRouter);
+  mountRouter(app, '/api/v1/api-keys', metricsService.trackApiKeysRequest.bind(metricsService));
+  mountRouter(app, '/api/v1', apiKeysRouter);
+  mountRouter(app, '/api/v1/contracts', createContractsRouter(metricsService));
+  mountRouter(app, '/api/v1/disputes', createDisputesRouter({ metricsService }));
+  mountRouter(app, '/api/v1/reputation', reputationRouter);
+  mountRouter(app, '/api/v1/dependency-scan', dependencyScanRouter);
+  mountRouter(app, '/api/v1', apiKeysRouter);
+  mountRouter(app, '/api/v1/admin', adminRouter);
+  mountRouter(app, '/api/v1/admin/deploy', deployRouter);
+  mountRouter(app, '/api/v1', rpcEventsRouter);
   if (features.webhooksEnabled) {
-    app.use('/api/v1/webhook-subscriptions', webhookSubscriptionRouter);
+    mountRouter(app, '/api/v1/webhook-subscriptions', webhookSubscriptionRouter);
   }
-  app.use('/api/v1/metrics', metricsAuthMiddleware, createMetricsRouter(metricsService));
+  mountRouter(app, '/api/v1/metrics', metricsAuthMiddleware, createMetricsRouter(metricsService));
 
   if (includeTerminalHandlers) {
     attachTerminalHandlers(app);

@@ -25,6 +25,12 @@ export const DataEntityType = _DataEntityType;
 export const DataClassification = _DataClassification;
 export const ArchivalStorageType = _ArchivalStorageType;
 
+// Type aliases so the enum values can also be used as types
+export type RetentionPeriod = _RetentionPeriod;
+export type DataEntityType = _DataEntityType;
+export type DataClassification = _DataClassification;
+export type ArchivalStorageType = _ArchivalStorageType;
+
 /**
  * Retention period durations in milliseconds
  * @private

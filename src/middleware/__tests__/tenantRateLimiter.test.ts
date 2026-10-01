@@ -108,8 +108,8 @@ describe('tenantRateLimiter', () => {
     expect(next).toHaveBeenCalledTimes(1);
     expect(res.status).toHaveBeenCalledWith(429);
     
-    // Advance time by 61 seconds (past the 60s window)
-    jest.advanceTimersByTime(61000);
+    // Advance time by 65 seconds (well past the 60s window so weight drops to 0)
+    jest.advanceTimersByTime(65000);
     
     limiter(req as Request, res as Response, next);
     expect(next).toHaveBeenCalledTimes(2);

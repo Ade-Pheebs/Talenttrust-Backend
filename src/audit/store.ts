@@ -74,7 +74,39 @@ export function computeEntryHash(
 }
 
 /**
+ * Thrown when a write is attempted from inside another write's critical
+ * section (re-entrancy) — which would otherwise fork the hash chain, because
+ * both entries would read the same `previousHash`.
+ *
+ * The message is preserved from the previous implementation so existing
+ * string matchers keep working; unlike before it is a typed, catchable error.
+ */
+export class AuditStoreConcurrencyError extends Error {
+  /** Stable, machine-readable identifier for this error class. */
+  readonly code = 'audit_store_concurrency_violation';
+
+  constructor(message = 'AuditStore append re-entrancy detected') {
+    super(message);
+    this.name = 'AuditStoreConcurrencyError';
+  }
+}
+
+/**
  * AuditStore — append-only, hash-chained audit log.
+ *
+ * Concurrency contract (issue #1379):
+ *  - Every write ({@link AuditStore.append}, {@link AuditStore.appendMany})
+ *    runs inside one synchronous, single-writer critical section. Node runs
+ *    that section to completion without yielding, so concurrent callers cannot
+ *    interleave two writes and fork the chain — the guarantee is now explicit
+ *    and enforced rather than incidental.
+ *  - The lock is re-entrancy safe: a write attempted from within a write (for
+ *    example a `metadata` getter or `toJSON` that calls back into the store)
+ *    is rejected with {@link AuditStoreConcurrencyError} instead of silently
+ *    corrupting the chain.
+ *  - Writes are atomic: if anything throws after entries were appended, the
+ *    log is rolled back to its previous length, so a failed, partial, or
+ *    re-entrant write can never leave a half-linked entry behind.
  *
  * @example
  * ```ts
@@ -87,41 +119,96 @@ export class AuditStore implements AuditLogRepository {
   /** Internal append-only log. Never mutate directly. */
   private readonly log: AuditEntry[] = [];
 
-  private _appendGuard = false;
+  /**
+   * Depth of the write critical section currently executing. `0` means idle;
+   * a non-zero value on entry means a nested write, which is rejected.
+   */
+  private _appendDepth = 0;
 
   append(input: CreateAuditEntryInput): AuditEntry {
-    if (this._appendGuard) {
-      throw new Error('AuditStore append re-entrancy detected');
-    }
-
-    this._appendGuard = true;
-    try {
-      const previousHash =
-        this.log.length === 0 ? GENESIS_HASH : this.log[this.log.length - 1].hash;
-
-      const partial: Omit<AuditEntry, 'hash'> = {
-        id: randomUUID(),
-        timestamp: new Date().toISOString(),
-        action: input.action,
-        severity: input.severity,
-        actor: input.actor,
-        resource: input.resource,
-        resourceId: input.resourceId,
-        metadata: Object.freeze({ ...input.metadata }),
-        ipAddress: input.ipAddress,
-        correlationId: input.correlationId,
-        previousHash,
-      };
-
-      const entry: AuditEntry = Object.freeze({
-        ...partial,
-        hash: computeEntryHash(partial),
-      });
-
+    return this.withWriteLock(() => {
+      const entry = this.buildEntry(input, this.currentHash());
       this.log.push(entry);
       return entry;
+    });
+  }
+
+  /**
+   * Atomically appends a batch of entries, chaining each to the one before it.
+   *
+   * All-or-nothing: if any entry in the batch fails to build (for example a
+   * `metadata` value whose `toJSON` throws while hashing), *no* entry from the
+   * batch is persisted. Callers that must record several related events can
+   * therefore never observe a partially applied batch.
+   *
+   * Not part of {@link AuditLogRepository} — it is an `AuditStore` primitive,
+   * so adding it does not change the repository interface or the SQLite
+   * backend.
+   */
+  appendMany(inputs: readonly CreateAuditEntryInput[]): AuditEntry[] {
+    return this.withWriteLock(() => {
+      const appended: AuditEntry[] = [];
+      let previousHash = this.currentHash();
+      for (const input of inputs) {
+        const entry = this.buildEntry(input, previousHash);
+        this.log.push(entry);
+        appended.push(entry);
+        previousHash = entry.hash;
+      }
+      return appended;
+    });
+  }
+
+  /** Hash of the current chain head, or {@link GENESIS_HASH} when empty. */
+  private currentHash(): string {
+    return this.log.length === 0 ? GENESIS_HASH : this.log[this.log.length - 1].hash;
+  }
+
+  /** Builds (but does not persist) a frozen entry linked to `previousHash`. */
+  private buildEntry(input: CreateAuditEntryInput, previousHash: string): AuditEntry {
+    const partial: Omit<AuditEntry, 'hash'> = {
+      id: randomUUID(),
+      timestamp: new Date().toISOString(),
+      action: input.action,
+      severity: input.severity,
+      actor: input.actor,
+      resource: input.resource,
+      resourceId: input.resourceId,
+      metadata: Object.freeze({ ...input.metadata }),
+      ipAddress: input.ipAddress,
+      correlationId: input.correlationId,
+      previousHash,
+    };
+
+    return Object.freeze({
+      ...partial,
+      hash: computeEntryHash(partial),
+    });
+  }
+
+  /**
+   * Runs `work` inside the single-writer critical section.
+   *
+   * Nested writes are rejected before they can run, and the log is rolled back
+   * to its pre-call length if `work` throws — guaranteeing that a failed or
+   * re-entrant write leaves no partial state behind.
+   */
+  private withWriteLock<T>(work: () => T): T {
+    if (this._appendDepth > 0) {
+      throw new AuditStoreConcurrencyError();
+    }
+
+    this._appendDepth += 1;
+    const priorLength = this.log.length;
+    try {
+      return work();
+    } catch (error) {
+      if (this.log.length > priorLength) {
+        this.log.length = priorLength;
+      }
+      throw error;
     } finally {
-      this._appendGuard = false;
+      this._appendDepth -= 1;
     }
   }
 
@@ -350,7 +437,7 @@ export class AuditStore implements AuditLogRepository {
    */
   _reset(): void {
     this.log.length = 0;
-    this._appendGuard = false;
+    this._appendDepth = 0;
   }
 }
 

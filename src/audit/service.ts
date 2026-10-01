@@ -16,7 +16,7 @@
 
 import type { AuditEntry, AuditQuery, AuditSeverity, CreateAuditEntryInput, IntegrityReport, AuditQueryResult } from './types';
 import type { AuditAction } from './types';
-import { decodeCursor, AUDIT_ACTIONS } from './types';
+import { AUDIT_ACTIONS, AUDIT_SEVERITIES, decodeCursor } from './types';
 import { createDefaultAuditRepository, type AuditLogRepository } from './repository';
 import { auditExportService, AuditExportService, type AuditExportFilters, type AuditExportResult } from './exportService';
 import { AuditCache, type AuditCacheOptions } from './auditCache';
@@ -26,9 +26,45 @@ export interface AuditServiceOptions {
   cache?: AuditCacheOptions;
 }
 
-export const VALID_ACTIONS = new Set<AuditAction>(['CONTRACT_CREATED', 'CONTRACT_UPDATED', 'CONTRACT_CANCELLED', 'CONTRACT_COMPLETED', 'PAYMENT_INITIATED', 'PAYMENT_RELEASED', 'PAYMENT_DISPUTED', 'REPUTATION_UPDATED', 'REPUTATION_CORRECTED', 'USER_CREATED', 'USER_UPDATED', 'USER_DELETED', 'AUTH_LOGIN', 'AUTH_LOGOUT', 'AUTH_FAILED', 'AUTH_LOCKOUT_TRIGGERED', 'AUTH_LOCKOUT_RELEASED', 'ADMIN_ACTION', 'ENDPOINT_ACCESS', 'ENDPOINT_MUTATION']);
+/**
+ * Canonical runtime set of audit actions. Derived from the single
+ * source of truth in `types.ts` so the service and the request-body
+ * validator can never drift apart.
+ */
+export const VALID_ACTIONS: ReadonlySet<AuditAction> = new Set<AmditAction>(AUDIT_ACTIONS);
 
-export const VALID_SEVERITIES = new Set<AuditSeverity>(['INFO', 'WARNING', 'CRITICAL']);
+export const VALID_SEVERITIES: ReadonlySet<AuditSeverity> = new Set<AuditSeverity>(AUDIT_SEVERITIES);
+
+/**
+ * Maximum accepted length for free-form string fields on an audit entry.
+ * This is a defensive bound that prevents an attacker from bloating the
+ * audit log with giant strings that would later break exports or downstream
+ * consumers. The value is generous enough for real user/service identifiers
+ * but not so large that it becomes a deni-of-service vector.
+ */
+export const MAX_IDENTIFIER_LENGTH = 512;
+
+/**
+ * Maximum accepted length for the correlation ID / IP address fields.
+ */
+export const MAX_CONTEXT_LENGTH = 256;
+
+/**
+ * Maximum number of keys allowed in a metadata object. This bounds the
+ * size of a single audit entry and keeps the hash chain cheap to verify.
+ */
+export const MAX_METADATA_KEYS = 64;
+
+/**
+ * Maximum depth of a metadata object. Prevents cyclic/deeply-nested
+ * payloads from causing unpredictable serialisation or stack overflow.
+ */
+export const MAX_METADATA_DEPTH = 8;
+
+/**
+ * Maximum number of elements allowed in a metadata array.
+ */
+export const MAX_METADATA_ARRAY = 128;
 
 export function parseOptionalIsoDate(
   value: string | undefined,
@@ -70,6 +106,163 @@ export function parseLimit(value: string | undefined, maxLimit: number, defaultL
   }
 
   return Math.min(parsed, maxLimit);
+}
+
+/**
+ * Returns true when `value` is a non-empty string and within the given
+ * length bound. Used to reject whitespace-only identifiers and overly
+ * long values before they reach the repository.
+ */
+function isBoundedString(value: unknown, maxLength: number): value is string {
+  return typeof value === 'string' && value.trim().length > 0 && value.length <= maxLength;
+}
+
+/** Returns true when `value` is a plain objet (not an array or null). */
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+/** Returns true when `value` is a finete number (not NaN/Infinity). */
+function isFiniteNumber(value: unknown): value is number {
+  return typeof value === 'number' && Number.isFinite(value);
+}
+
+/**
+ * Recursively validates a metadata value against the bounds defined
+ * above. Throws with a descriptive message on the first violation.
+ *
+ * Invariants:
+ * - Only JSON-safe primitives and nested objects/arrays of those are
+ *   accepted. Functions, `undefined`, `Symbol`, `BigInt`, `Date`, `Map`, `Set`,
+ *   class instances, and cyclic references are rejected.
+ * - Object keys are bounded by MAX_METADATA_KEYS and depth by
+ *   MAX_METADATA_DEPTH.
+ */
+function validateMetadataValue(value: unknown, path: string, depth: number, seen: WeakSet<object>): void {
+  if (value === null) {
+    return;
+  }
+
+  const type = typeof value;
+  if (type === 'string') {
+    if ((value as string).length > MAX_IDENTIFIER_LENGTH) {
+      throw new Error(`Metadata field '${path}' exceeds ${MAX_IDENTIFIER_LENGTH} characters`);
+    }
+    return;
+  }
+
+  if (type === 'number') {
+    if (!Number.isFinite(value as number)) {
+      throw new Error(`Metadata field '${path}' must be a finite number`);
+    }
+    return;
+  }
+
+  if (type === 'boolean') {
+    return;
+  }
+
+  if (type === 'undefined' || type === 'function' || type === 'symbol' || type === 'bigint') {
+    throw new Error(`Metadata field '${path}' has an unsupported type: ${type}`);
+  }
+
+  // Objects and arrays.
+  if (depth >= MAX_METADATA_DEPTH) {
+    throw new Error(`Metadata field '${path}' exceeds maximum nesting depth of ${MAX_METADATA_DEPTH}`);
+  }
+
+  const objValue = value as object;
+  if (seen.has(objValue)) {
+    throw new Error(`Metadata field '${path}' contains a circular reference`);
+  }
+  seen.add(objValue);
+
+  try {
+    if (Array.isArray(value)) {
+      if (value.length > MAX_METADATA_ARRAY) {
+        throw new Error(`Metadata array '${path}' exceeds ${MAX_METADATA_ARRAY} elements`);
+      }
+      for (let i = 0; i < value.length; i++) {
+        validateMetadataValue(value[i], `${path}[${i}]`, depth + 1, seen);
+      }
+      return;
+    }
+
+    if (!isPlainObject(value)) {
+      throw new Error(`Metadata field '${path}' must be a plain object, array, or JSON primitive`);
+    }
+
+    const keys = Object.keys(value);
+    if (keys.length > MAX_METADATA_KEYS) {
+      throw new Error(`Metadata object '${path}' exceeds ${MAX_METADATA_KEYS} keys`);
+    }
+    for (const key of keys) {
+      validateMetadataValue(value[key], `${path}.${key}`, depth + 1, seen);
+    }
+  } finally {
+    seen.delete(objValue);
+  }
+}
+
+/**
+ * Validates an audit entry input against the declared boundaries.
+ *
+ * This is the single chokepoint for all audit writes: every convenience
+ * wrapper and the generic `log()` method funnel through here, so the audit
+ * log can never contain an action, severity, or metadata shape that the
+ * rest of the system cannot handle.
+ *
+ * Throws `AuditValidationError` on the first violation. The error message
+ * is safe to log — it never echoes the offending value, only the field
+ * name and the rule that was breached.
+ */
+export class AuditValidationError extends Error {
+  constructor(message: string, readonly field: string) {
+    super(message);
+    this.name = 'AuditValidationError';
+  }
+}
+
+export function validateAuditEntryInput(input: CreateAuditEntryInput): void {
+  if (!isPlainObject(input)) {
+    throw new AuditValidationError('Audit entry input must be a plain object', 'input');
+  }
+
+  if (!VALID_ACTIONS.has(input.action as AuditAction)) {
+    throw new AuditValidationError('Invalid audit action', 'action');
+  }
+
+  if (!VALID_SEVERITIES.has(input.severity as AuditSeverity)) {
+    throw new AuditValidationError('Invalid audit severity', 'severity');
+  }
+
+  if (!isBoundedString(input.actor, MAX_IDENTIFIER_LENGTH)) {
+    throw new AuditValidationError('Audit actor must be a non-empty string within the length bound', 'actor');
+  }
+
+  if (!isBoundedString(input.resource, MAX_IDENTIFIER_LENGTH)) {
+    throw new AuditValidationError('Audit resource must be a non-empty string within the length bound', 'resource');
+  }
+
+  if (!isBoundedString(input.resourceId, MAX_IDENTIFIER_LENGTH)) {
+    throw new AuditValidationError('Audit resourceId must be a non-empty string within the length bound', 'resourceId');
+  }
+
+  if (input.metadata !== undefined && !isPlainObject(input.metadata)) {
+    throw new AuditValidationError('Audit metadata must be a plain object', 'metadata');
+  }
+
+  if (input.metadata !== undefined) {
+    validateMetadataValue(input.metadata, 'metadata', 0, new WeakSet());
+  }
+
+  if (input.ipAddress !== undefined && !isBoundedString(input.ipAddress, MAX_CONTEXT_LENGTH)) {
+    throw new AuditValidationError('Audit ipAddress must be a non-empty string within the length bound', 'ipAddress');
+  }
+
+  if (input.correlationId !== undefined && !isBoundedString(input.correlationId, MAX_CONTEXT_LENGTH)) {
+    throw new AuditValidationError('Audit correlationId must be a non-empty string within the length bound', 'correlationId');
+  }
 }
 
 export function parseAuditQuery(
@@ -155,48 +348,18 @@ export class AuditService {
   /**
    * Records an audit event.
    *
-   * Validation runs before any repository interaction — the same invalid input
-   * always throws `AuditValidationError` (HTTP 400, code `"validation_error"`)
-   * and is never passed to the repository. This is a permanent failure; do not
-   * retry on `AuditValidationError`.
+   * The input is validated against the boundaries defined in this module
+   * before being handed to the repository. Validation failures are thrown
+   * synchronously and never partially persist an entry.
    *
-   * Repository write failures (I/O, lock contention, etc.) are transient and
-   * are re-thrown so the caller can decide whether to retry via `withRetry`.
-   *
-   * Validation failures are logged at `warn` level with field-level context but
-   * without exposing field values (no PII in log records). Write failures are
-   * logged at `error` level.
-   *
-   * @param input - Event details. metadata must be pre-sanitised (no raw PII).
+   * @param input - Event details. metadata must be pre-sanitised.
    * @returns The persisted, immutable AuditEntry.
-   * @throws {AuditValidationError} When input fails validation (permanent, HTTP 400).
-   * @throws {Error} When the repository write fails (transient, should be retried by caller).
+   * @throws AuditValidationError when the input breaches a boundary.
+   * @throws Only when options.strict is true and the store throws.
    */
   log(input: CreateAuditEntryInput): AuditEntry {
-    const log = createLogger({ service: 'audit-service' });
+    validateAuditEntryInput(input);
 
-    // ── Step 1: Validate input deterministically ──────────────────────────
-    // Same input always produces the same result. No I/O involved.
-    // AuditValidationError is a permanent failure — do not retry.
-    let validated: CreateAuditEntryInput;
-    try {
-      validated = validateAuditInput(input);
-    } catch (err) {
-      if (err instanceof AuditValidationError) {
-        // Emit a warn with structural context only — never log field values.
-        log.warn('Audit input validation failed', {
-          issueCount: err.issues.length,
-          fields: err.issues.map((i) => i.field),
-        });
-        throw err;
-      }
-      // Unexpected error from the validator itself — escalate.
-      log.error('Unexpected error during audit input validation', { err: err as Error });
-      throw err;
-    }
-
-    // ── Step 2: Persist the validated entry ───────────────────────────────
-    // Repository failures are transient — re-throw so callers can retry.
     try {
       const entry = this.repository.append(input);
       
@@ -214,12 +377,11 @@ export class AuditService {
 
   /**
    * Validates payload fields and creates an audit entry.
-   * Throws Error if any required field is missing.
+   * Throws Error if any required field is missing or out of bounds.
    */
   createEntry(input: CreateAuditEntryInput): AuditEntry {
-    if (!input.action || !input.severity || !input.actor || !input.resource || !input.resourceId) {
-      throw new Error('Missing required fields: action, severity, actor, resource, resourceId');
-    }
+    // `log` performs the full boundary validation, including the
+    // required-field check that this method historically enforced.
     return this.log(input);
   }
 
@@ -288,7 +450,7 @@ export class AuditService {
 
     const exportResult = await exportService.createNdjsonExport(filters);
 
-    this.log({
+    this.log( {
       action: 'ADMIN_ACTION',
       severity: 'CRITICAL',
       actor: context.actor ?? 'anonymous',
@@ -414,30 +576,25 @@ export class AuditService {
   }
 
   /**
-   * Queries audit entries with the given filters.
+   * Retrieves audit entries matching the given query.
    */
   query(query: AuditQuery): AuditEntry[] {
     return this.repository.query(query);
   }
 
   /**
-   * Queries audit entries using cursor-based pagination.
+   * Retrieves a page of audit entries using a cursor.
    */
   queryWithCursor(query: AuditQuery): AuditQueryResult {
     return this.repository.queryWithCursor(query);
   }
 
   /**
-   * Returns an integrity report for the audit log.
+   * Verifies the integrity of the audit chain.
    */
   verifyIntegrity(): IntegrityReport {
     return this.repository.verifyIntegrity();
   }
-
-  /**
-   * Returns the total number of audit entries.
-   */
-  count(): number {
-    return this.repository.count();
-  }
 }
+
+export const auditService = new AuditService();

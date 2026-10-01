@@ -34,6 +34,8 @@
 
 #[no_std]
 
+#[cfg(test)]
+mod batch_operations_tests;
 mod bets;
 mod errors;
 mod storage;

@@ -137,10 +137,7 @@ use soroban_sdk::{Address, Bytes, BytesN, Env, Symbol, Vec};
 
 use crate::{
     errors::Error,
-    storage::{
-        DataKey, CONTRACT_TTL_LEDGERS, CONTRACT_TTL_THRESHOLD_LEDGERS, IDEM_KEY_TTL_LEDGERS,
-        RECEIPT_EXTEND_THRESHOLD_LEDGERS,
-    },
+    storage::{DataKey, IDEM_KEY_TTL_LEDGERS, INSTANCE_TTL_LEDGERS},
 };
 
 /// Maximum number of bets accepted in a single [`place_bets`] call.
@@ -228,15 +225,8 @@ fn validate_bets(bets: &Vec<Bet>) -> Result<(), Error> {
 /// # Errors
 ///
 /// * [`Error::EmptyBatch`] – `bets` is empty.
-/// * [`Error::BatchTooLarge`] – more than [`MAX_BATCH_SIZE`] entries were
-///   supplied.
-/// * [`Error::InvalidBetAmount`] – a bet had `amount <= 0`.
-/// * [`Error::InvalidMarketId`] – a bet had `market_id == 0`.
 /// * [`Error::IdempotentBatchAlreadyApplied`] – the `(caller, idempotency_key)`
 ///   pair has already been consumed.
-///
-/// Validation errors are reported before the idempotency key is consumed, so
-/// a rejected batch never burns the caller's key.
 ///
 /// # Idempotency semantics
 ///
@@ -323,66 +313,51 @@ pub fn place_bets(
 
     if deduplicated {
         let idem_key = DataKey::PlaceBetsIdem(caller.clone(), idempotency_key.clone());
-        let digest_key = DataKey::PlaceBetsDigest(caller.clone(), idempotency_key.clone());
-        let digest = batch_digest(env, &bets);
+        let idem_ledger_key = DataKey::PlaceBetsIdemLedger(caller.clone(), idempotency_key.clone());
+        let now = env.ledger().sequence();
 
-        match env
-            .storage()
-            .temporary()
-            .get::<DataKey, BatchReceipt>(&idem_key)
-        {
-            // A live receipt means this pair was already applied. Tell an
-            // honest duplicate apart from a token collision (I8) so the
-            // caller can tell "retry" from "use a new token".
-            Some(_) => {
-                let previous = env
-                    .storage()
-                    .temporary()
-                    .get::<DataKey, BytesN<32>>(&digest_key);
+        if env.storage().instance().has(&idem_key) {
+            // Instance storage shares the contract instance's TTL entry, so a
+            // consumed key cannot simply be evicted when its own window
+            // elapses: the window has to be enforced in contract code from the
+            // ledger recorded next to the sentinel.
+            let consumed_at = env
+                .storage()
+                .instance()
+                .get::<DataKey, u32>(&idem_ledger_key);
 
-                return Err(match previous {
-                    Some(previous) => {
-                        if previous == digest {
-                            Error::IdempotentBatchAlreadyApplied
-                        } else {
-                            Error::IdempotencyKeyReusedWithDifferentBatch
-                        }
-                    }
-                    // Receipt predates the fingerprint (or the fingerprint
-                    // aged out on its own). Treat it as applied rather
-                    // than as a collision: we cannot prove the batches
-                    // differ, and claiming a conflict we cannot verify
-                    // would be worse than the ambiguity.
-                    None => Error::IdempotentBatchAlreadyApplied,
-                });
-            }
-            None => {
-                // Claim the token *before* the batch is applied. See the
-                // module documentation for why, and for why a later
-                // failure does not burn the token.
-                env.storage().temporary().set(
-                    &idem_key,
-                    &BatchReceipt {
-                        bet_count,
-                        total_amount,
-                        applied_at_ledger: env.ledger().sequence(),
-                    },
-                );
-                env.storage().temporary().extend_ttl(
-                    &idem_key,
-                    RECEIPT_EXTEND_THRESHOLD_LEDGERS,
-                    IDEM_KEY_TTL_LEDGERS,
-                );
+            match consumed_at {
+                // A sentinel with no recorded ledger was written by an older
+                // contract version that stored only `true`. Treat it as a
+                // durable replay guard: an upgrade must never make a token
+                // that was already consumed replayable again.
+                None => return Err(Error::IdempotentBatchAlreadyApplied),
 
-                // Fingerprint of the batch this token was spent on.
-                env.storage().temporary().set(&digest_key, &digest);
-                env.storage().temporary().extend_ttl(
-                    &digest_key,
-                    RECEIPT_EXTEND_THRESHOLD_LEDGERS,
-                    IDEM_KEY_TTL_LEDGERS,
-                );
+                // Still inside the replay window.
+                Some(consumed_at) if now < consumed_at.saturating_add(IDEM_KEY_TTL_LEDGERS) => {
+                    return Err(Error::IdempotentBatchAlreadyApplied)
+                }
+
+                // The window has elapsed: drop the stale sentinel and fall
+                // through so the batch is accepted as a fresh submission.
+                Some(_) => {
+                    env.storage().instance().remove(&idem_key);
+                    env.storage().instance().remove(&idem_ledger_key);
+                }
             }
         }
+
+        // Mark the key as consumed before applying the batch so that
+        // concurrent invocations on the same ledger also fail fast.
+        env.storage().instance().set(&idem_key, &true);
+        env.storage().instance().set(&idem_ledger_key, &now);
+
+        // Keep the *instance* entry alive well past the replay window; using
+        // the idempotency window here would archive the contract at exactly
+        // the moment the newest key expires.
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_TTL_LEDGERS, INSTANCE_TTL_LEDGERS);
     }
     env.storage()
         .instance()

@@ -127,64 +127,43 @@ router.post(
     // `assess()` is a pure read — flushed pre-scrypt, valid post-scrypt.
     const pre = accountLockout.assess(email);
 
-    try {
-      // SECURITY: always run authService.login (constant-time scrypt +
-      // dummy-hash path) regardless of whether the account is currently
-      // locked. Skipping this would create a different timing oracle
-      // that lets an attacker enumerate accounts (locked vs. missing
-      // would respond at conspicuously different latencies).
-      const tokens = await getAuthService().login(email, password);
+    const result = await accountLockout.withLock(email, async () => {
+      try {
+        // SECURITY: always run authService.login (constant-time scrypt +
+        // dummy-hash path) regardless of whether the account is currently
+        // locked. Skipping this would create a different timing oracle
+        // that lets an attacker enumerate accounts (locked vs. missing
+        // would respond at conspicuously different latencies).
+        const tokens = await getAuthService().login(email, password);
 
-      // Re-assess live state after scrypt completes: `pre` was
-      // captured ~100ms ago and the lockout deadline may have lapsed
-      // during the wait. Without this re-check, a user with the
-      // correct password arriving 1ms before lockout-expiry would be
-      // unjustly rejected. We still pad to `pre.preDelayMs` so the
-      // timing surface (from the attacker's perspective) is uniformly
-      // determined by the request's start-of-flight state.
-      const live = accountLockout.assess(email);
+        // Re-assess live state after scrypt completes
+        const live = accountLockout.assess(email);
 
-      if (live.isLocked) {
-        // Lockout still active — honor the policy: suppress token
-        // issuance and return the same uniform `invalid_credentials`
-        // shape. The record is NOT cleared — the next eligible user
-        // login will emit AUTH_LOCKOUT_RELEASED via `recordSuccess`.
-        await padResponseTime(startMs, pre.preDelayMs);
-        return authError(res, 401, 'invalid_credentials', 'Request validation failed');
+        if (live.isLocked) {
+          // Lockout still active
+          return { error: true, status: 401, code: 'invalid_credentials', message: 'Request validation failed', padMs: pre.preDelayMs };
+        }
+
+        accountLockout.recordSuccess(email, lockoutCtx);
+        return { success: true, tokens, padMs: pre.preDelayMs };
+      } catch (err) {
+        const code = (err as NodeJS.ErrnoException).code;
+        if (code !== 'invalid_credentials') {
+          return { error: true, status: 500, code: 'internal_error', message: 'An unexpected error occurred.', padMs: 0 };
+        }
+        const failure = accountLockout.recordFailure(email, lockoutCtx);
+        return { error: true, status: 401, code: 'invalid_credentials', message: 'Request validation failed', padMs: failure.waitMs };
       }
+    });
 
-      // Lockout was cleared between snapshot and now (or never
-      // present) — issue tokens. Padding remains `pre.preDelayMs` so
-      // wall time matches what the request would have taken had the
-      // lockout still been active at the start of the request.
-      // (Note: this is a deliberate security/UX tradeoff — a legit
-      // user who fat-fingers their password N times and then enters
-      // it correctly will wait `computeDelay(N)` ms after the last
-      // failed attempt. The alternative (no success padding) re-
-      // introduces a high-failure timing oracle — see issue #631.)
-      accountLockout.recordSuccess(email, lockoutCtx);
-      await padResponseTime(startMs, pre.preDelayMs);
-      return res.status(200).json(tokens);
-    } catch (err) {
-      const code = (err as NodeJS.ErrnoException).code;
-      if (code !== 'invalid_credentials') {
-        return authError(res, 500, 'internal_error', 'An unexpected error occurred.');
-      }
-      // Apply per-account throttling. recordFailure is a synchronous,
-      // map-only mutation: it may emit AUTH_LOCKOUT_TRIGGERED if this
-      // attempt crossed the threshold (strict equality), or be a no-op
-      // if the account is already locked (the lockout deadline is
-      // deliberately not extended by additional failed attempts during
-      // its window — issue #631).
-      const failure = accountLockout.recordFailure(email, lockoutCtx);
-      // Pad the failure response to the post-throttling waitMs so a
-      // failure of N grows progressively slower across the streak.
-      // When the account is currently locked `failure.waitMs ===
-      // maxDelayMs` and matches the live-locked post-scrypt padding
-      // for the same identity.
-      await padResponseTime(startMs, failure.waitMs);
-      return authError(res, 401, 'invalid_credentials', 'Request validation failed');
+    if (result.padMs > 0) {
+      await padResponseTime(startMs, result.padMs);
     }
+
+    if (result.error) {
+      return authError(res, result.status as number, result.code as string, result.message as string);
+    }
+    return res.status(200).json(result.tokens);
   }
 );
 
@@ -269,26 +248,33 @@ router.post(
         const { email, password } = item.payload;
         const startMs = Date.now();
         const pre = accountLockout.assess(email);
-        try {
-          const tokens = await authService.login(email, password);
-          const live = accountLockout.assess(email);
-          if (live.isLocked) {
-            await padResponseTime(startMs, pre.preDelayMs);
-            results.push({ status: 'error', error: { code: 'invalid_credentials', message: 'Request validation failed' } });
-            continue;
+        const result = await accountLockout.withLock(email, async () => {
+          try {
+            const tokens = await authService.login(email, password);
+            const live = accountLockout.assess(email);
+            if (live.isLocked) {
+              return { error: true, code: 'invalid_credentials', message: 'Request validation failed', padMs: pre.preDelayMs };
+            }
+            accountLockout.recordSuccess(email, lockoutCtx);
+            return { success: true, tokens, padMs: pre.preDelayMs };
+          } catch (err) {
+            const code = (err as NodeJS.ErrnoException).code;
+            if (code !== 'invalid_credentials') {
+              return { error: true, code: 'internal_error', message: 'An unexpected error occurred.', padMs: 0 };
+            }
+            const failure = accountLockout.recordFailure(email, lockoutCtx);
+            return { error: true, code: 'invalid_credentials', message: 'Request validation failed', padMs: failure.waitMs };
           }
-          accountLockout.recordSuccess(email, lockoutCtx);
-          await padResponseTime(startMs, pre.preDelayMs);
-          results.push({ status: 'success', data: tokens });
-        } catch (err) {
-          const code = (err as NodeJS.ErrnoException).code;
-          if (code !== 'invalid_credentials') {
-            results.push({ status: 'error', error: { code: 'internal_error', message: 'An unexpected error occurred.' } });
-            continue;
-          }
-          const failure = accountLockout.recordFailure(email, lockoutCtx);
-          await padResponseTime(startMs, failure.waitMs);
-          results.push({ status: 'error', error: { code: 'invalid_credentials', message: 'Request validation failed' } });
+        });
+
+        if (result.padMs > 0) {
+          await padResponseTime(startMs, result.padMs);
+        }
+
+        if (result.error) {
+          results.push({ status: 'error', error: { code: result.code, message: result.message } });
+        } else {
+          results.push({ status: 'success', data: result.tokens });
         }
       } else if (item.operation === 'register') {
         const { email, password, username, role } = item.payload;

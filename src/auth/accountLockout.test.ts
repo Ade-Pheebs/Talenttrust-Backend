@@ -682,3 +682,82 @@ describe('AccountLockoutTracker — tiny config quick smoke', () => {
     expect(auditCalls.filter((c) => c.action === 'AUTH_LOCKOUT_RELEASED')).toHaveLength(1);
   });
 });
+
+describe('AccountLockoutTracker — concurrent execution', () => {
+  it('serializes concurrent operations using withLock', async () => {
+    const { tracker } = makeTracker();
+    const order: number[] = [];
+    const p1 = tracker.withLock('a@example.com', async () => {
+      order.push(1);
+      await new Promise(r => setTimeout(r, 10));
+      order.push(2);
+    });
+    const p2 = tracker.withLock('a@example.com', async () => {
+      order.push(3);
+      await new Promise(r => setTimeout(r, 10));
+      order.push(4);
+    });
+
+    await Promise.all([p1, p2]);
+    // The second lock should wait for the first lock to fully resolve
+    expect(order).toEqual([1, 2, 3, 4]);
+  });
+
+  it('allows concurrent operations for different identities', async () => {
+    const { tracker } = makeTracker();
+    const order: number[] = [];
+    const p1 = tracker.withLock('a@example.com', async () => {
+      order.push(1);
+      await new Promise(r => setTimeout(r, 20));
+      order.push(2);
+    });
+    const p2 = tracker.withLock('b@example.com', async () => {
+      order.push(3);
+      await new Promise(r => setTimeout(r, 10));
+      order.push(4);
+    });
+
+    await Promise.all([p1, p2]);
+    // They run concurrently, so 1 and 3 happen before 2 and 4. Since p2 is shorter, 4 happens before 2.
+    expect(order).toEqual(expect.arrayContaining([1, 3]));
+    expect(order.indexOf(1)).toBeLessThan(order.indexOf(2));
+    expect(order.indexOf(3)).toBeLessThan(order.indexOf(4));
+    expect(order.indexOf(4)).toBeLessThan(order.indexOf(2));
+  });
+
+  it('safely recovers if the inner function throws', async () => {
+    const { tracker } = makeTracker();
+    let threw = false;
+    try {
+      await tracker.withLock('a@example.com', async () => {
+        throw new Error('sync fail');
+      });
+    } catch {
+      threw = true;
+    }
+    expect(threw).toBe(true);
+
+    // Lock should be released and available for the next call
+    const result = await tracker.withLock('a@example.com', async () => 'recovered');
+    expect(result).toBe('recovered');
+  });
+
+  it('returns immediately without locking if disabled', async () => {
+    const { tracker } = makeTracker({ ...FAST_CONFIG, enabled: false });
+    const order: number[] = [];
+    const p1 = tracker.withLock('a@example.com', async () => {
+      order.push(1);
+      await new Promise(r => setTimeout(r, 20));
+      order.push(2);
+    });
+    const p2 = tracker.withLock('a@example.com', async () => {
+      order.push(3);
+      await new Promise(r => setTimeout(r, 10));
+      order.push(4);
+    });
+
+    await Promise.all([p1, p2]);
+    // If disabled, they run concurrently. p2 finishes before p1.
+    expect(order.indexOf(4)).toBeLessThan(order.indexOf(2));
+  });
+});

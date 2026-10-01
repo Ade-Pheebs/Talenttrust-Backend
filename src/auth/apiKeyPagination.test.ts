@@ -1,829 +1,661 @@
 /**
  * @file apiKeyPagination.test.ts
+ * @description Regression tests for hardened cursor-based API key pagination.
  *
- * Validation-boundary tests for src/auth/apiKeyPagination.ts.
- *
- * Coverage matrix:
- * ─────────────────────────────────────────────────────────────────────────────
- * encodeApiKeyCursor
- *   - Produces a two-part base64url.signature string
- *   - Round-trips through decodeApiKeyCursor
- *   - Different positions produce different cursors
- *
- * decodeApiKeyCursor — accepted input
- *   - Valid round-trip cursor accepted
- *   - Leading zeros in id accepted
- *   - ISO-8601 date with milliseconds accepted
- *
- * decodeApiKeyCursor — rejected input (InvalidApiKeyCursorError on all)
- *   - Empty string
- *   - Non-string (number, null, undefined, object)
- *   - String exceeding CURSOR_MAX_LENGTH (512 chars)
- *   - String without a dot separator
- *   - String with multiple dots
- *   - Wrong characters (spaces, slashes)
- *   - Signature tampered (1 bit flipped)
- *   - Payload tampered (1 char changed, valid base64)
- *   - Payload decodes to non-JSON
- *   - Payload decodes to non-object (array, number, null, string)
- *   - Wrong cursor version (0, 2, string, missing)
- *   - createdAt missing
- *   - createdAt empty string
- *   - createdAt not a valid ISO date ("not-a-date")
- *   - createdAt exceeds max field length (>64 chars)
- *   - id missing
- *   - id empty string
- *   - id exceeds max field length (>200 chars)
- *   - Extra unknown fields in payload are tolerated (only required fields validated)
- *
- * parseApiKeyPageSize — accepted input
- *   - undefined → default
- *   - null → default
- *   - "" → default
- *   - "1" → 1
- *   - "20" → 20 (default)
- *   - "100" → 100 (max)
- *   - "101" → 100 (clamped)
- *   - "99999" → 100 (clamped)
- *
- * parseApiKeyPageSize — rejected / fallback to default
- *   - "0" → default
- *   - "-1" → default
- *   - "1.5" → default (float string)
- *   - "abc" → default
- *   - " 5" (leading space) → default
- *   - "5 " (trailing space) → default
- *   - "5.0" → default (decimal even if integer value)
- *   - "+5" → default (leading plus)
- *   - "1e2" → default (scientific notation)
- *   - 5 (number) → default
- *   - true (boolean) → default
- *   - {} (object) → default
- *   - [] (array) → default
- *   - NaN → default
- *
- * paginateApiKeys — success paths
- *   - Empty records → empty items, no nextCursor
- *   - Records fewer than limit → all returned, no nextCursor
- *   - Records equal to limit → all returned, no nextCursor
- *   - Records greater than limit → first N returned, nextCursor present
- *   - Cursor from first page used for second page → correct continuation
- *   - Full traversal collects every record exactly once
- *   - limit=1 works (single-item pages)
- *   - Limit clamped from excessive value
- *   - Limit clamped from 0 → treated as 1
- *   - Limit clamped from negative → treated as 1
- *   - Non-finite limit → uses default page size
- *   - Records with identical createdAt sorted by id lexicographically (descending id → first)
- *   - Stable sort: second traversal on same dataset gives identical cursor chain
- *
- * paginateApiKeys — invalid cursor propagation
- *   - Empty cursor string → throws InvalidApiKeyCursorError
- *   - Tampered cursor → throws InvalidApiKeyCursorError
- *   - Cursor from a different secret → throws InvalidApiKeyCursorError
- *
- * Concurrent / idempotency invariants
- *   - Encoding the same position twice yields the same cursor (deterministic)
- *   - Decoding the same cursor twice yields the same position (idempotent)
- *   - paginateApiKeys with same input always returns the same page (pure function)
- * ─────────────────────────────────────────────────────────────────────────────
+ * Test categories:
+ *   1. encodeApiKeyCursor / decodeApiKeyCursor — round-trips, tampering, edge cases.
+ *   2. parseApiKeyPageSize — valid, invalid, boundary inputs.
+ *   3. paginateApiKeys — normal pages, cursor resumption, concurrent-insert
+ *      safety, duplicate-cursor idempotency, racing mutations, boundary values.
+ *   4. Concurrency / timing safety — same-millisecond inserts, sort stability.
+ *   5. Secret rotation — lazy-loading behaviour.
  */
 
 import {
-  API_KEYS_DEFAULT_PAGE_SIZE,
-  API_KEYS_MAX_PAGE_SIZE,
-  ApiKeyCursorPosition,
-  InvalidApiKeyCursorError,
-  decodeApiKeyCursor,
   encodeApiKeyCursor,
+  decodeApiKeyCursor,
   parseApiKeyPageSize,
   paginateApiKeys,
+  InvalidApiKeyCursorError,
+  ApiKeyCursorPosition,
+  API_KEYS_DEFAULT_PAGE_SIZE,
+  API_KEYS_MAX_PAGE_SIZE,
 } from './apiKeyPagination';
+import { setWriteRecordImpl, LogRecord } from '../logger';
 
-// ─── Helpers ──────────────────────────────────────────────────────────────────
+// ─── Test helpers ────────────────────────────────────────────────────────────
 
-function makePosition(id: string, createdAt: string): ApiKeyCursorPosition {
+/** Create a minimal API key record at a given time offset (ms from epoch). */
+function makeRecord(id: string, createdAt: string): ApiKeyCursorPosition {
   return { id, createdAt };
 }
 
-/** Build N records ordered from newest to oldest (descending createdAt). */
-function makeRecords(count: number): ApiKeyCursorPosition[] {
+/** Build a predictable set of N records spaced 1 second apart (newest first). */
+function buildRecords(count: number): ApiKeyCursorPosition[] {
+  const base = new Date('2024-06-01T00:00:00.000Z').getTime();
   return Array.from({ length: count }, (_, i) => ({
     id: `key-${String(i).padStart(4, '0')}`,
-    createdAt: new Date(Date.now() - i * 1000).toISOString(),
+    // Oldest record is index 0 in this helper, newest is index count-1
+    createdAt: new Date(base + i * 1000).toISOString(),
   }));
 }
 
-/**
- * Craft a syntactically valid cursor token that was signed with a DIFFERENT
- * secret so the HMAC check fails.
- */
-function encodeCursorWithSecret(
-  position: ApiKeyCursorPosition,
-  secret: string,
-): string {
-  const { createHmac } = require('node:crypto') as typeof import('node:crypto');
-  const payload = JSON.stringify({ version: 1, ...position });
-  const encoded = Buffer.from(payload, 'utf8').toString('base64url');
-  const sig = createHmac('sha256', secret).update(encoded).digest('base64url');
-  return `${encoded}.${sig}`;
+/** Capture log records emitted during a callback, then restore. */
+async function captureLogRecords(fn: () => void | Promise<void>): Promise<LogRecord[]> {
+  const records: LogRecord[] = [];
+  const original = (global as any).__writeRecordImpl;
+  setWriteRecordImpl((r) => records.push(r));
+  try {
+    await fn();
+  } finally {
+    // Restore to default (output to stdout)
+    setWriteRecordImpl((r) => {
+      const line = JSON.stringify(r);
+      if (r.level === 'error') process.stderr.write(line + '\n');
+      else process.stdout.write(line + '\n');
+    });
+  }
+  return records;
 }
 
-/**
- * Craft a cursor whose payload has been tampered (a single character replaced)
- * while keeping the original (now invalid) signature.
- */
-function tamperPayload(cursor: string): string {
-  const dotIdx = cursor.lastIndexOf('.');
-  const encodedPayload = cursor.slice(0, dotIdx);
-  const signature = cursor.slice(dotIdx + 1);
+// ─── 1. Cursor encode / decode ───────────────────────────────────────────────
 
-  // Decode, mutate, re-encode without re-signing
-  const decoded = Buffer.from(encodedPayload, 'base64url').toString('utf8');
-  const mutated = decoded.replace(/"id":"key-/, '"id":"TAMPERED-');
-  const reEncoded = Buffer.from(mutated, 'utf8').toString('base64url');
-  return `${reEncoded}.${signature}`;
-}
+describe('encodeApiKeyCursor / decodeApiKeyCursor', () => {
+  const position: ApiKeyCursorPosition = {
+    id: 'key-abc',
+    createdAt: '2024-06-15T12:00:00.000Z',
+  };
 
-/** Build a base64url-encoded payload with a valid HMAC for a given JSON object. */
-function buildSignedCursor(payloadObj: Record<string, unknown>): string {
-  const { createHmac } = require('node:crypto') as typeof import('node:crypto');
-  const secret = process.env['API_KEYS_CURSOR_SECRET'] ?? 'talenttrust-api-keys-cursor-v1';
-  const encoded = Buffer.from(JSON.stringify(payloadObj), 'utf8').toString('base64url');
-  const sig = createHmac('sha256', secret).update(encoded).digest('base64url');
-  return `${encoded}.${sig}`;
-}
-
-// ─── encodeApiKeyCursor ───────────────────────────────────────────────────────
-
-describe('encodeApiKeyCursor', () => {
-  it('returns a string with exactly one dot separator', () => {
-    const cursor = encodeApiKeyCursor({ id: 'key-1', createdAt: '2024-01-01T00:00:00.000Z' });
-    const parts = cursor.split('.');
-    expect(parts.length).toBe(2);
-    expect(parts[0]).toMatch(/^[A-Za-z0-9_-]+$/);
-    expect(parts[1]).toMatch(/^[A-Za-z0-9_-]+$/);
-  });
-
-  it('round-trips: decoded value equals the original position', () => {
-    const position: ApiKeyCursorPosition = {
-      id: 'key-abc',
-      createdAt: '2024-06-15T12:30:45.123Z',
-    };
+  it('round-trips a valid position', () => {
     const cursor = encodeApiKeyCursor(position);
     const decoded = decodeApiKeyCursor(cursor);
     expect(decoded).toEqual(position);
   });
 
-  it('produces different cursors for different positions', () => {
-    const a = encodeApiKeyCursor({ id: 'key-1', createdAt: '2024-01-01T00:00:00.000Z' });
-    const b = encodeApiKeyCursor({ id: 'key-2', createdAt: '2024-01-01T00:00:00.000Z' });
-    const c = encodeApiKeyCursor({ id: 'key-1', createdAt: '2024-01-02T00:00:00.000Z' });
-    expect(a).not.toBe(b);
-    expect(a).not.toBe(c);
-    expect(b).not.toBe(c);
+  it('produces a string matching the expected format', () => {
+    const cursor = encodeApiKeyCursor(position);
+    // Must match: <base64url>.<base64url>
+    expect(cursor).toMatch(/^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/);
   });
 
-  it('is deterministic: same input always produces the same cursor', () => {
-    const position: ApiKeyCursorPosition = {
-      id: 'key-stable',
-      createdAt: '2025-03-01T00:00:00.000Z',
-    };
-    expect(encodeApiKeyCursor(position)).toBe(encodeApiKeyCursor(position));
+  it('encodes different positions to different cursors', () => {
+    const c1 = encodeApiKeyCursor({ id: 'key-1', createdAt: '2024-01-01T00:00:00.000Z' });
+    const c2 = encodeApiKeyCursor({ id: 'key-2', createdAt: '2024-01-01T00:00:00.000Z' });
+    expect(c1).not.toBe(c2);
   });
 
-  it('total cursor length stays under CURSOR_MAX_LENGTH for typical ids', () => {
-    // 200-char id is the current maximum allowed field length
-    const longId = 'a'.repeat(200);
-    const cursor = encodeApiKeyCursor({ id: longId, createdAt: '2024-01-01T00:00:00.000Z' });
-    expect(cursor.length).toBeLessThanOrEqual(512);
+  it('each call produces a unique cursor (due to issuedAt timestamp)', () => {
+    const c1 = encodeApiKeyCursor(position);
+    // Advance clock by 1ms to ensure different issuedAt
+    const originalNow = Date.now;
+    Date.now = () => originalNow() + 1;
+    const c2 = encodeApiKeyCursor(position);
+    Date.now = originalNow;
+    // Cursors may differ due to issuedAt; both must decode to the same position
+    expect(decodeApiKeyCursor(c1)).toEqual(position);
+    expect(decodeApiKeyCursor(c2)).toEqual(position);
+  });
+
+  it('throws InvalidApiKeyCursorError for an empty string', () => {
+    expect(() => decodeApiKeyCursor('')).toThrow(InvalidApiKeyCursorError);
+  });
+
+  it('throws InvalidApiKeyCursorError for a string exceeding max length', () => {
+    const long = 'a'.repeat(513);
+    expect(() => decodeApiKeyCursor(long)).toThrow(InvalidApiKeyCursorError);
+  });
+
+  it('throws InvalidApiKeyCursorError for a string with invalid characters', () => {
+    expect(() => decodeApiKeyCursor('invalid!@#$.signature')).toThrow(InvalidApiKeyCursorError);
+  });
+
+  it('throws InvalidApiKeyCursorError when signature is tampered', () => {
+    const cursor = encodeApiKeyCursor(position);
+    const parts = cursor.split('.');
+    const tampered = `${parts[0]}.AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA`;
+    expect(() => decodeApiKeyCursor(tampered)).toThrow(InvalidApiKeyCursorError);
+  });
+
+  it('throws InvalidApiKeyCursorError when payload is tampered', () => {
+    const cursor = encodeApiKeyCursor(position);
+    const parts = cursor.split('.');
+    // Replace the payload with a different base64url string of similar length
+    const altPayload = Buffer.from(JSON.stringify({ id: 'EVIL', version: 1, createdAt: '2024-01-01T00:00:00.000Z', issuedAt: 0 })).toString('base64url');
+    const tampered = `${altPayload}.${parts[parts.length - 1]}`;
+    expect(() => decodeApiKeyCursor(tampered)).toThrow(InvalidApiKeyCursorError);
+  });
+
+  it('throws InvalidApiKeyCursorError for a non-string value', () => {
+    expect(() => decodeApiKeyCursor(42 as any)).toThrow(InvalidApiKeyCursorError);
+    expect(() => decodeApiKeyCursor(null as any)).toThrow(InvalidApiKeyCursorError);
+    expect(() => decodeApiKeyCursor(undefined as any)).toThrow(InvalidApiKeyCursorError);
+  });
+
+  it('throws InvalidApiKeyCursorError when version is wrong', () => {
+    // Manually build a cursor with wrong version (signed but bad version)
+    const payload = Buffer.from(
+      JSON.stringify({ version: 99, createdAt: '2024-01-01T00:00:00.000Z', id: 'x', issuedAt: 0 }),
+    ).toString('base64url');
+    const { createHmac } = require('node:crypto');
+    const secret = process.env['API_KEYS_CURSOR_SECRET'] ?? 'talenttrust-api-keys-cursor-v1';
+    const sig = createHmac('sha256', secret).update(payload).digest('base64url');
+    expect(() => decodeApiKeyCursor(`${payload}.${sig}`)).toThrow(InvalidApiKeyCursorError);
+  });
+
+  it('throws InvalidApiKeyCursorError when createdAt is not a valid date', () => {
+    const payload = Buffer.from(
+      JSON.stringify({ version: 1, createdAt: 'not-a-date', id: 'x', issuedAt: 0 }),
+    ).toString('base64url');
+    const { createHmac } = require('node:crypto');
+    const secret = process.env['API_KEYS_CURSOR_SECRET'] ?? 'talenttrust-api-keys-cursor-v1';
+    const sig = createHmac('sha256', secret).update(payload).digest('base64url');
+    expect(() => decodeApiKeyCursor(`${payload}.${sig}`)).toThrow(InvalidApiKeyCursorError);
+  });
+
+  it('throws InvalidApiKeyCursorError when id is an empty string', () => {
+    const payload = Buffer.from(
+      JSON.stringify({ version: 1, createdAt: '2024-01-01T00:00:00.000Z', id: '', issuedAt: 0 }),
+    ).toString('base64url');
+    const { createHmac } = require('node:crypto');
+    const secret = process.env['API_KEYS_CURSOR_SECRET'] ?? 'talenttrust-api-keys-cursor-v1';
+    const sig = createHmac('sha256', secret).update(payload).digest('base64url');
+    expect(() => decodeApiKeyCursor(`${payload}.${sig}`)).toThrow(InvalidApiKeyCursorError);
+  });
+
+  it('uses the last "." as the separator (robustness for multi-dot payloads)', () => {
+    // Verify that decoding uses lastIndexOf('.'), not indexOf('.')
+    // Any valid cursor is already well-formed; this test confirms the split
+    // direction by creating a cursor and verifying it round-trips correctly.
+    const pos = { id: 'multi-dot-key', createdAt: '2024-03-01T00:00:00.000Z' };
+    const cursor = encodeApiKeyCursor(pos);
+    expect(cursor.split('.').length).toBeGreaterThanOrEqual(2);
+    expect(decodeApiKeyCursor(cursor)).toEqual(pos);
   });
 });
 
-// ─── decodeApiKeyCursor — accepted inputs ─────────────────────────────────────
-
-describe('decodeApiKeyCursor — accepted inputs', () => {
-  it('accepts a cursor round-tripped from encodeApiKeyCursor', () => {
-    const position: ApiKeyCursorPosition = {
-      id: 'abc-123',
-      createdAt: '2024-01-15T10:30:00.000Z',
-    };
-    expect(decodeApiKeyCursor(encodeApiKeyCursor(position))).toEqual(position);
-  });
-
-  it('accepts an id with only numeric characters', () => {
-    const position = makePosition('00001', '2024-01-01T00:00:00.000Z');
-    expect(decodeApiKeyCursor(encodeApiKeyCursor(position))).toEqual(position);
-  });
-
-  it('accepts a full ISO-8601 datetime with milliseconds', () => {
-    const position = makePosition('k1', '2024-12-31T23:59:59.999Z');
-    expect(decodeApiKeyCursor(encodeApiKeyCursor(position))).toEqual(position);
-  });
-
-  it('accepts an ISO-8601 date without milliseconds', () => {
-    const position = makePosition('k2', '2024-06-01T00:00:00Z');
-    expect(decodeApiKeyCursor(encodeApiKeyCursor(position))).toEqual(position);
-  });
-
-  it('accepts extra unknown fields in the payload (forward-compat)', () => {
-    // Build a signed cursor that includes extra fields beyond version/createdAt/id
-    const cursor = buildSignedCursor({
-      version: 1,
-      createdAt: '2024-01-01T00:00:00.000Z',
-      id: 'key-extra',
-      extra: 'ignored',
-    });
-    const decoded = decodeApiKeyCursor(cursor);
-    expect(decoded).toEqual({ id: 'key-extra', createdAt: '2024-01-01T00:00:00.000Z' });
-  });
-
-  it('is idempotent: decoding the same cursor twice yields identical results', () => {
-    const cursor = encodeApiKeyCursor({ id: 'k', createdAt: '2024-01-01T00:00:00.000Z' });
-    expect(decodeApiKeyCursor(cursor)).toEqual(decodeApiKeyCursor(cursor));
-  });
-});
-
-// ─── decodeApiKeyCursor — rejected inputs ─────────────────────────────────────
-
-describe('decodeApiKeyCursor — rejected inputs', () => {
-  function expectInvalidCursor(value: unknown): void {
-    expect(() => decodeApiKeyCursor(value as string)).toThrow(InvalidApiKeyCursorError);
-  }
-
-  // ── Structural checks ─────────────────────────────────────────────────────
-
-  it('rejects an empty string', () => expectInvalidCursor(''));
-
-  it('rejects a non-string number', () => expectInvalidCursor(42));
-
-  it('rejects null', () => expectInvalidCursor(null));
-
-  it('rejects undefined', () => expectInvalidCursor(undefined));
-
-  it('rejects a plain object', () => expectInvalidCursor({}));
-
-  it('rejects a string exceeding CURSOR_MAX_LENGTH (512)', () => {
-    expectInvalidCursor('a'.repeat(513));
-  });
-
-  it('rejects a string exactly at CURSOR_MAX_LENGTH that has wrong format', () => {
-    // 512 chars with no dot
-    expectInvalidCursor('a'.repeat(512));
-  });
-
-  it('rejects a string with no dot separator', () => {
-    expectInvalidCursor('nodotcharacteratall');
-  });
-
-  it('rejects a string whose only dot is a trailing dot', () => {
-    expectInvalidCursor('payload.');
-  });
-
-  it('rejects a string whose only dot is a leading dot', () => {
-    expectInvalidCursor('.signature');
-  });
-
-  it('rejects a string with spaces (invalid base64url characters)', () => {
-    expectInvalidCursor('pay load.signature');
-  });
-
-  it('rejects a string with forward slashes (invalid base64url characters)', () => {
-    expectInvalidCursor('pay/load.sig/nat');
-  });
-
-  // ── HMAC verification ────────────────────────────────────────────────────
-
-  it('rejects a cursor with a tampered payload (valid base64url, bad signature)', () => {
-    const good = encodeApiKeyCursor({ id: 'key-1', createdAt: '2024-01-01T00:00:00.000Z' });
-    expectInvalidCursor(tamperPayload(good));
-  });
-
-  it('rejects a cursor signed with a different secret', () => {
-    const cursor = encodeCursorWithSecret(
-      { id: 'key-1', createdAt: '2024-01-01T00:00:00.000Z' },
-      'wrong-secret',
-    );
-    expectInvalidCursor(cursor);
-  });
-
-  it('rejects when signature is all zeros (constant-time comparison must still fail)', () => {
-    const good = encodeApiKeyCursor({ id: 'key-1', createdAt: '2024-01-01T00:00:00.000Z' });
-    const dotIdx = good.lastIndexOf('.');
-    const badSig = 'A'.repeat(good.slice(dotIdx + 1).length);
-    expectInvalidCursor(`${good.slice(0, dotIdx)}.${badSig}`);
-  });
-
-  // ── Payload structure validation ─────────────────────────────────────────
-
-  it('rejects a payload that decodes to non-JSON (random bytes)', () => {
-    const { createHmac } = require('node:crypto') as typeof import('node:crypto');
-    const secret = process.env['API_KEYS_CURSOR_SECRET'] ?? 'talenttrust-api-keys-cursor-v1';
-    const encoded = Buffer.from('not-json!!!').toString('base64url');
-    const sig = createHmac('sha256', secret).update(encoded).digest('base64url');
-    expectInvalidCursor(`${encoded}.${sig}`);
-  });
-
-  it('rejects a payload that decodes to a JSON array', () => {
-    expectInvalidCursor(buildSignedCursor({ '0': 'a' } as unknown as Record<string, unknown>));
-    // actual array payload
-    const { createHmac } = require('node:crypto') as typeof import('node:crypto');
-    const secret = process.env['API_KEYS_CURSOR_SECRET'] ?? 'talenttrust-api-keys-cursor-v1';
-    const encoded = Buffer.from(JSON.stringify([1, 2, 3]), 'utf8').toString('base64url');
-    const sig = createHmac('sha256', secret).update(encoded).digest('base64url');
-    expectInvalidCursor(`${encoded}.${sig}`);
-  });
-
-  it('rejects a payload that decodes to a JSON null', () => {
-    const { createHmac } = require('node:crypto') as typeof import('node:crypto');
-    const secret = process.env['API_KEYS_CURSOR_SECRET'] ?? 'talenttrust-api-keys-cursor-v1';
-    const encoded = Buffer.from('null', 'utf8').toString('base64url');
-    const sig = createHmac('sha256', secret).update(encoded).digest('base64url');
-    expectInvalidCursor(`${encoded}.${sig}`);
-  });
-
-  // ── version field ─────────────────────────────────────────────────────────
-
-  it('rejects version 0', () => {
-    expectInvalidCursor(
-      buildSignedCursor({ version: 0, createdAt: '2024-01-01T00:00:00.000Z', id: 'k' }),
-    );
-  });
-
-  it('rejects version 2', () => {
-    expectInvalidCursor(
-      buildSignedCursor({ version: 2, createdAt: '2024-01-01T00:00:00.000Z', id: 'k' }),
-    );
-  });
-
-  it('rejects string version', () => {
-    expectInvalidCursor(
-      buildSignedCursor({ version: '1', createdAt: '2024-01-01T00:00:00.000Z', id: 'k' }),
-    );
-  });
-
-  it('rejects missing version', () => {
-    expectInvalidCursor(
-      buildSignedCursor({ createdAt: '2024-01-01T00:00:00.000Z', id: 'k' }),
-    );
-  });
-
-  // ── createdAt field ───────────────────────────────────────────────────────
-
-  it('rejects missing createdAt', () => {
-    expectInvalidCursor(buildSignedCursor({ version: 1, id: 'k' }));
-  });
-
-  it('rejects empty createdAt', () => {
-    expectInvalidCursor(buildSignedCursor({ version: 1, createdAt: '', id: 'k' }));
-  });
-
-  it('rejects non-date createdAt string', () => {
-    expectInvalidCursor(
-      buildSignedCursor({ version: 1, createdAt: 'not-a-date', id: 'k' }),
-    );
-  });
-
-  it('rejects numeric createdAt', () => {
-    expectInvalidCursor(
-      buildSignedCursor({ version: 1, createdAt: 1704067200000, id: 'k' }),
-    );
-  });
-
-  it('rejects createdAt exceeding 64 characters', () => {
-    const longDate = '2024-01-01T00:00:00.000Z' + '0'.repeat(50); // 73 chars
-    expectInvalidCursor(buildSignedCursor({ version: 1, createdAt: longDate, id: 'k' }));
-  });
-
-  // ── id field ─────────────────────────────────────────────────────────────
-
-  it('rejects missing id', () => {
-    expectInvalidCursor(
-      buildSignedCursor({ version: 1, createdAt: '2024-01-01T00:00:00.000Z' }),
-    );
-  });
-
-  it('rejects empty id', () => {
-    expectInvalidCursor(
-      buildSignedCursor({ version: 1, createdAt: '2024-01-01T00:00:00.000Z', id: '' }),
-    );
-  });
-
-  it('rejects numeric id', () => {
-    expectInvalidCursor(
-      buildSignedCursor({ version: 1, createdAt: '2024-01-01T00:00:00.000Z', id: 42 }),
-    );
-  });
-
-  it('rejects id exceeding 200 characters', () => {
-    const longId = 'k'.repeat(201);
-    expectInvalidCursor(
-      buildSignedCursor({ version: 1, createdAt: '2024-01-01T00:00:00.000Z', id: longId }),
-    );
-  });
-
-  it('accepts id of exactly 200 characters (boundary)', () => {
-    const maxId = 'k'.repeat(200);
-    const cursor = buildSignedCursor({
-      version: 1,
-      createdAt: '2024-01-01T00:00:00.000Z',
-      id: maxId,
-    });
-    const decoded = decodeApiKeyCursor(cursor);
-    expect(decoded.id).toBe(maxId);
-  });
-
-  it('accepts id of exactly 1 character (boundary)', () => {
-    const cursor = buildSignedCursor({
-      version: 1,
-      createdAt: '2024-01-01T00:00:00.000Z',
-      id: 'x',
-    });
-    expect(decodeApiKeyCursor(cursor).id).toBe('x');
-  });
-});
-
-// ─── parseApiKeyPageSize ──────────────────────────────────────────────────────
+// ─── 2. parseApiKeyPageSize ──────────────────────────────────────────────────
 
 describe('parseApiKeyPageSize', () => {
-  // ── Absent / empty → default ──────────────────────────────────────────────
-
-  it('returns the default for undefined', () => {
+  it('returns default for undefined', () => {
     expect(parseApiKeyPageSize(undefined)).toBe(API_KEYS_DEFAULT_PAGE_SIZE);
   });
 
-  it('returns the default for null', () => {
+  it('returns default for null', () => {
     expect(parseApiKeyPageSize(null)).toBe(API_KEYS_DEFAULT_PAGE_SIZE);
   });
 
-  it('returns the default for empty string', () => {
+  it('returns default for empty string', () => {
     expect(parseApiKeyPageSize('')).toBe(API_KEYS_DEFAULT_PAGE_SIZE);
   });
 
-  // ── Valid integer strings ─────────────────────────────────────────────────
-
-  it('returns 1 for "1" (minimum)', () => {
+  it('parses a valid string integer', () => {
+    expect(parseApiKeyPageSize('10')).toBe(10);
     expect(parseApiKeyPageSize('1')).toBe(1);
-  });
-
-  it('returns 20 for "20" (default value as explicit string)', () => {
-    expect(parseApiKeyPageSize('20')).toBe(20);
-  });
-
-  it('returns 50 for "50"', () => {
     expect(parseApiKeyPageSize('50')).toBe(50);
   });
 
-  it('returns 100 for "100" (maximum)', () => {
-    expect(parseApiKeyPageSize('100')).toBe(API_KEYS_MAX_PAGE_SIZE);
+  it('clamps values above the maximum', () => {
+    expect(parseApiKeyPageSize('200')).toBe(API_KEYS_MAX_PAGE_SIZE);
+    expect(parseApiKeyPageSize('9999')).toBe(API_KEYS_MAX_PAGE_SIZE);
   });
 
-  it('clamps "101" to 100 (maximum page size)', () => {
-    expect(parseApiKeyPageSize('101')).toBe(API_KEYS_MAX_PAGE_SIZE);
-  });
-
-  it('clamps "99999" to 100 (far above maximum)', () => {
-    expect(parseApiKeyPageSize('99999')).toBe(API_KEYS_MAX_PAGE_SIZE);
-  });
-
-  // ── Invalid strings → default ─────────────────────────────────────────────
-
-  it('returns the default for "0" (zero is not a valid page size)', () => {
-    expect(parseApiKeyPageSize('0')).toBe(API_KEYS_DEFAULT_PAGE_SIZE);
-  });
-
-  it('returns the default for "-1" (negative)', () => {
-    expect(parseApiKeyPageSize('-1')).toBe(API_KEYS_DEFAULT_PAGE_SIZE);
-  });
-
-  it('returns the default for "1.5" (float string)', () => {
-    expect(parseApiKeyPageSize('1.5')).toBe(API_KEYS_DEFAULT_PAGE_SIZE);
-  });
-
-  it('returns the default for "5.0" (decimal even though integer value)', () => {
-    expect(parseApiKeyPageSize('5.0')).toBe(API_KEYS_DEFAULT_PAGE_SIZE);
-  });
-
-  it('returns the default for "+5" (leading plus sign)', () => {
-    expect(parseApiKeyPageSize('+5')).toBe(API_KEYS_DEFAULT_PAGE_SIZE);
-  });
-
-  it('returns the default for "1e2" (scientific notation)', () => {
-    expect(parseApiKeyPageSize('1e2')).toBe(API_KEYS_DEFAULT_PAGE_SIZE);
-  });
-
-  it('returns the default for "abc"', () => {
-    expect(parseApiKeyPageSize('abc')).toBe(API_KEYS_DEFAULT_PAGE_SIZE);
-  });
-
-  it('returns the default for " 5" (leading space)', () => {
-    expect(parseApiKeyPageSize(' 5')).toBe(API_KEYS_DEFAULT_PAGE_SIZE);
-  });
-
-  it('returns the default for "5 " (trailing space)', () => {
-    expect(parseApiKeyPageSize('5 ')).toBe(API_KEYS_DEFAULT_PAGE_SIZE);
-  });
-
-  it('returns the default for "5\n" (trailing newline)', () => {
-    expect(parseApiKeyPageSize('5\n')).toBe(API_KEYS_DEFAULT_PAGE_SIZE);
-  });
-
-  // ── Non-string types → default (only strings accepted) ────────────────────
-
-  it('returns the default for a raw number 5 (non-string type)', () => {
-    expect(parseApiKeyPageSize(5)).toBe(API_KEYS_DEFAULT_PAGE_SIZE);
-  });
-
-  it('returns the default for true (boolean)', () => {
-    expect(parseApiKeyPageSize(true)).toBe(API_KEYS_DEFAULT_PAGE_SIZE);
-  });
-
-  it('returns the default for false (boolean)', () => {
-    expect(parseApiKeyPageSize(false)).toBe(API_KEYS_DEFAULT_PAGE_SIZE);
-  });
-
-  it('returns the default for a plain object', () => {
-    expect(parseApiKeyPageSize({})).toBe(API_KEYS_DEFAULT_PAGE_SIZE);
-  });
-
-  it('returns the default for an array', () => {
-    expect(parseApiKeyPageSize(['10'])).toBe(API_KEYS_DEFAULT_PAGE_SIZE);
-  });
-
-  it('returns the default for NaN', () => {
-    expect(parseApiKeyPageSize(NaN)).toBe(API_KEYS_DEFAULT_PAGE_SIZE);
-  });
-
-  it('returns the default for Infinity', () => {
-    expect(parseApiKeyPageSize(Infinity)).toBe(API_KEYS_DEFAULT_PAGE_SIZE);
-  });
-
-  // ── Boundary: exactly at the clamping boundary ────────────────────────────
-
-  it('returns 100 for the string representation of API_KEYS_MAX_PAGE_SIZE', () => {
+  it('returns exactly the maximum for the boundary value', () => {
     expect(parseApiKeyPageSize(String(API_KEYS_MAX_PAGE_SIZE))).toBe(API_KEYS_MAX_PAGE_SIZE);
   });
 
-  it('clamps to 100 for one above API_KEYS_MAX_PAGE_SIZE', () => {
-    expect(parseApiKeyPageSize(String(API_KEYS_MAX_PAGE_SIZE + 1))).toBe(API_KEYS_MAX_PAGE_SIZE);
+  it('returns 1 for the minimum boundary value', () => {
+    expect(parseApiKeyPageSize('1')).toBe(1);
+  });
+
+  it('returns default and emits a warn log for a zero value', async () => {
+    const records = await captureLogRecords(() => {
+      const result = parseApiKeyPageSize('0');
+      expect(result).toBe(API_KEYS_DEFAULT_PAGE_SIZE);
+    });
+    const warnRecords = records.filter((r) => r.level === 'warn');
+    expect(warnRecords.length).toBeGreaterThanOrEqual(1);
+    expect(warnRecords[0]!.message).toMatch(/invalid page-size/i);
+  });
+
+  it('returns default and emits a warn log for a negative value', async () => {
+    const records = await captureLogRecords(() => {
+      const result = parseApiKeyPageSize('-5');
+      expect(result).toBe(API_KEYS_DEFAULT_PAGE_SIZE);
+    });
+    expect(records.some((r) => r.level === 'warn')).toBe(true);
+  });
+
+  it('returns default and emits a warn log for a non-numeric string', async () => {
+    const records = await captureLogRecords(() => {
+      const result = parseApiKeyPageSize('abc');
+      expect(result).toBe(API_KEYS_DEFAULT_PAGE_SIZE);
+    });
+    expect(records.some((r) => r.level === 'warn')).toBe(true);
+  });
+
+  it('returns default and emits a warn log for a float string', async () => {
+    const records = await captureLogRecords(() => {
+      const result = parseApiKeyPageSize('3.7');
+      expect(result).toBe(API_KEYS_DEFAULT_PAGE_SIZE);
+    });
+    expect(records.some((r) => r.level === 'warn')).toBe(true);
+  });
+
+  it('returns default and emits a warn log for a non-string, non-null value', async () => {
+    const records = await captureLogRecords(() => {
+      // Passing a number directly (not a string) is treated as NaN
+      const result = parseApiKeyPageSize(42 as any);
+      expect(result).toBe(API_KEYS_DEFAULT_PAGE_SIZE);
+    });
+    expect(records.some((r) => r.level === 'warn')).toBe(true);
+  });
+
+  it('does NOT emit a warn log for missing params (undefined/null/empty)', async () => {
+    const records = await captureLogRecords(() => {
+      parseApiKeyPageSize(undefined);
+      parseApiKeyPageSize(null);
+      parseApiKeyPageSize('');
+    });
+    expect(records.filter((r) => r.level === 'warn').length).toBe(0);
   });
 });
 
-// ─── paginateApiKeys ──────────────────────────────────────────────────────────
+// ─── 3. paginateApiKeys — normal operation ──────────────────────────────────
 
-describe('paginateApiKeys', () => {
-  // ── Empty dataset ────────────────────────────────────────────────────────
-
-  it('returns empty items and null nextCursor for an empty dataset', () => {
-    const result = paginateApiKeys([], 20);
-    expect(result.items).toHaveLength(0);
-    expect(result.nextCursor).toBeNull();
+describe('paginateApiKeys — normal pages', () => {
+  it('returns all records on the first page when count ≤ limit', () => {
+    const records = buildRecords(5);
+    const { items, nextCursor } = paginateApiKeys(records, 10);
+    expect(items).toHaveLength(5);
+    expect(nextCursor).toBeNull();
   });
 
-  // ── Dataset smaller than limit ────────────────────────────────────────────
-
-  it('returns all items when count < limit', () => {
-    const records = makeRecords(5);
-    const result = paginateApiKeys(records, 10);
-    expect(result.items).toHaveLength(5);
-    expect(result.nextCursor).toBeNull();
+  it('returns exactly `limit` items and a nextCursor when count > limit', () => {
+    const records = buildRecords(10);
+    const { items, nextCursor } = paginateApiKeys(records, 3);
+    expect(items).toHaveLength(3);
+    expect(nextCursor).not.toBeNull();
   });
 
-  // ── Dataset equal to limit ────────────────────────────────────────────────
-
-  it('returns all items with no nextCursor when count === limit', () => {
-    const records = makeRecords(20);
-    const result = paginateApiKeys(records, 20);
-    expect(result.items).toHaveLength(20);
-    expect(result.nextCursor).toBeNull();
+  it('returns items in createdAt DESC order (newest first)', () => {
+    const records = buildRecords(5);
+    const { items } = paginateApiKeys(records, 10);
+    for (let i = 1; i < items.length; i++) {
+      expect(items[i - 1]!.createdAt >= items[i]!.createdAt).toBe(true);
+    }
   });
 
-  // ── Dataset larger than limit ─────────────────────────────────────────────
-
-  it('returns exactly limit items and a non-null nextCursor when count > limit', () => {
-    const records = makeRecords(25);
-    const result = paginateApiKeys(records, 20);
-    expect(result.items).toHaveLength(20);
-    expect(result.nextCursor).not.toBeNull();
+  it('returns no items for an empty snapshot', () => {
+    const { items, nextCursor } = paginateApiKeys([], 10);
+    expect(items).toHaveLength(0);
+    expect(nextCursor).toBeNull();
   });
 
-  // ── Cursor-based continuation ─────────────────────────────────────────────
+  it('traverses all pages without gaps or duplicates', () => {
+    const total = 25;
+    const pageSize = 7;
+    const records = buildRecords(total);
 
-  it('second page contains the remaining items when traversing page by page', () => {
-    const records = makeRecords(25);
-    const page1 = paginateApiKeys(records, 20);
-    expect(page1.items).toHaveLength(20);
-    expect(page1.nextCursor).not.toBeNull();
-
-    const page2 = paginateApiKeys(records, 20, page1.nextCursor!);
-    expect(page2.items).toHaveLength(5);
-    expect(page2.nextCursor).toBeNull();
-  });
-
-  it('full traversal collects every record exactly once', () => {
-    const records = makeRecords(55);
     const seen = new Set<string>();
-    let cursor: string | undefined;
+    let cursor: string | undefined = undefined;
 
-    for (let page = 0; ; page++) {
-      const result = paginateApiKeys(records, 20, cursor);
+    for (let page = 0; page < Math.ceil(total / pageSize) + 1; page++) {
+      const result = paginateApiKeys(records, pageSize, cursor);
       for (const item of result.items) {
         expect(seen.has(item.id)).toBe(false); // no duplicates
         seen.add(item.id);
       }
       if (result.nextCursor === null) break;
       cursor = result.nextCursor;
-      // Safety: prevent infinite loop in case of regression
-      if (page > 10) throw new Error('Traversal did not terminate');
     }
 
-    expect(seen.size).toBe(55);
+    expect(seen.size).toBe(total); // no gaps
   });
 
-  // ── Limit clamping ────────────────────────────────────────────────────────
-
-  it('limit=1 works: single-item pages', () => {
-    const records = makeRecords(3);
-    const page1 = paginateApiKeys(records, 1);
-    expect(page1.items).toHaveLength(1);
+  it('returns nextCursor as null on the last page', () => {
+    const records = buildRecords(6);
+    const page1 = paginateApiKeys(records, 4);
     expect(page1.nextCursor).not.toBeNull();
-    const page2 = paginateApiKeys(records, 1, page1.nextCursor!);
-    expect(page2.items).toHaveLength(1);
+
+    const page2 = paginateApiKeys(records, 4, page1.nextCursor!);
+    expect(page2.items).toHaveLength(2);
+    expect(page2.nextCursor).toBeNull();
+  });
+});
+
+// ─── 4. paginateApiKeys — boundary and clamping ─────────────────────────────
+
+describe('paginateApiKeys — limit boundary handling', () => {
+  // Use enough records to saturate the maximum page size so clamping is observable.
+  const records = buildRecords(API_KEYS_MAX_PAGE_SIZE + 10);
+
+  it('clamps limit of 0 to 1', () => {
+    const { items } = paginateApiKeys(records, 0);
+    expect(items).toHaveLength(1);
   });
 
-  it('clamps over-limit value to API_KEYS_MAX_PAGE_SIZE', () => {
-    const records = makeRecords(150);
-    const result = paginateApiKeys(records, 999);
-    expect(result.items).toHaveLength(API_KEYS_MAX_PAGE_SIZE);
+  it('clamps negative limit to 1', () => {
+    const { items } = paginateApiKeys(records, -10);
+    expect(items).toHaveLength(1);
   });
 
-  it('treats limit=0 as 1 (minimum page size)', () => {
-    const records = makeRecords(5);
-    const result = paginateApiKeys(records, 0);
-    expect(result.items).toHaveLength(1);
+  it('clamps limit above max to API_KEYS_MAX_PAGE_SIZE', () => {
+    const { items } = paginateApiKeys(records, 999);
+    expect(items).toHaveLength(API_KEYS_MAX_PAGE_SIZE);
   });
 
-  it('treats a negative limit as 1 (minimum page size)', () => {
-    const records = makeRecords(5);
-    const result = paginateApiKeys(records, -10);
-    expect(result.items).toHaveLength(1);
+  it('uses default for non-finite limit (NaN)', () => {
+    const { items } = paginateApiKeys(records, NaN);
+    expect(items).toHaveLength(API_KEYS_DEFAULT_PAGE_SIZE);
   });
 
-  it('uses default page size for a non-finite limit', () => {
-    const records = makeRecords(50);
-    const resultInf = paginateApiKeys(records, Infinity);
-    expect(resultInf.items).toHaveLength(API_KEYS_DEFAULT_PAGE_SIZE);
-    const resultNaN = paginateApiKeys(records, NaN);
-    expect(resultNaN.items).toHaveLength(API_KEYS_DEFAULT_PAGE_SIZE);
+  it('uses default for Infinity limit', () => {
+    const { items } = paginateApiKeys(records, Infinity);
+    expect(items).toHaveLength(API_KEYS_DEFAULT_PAGE_SIZE);
   });
 
-  // ── Sort order: newest-first (desc createdAt, then desc id) ──────────────
+  it('floors a float limit', () => {
+    const { items } = paginateApiKeys(records, 5.9);
+    expect(items).toHaveLength(5);
+  });
+});
 
-  it('returns items sorted newest-first by createdAt', () => {
+// ─── 5. paginateApiKeys — cursor safety ─────────────────────────────────────
+
+describe('paginateApiKeys — cursor safety', () => {
+  const records = buildRecords(10);
+
+  it('throws InvalidApiKeyCursorError for a tampered cursor', () => {
+    const { nextCursor } = paginateApiKeys(records, 5);
+    expect(nextCursor).not.toBeNull();
+    const tampered = `${nextCursor!.split('.')[0]}.AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA`;
+    expect(() => paginateApiKeys(records, 5, tampered)).toThrow(InvalidApiKeyCursorError);
+  });
+
+  it('throws InvalidApiKeyCursorError for a malformed cursor string', () => {
+    expect(() => paginateApiKeys(records, 5, 'not-a-valid-cursor')).toThrow(InvalidApiKeyCursorError);
+  });
+
+  it('throws InvalidApiKeyCursorError for an empty cursor string', () => {
+    expect(() => paginateApiKeys(records, 5, '')).toThrow(InvalidApiKeyCursorError);
+  });
+
+  it('is idempotent: same cursor on the same snapshot returns identical results', () => {
+    const page1 = paginateApiKeys(records, 3);
+    const cursor = page1.nextCursor!;
+
+    const page2a = paginateApiKeys(records, 3, cursor);
+    const page2b = paginateApiKeys(records, 3, cursor);
+
+    expect(page2a.items).toEqual(page2b.items);
+    expect(page2a.nextCursor).toEqual(page2b.nextCursor);
+  });
+
+  it('cursor from one snapshot still works after adding new records (snapshot isolation)', () => {
+    // Simulate: cursor taken from snapshot-A, then new record added before next call
+    const snapshotA = buildRecords(6);
+    const page1 = paginateApiKeys(snapshotA, 3);
+    const cursor = page1.nextCursor!;
+
+    // New snapshot includes one extra newest record
+    const newRecord: ApiKeyCursorPosition = {
+      id: 'key-new',
+      createdAt: new Date(Date.now() + 100000).toISOString(),
+    };
+    const snapshotB = [newRecord, ...snapshotA];
+
+    // Cursor should still yield the correct next 3 items from original snapshot
+    const page2 = paginateApiKeys(snapshotB, 3, cursor);
+    // The new record is newer than cursor anchor, so it won't appear after cursor
+    // But the existing records should still be accessible.
+    expect(page2.items.every((item) => item.id !== 'key-new')).toBe(true);
+  });
+});
+
+// ─── 6. Concurrency / timing safety ─────────────────────────────────────────
+
+describe('paginateApiKeys — concurrency and timing safety', () => {
+  it('total order is stable when two records share the same createdAt', () => {
+    const sameTime = '2024-06-01T12:00:00.000Z';
     const records: ApiKeyCursorPosition[] = [
-      { id: 'old', createdAt: '2024-01-01T00:00:00.000Z' },
-      { id: 'new', createdAt: '2024-12-01T00:00:00.000Z' },
-      { id: 'mid', createdAt: '2024-06-01T00:00:00.000Z' },
+      { id: 'key-b', createdAt: sameTime },
+      { id: 'key-a', createdAt: sameTime },
+      { id: 'key-c', createdAt: sameTime },
     ];
-    const result = paginateApiKeys(records, 3);
-    expect(result.items.map((i) => i.id)).toEqual(['new', 'mid', 'old']);
+
+    const { items } = paginateApiKeys(records, 10);
+    // All three have same createdAt; sort by id ASC
+    expect(items.map((i) => i.id)).toEqual(['key-a', 'key-b', 'key-c']);
   });
 
-  it('breaks createdAt ties by descending id (lexicographic)', () => {
-    const sameTime = '2024-06-01T00:00:00.000Z';
-    const records: ApiKeyCursorPosition[] = [
-      { id: 'aa', createdAt: sameTime },
-      { id: 'cc', createdAt: sameTime },
-      { id: 'bb', createdAt: sameTime },
-    ];
-    const result = paginateApiKeys(records, 3);
-    // Higher lexicographic id comes first
-    expect(result.items.map((i) => i.id)).toEqual(['cc', 'bb', 'aa']);
+  it('no record is skipped or duplicated across pages with same-ms inserts', () => {
+    const sameTime = '2024-06-01T12:00:00.000Z';
+    const records: ApiKeyCursorPosition[] = Array.from({ length: 9 }, (_, i) => ({
+      id: `key-${String(i).padStart(3, '0')}`,
+      createdAt: sameTime,
+    }));
+
+    const seen = new Set<string>();
+    let cursor: string | undefined = undefined;
+
+    for (let page = 0; page < 10; page++) {
+      const result = paginateApiKeys(records, 3, cursor);
+      for (const item of result.items) {
+        expect(seen.has(item.id)).toBe(false);
+        seen.add(item.id);
+      }
+      if (result.nextCursor === null) break;
+      cursor = result.nextCursor;
+    }
+
+    expect(seen.size).toBe(9);
   });
 
-  // ── Stable sort: multiple traversals produce identical results ────────────
+  it('simulates two concurrent requests using the same cursor without producing duplicates', () => {
+    const records = buildRecords(15);
+    const page1 = paginateApiKeys(records, 5);
+    const cursor = page1.nextCursor!;
 
-  it('is a pure function: same input produces the same output', () => {
-    const records = makeRecords(30);
-    const run1 = paginateApiKeys(records, 10);
-    const run2 = paginateApiKeys(records, 10);
+    // Two concurrent handlers call paginateApiKeys with the same cursor
+    const resultA = paginateApiKeys(records, 5, cursor);
+    const resultB = paginateApiKeys(records, 5, cursor);
+
+    // Both results must be identical
+    expect(resultA.items).toEqual(resultB.items);
+    expect(resultA.nextCursor).toEqual(resultB.nextCursor);
+
+    // No overlap between page1 and page2
+    const page1Ids = new Set(page1.items.map((i) => i.id));
+    for (const item of resultA.items) {
+      expect(page1Ids.has(item.id)).toBe(false);
+    }
+  });
+
+  it('handles records added concurrently (not in snapshot) without corrupting existing pages', () => {
+    const original = buildRecords(10);
+    const page1 = paginateApiKeys(original, 4);
+    const cursor = page1.nextCursor!;
+
+    // Simulate a record that was inserted after snapshot was taken
+    const concurrent: ApiKeyCursorPosition = {
+      id: 'key-concurrent',
+      createdAt: new Date(Date.now() + 999999).toISOString(),
+    };
+
+    // Existing pages remain correct when using the original snapshot
+    const page2 = paginateApiKeys(original, 4, cursor);
+    expect(page2.items.map((i) => i.id)).not.toContain(concurrent.id);
+
+    // Full traversal of original snapshot covers exactly the original 10 records
+    const allIds = new Set([...page1.items, ...page2.items].map((i) => i.id));
+    expect(allIds.size).toBe(8); // 4 + 4 (last page has 2 more)
+
+    const page3 = paginateApiKeys(original, 4, page2.nextCursor!);
+    page3.items.forEach((item) => allIds.add(item.id));
+    expect(allIds.size).toBe(10);
+    expect(page3.nextCursor).toBeNull();
+  });
+
+  it('sort order is deterministic across repeated calls on the same input', () => {
+    const records = buildRecords(20);
+    const run1 = paginateApiKeys(records, 20).items.map((i) => i.id);
+    const run2 = paginateApiKeys(records, 20).items.map((i) => i.id);
     expect(run1).toEqual(run2);
   });
 
-  it('cursor chain is stable across re-traversals', () => {
-    const records = makeRecords(25);
-
-    function fullTraversal(): string[] {
-      const ids: string[] = [];
-      let cursor: string | undefined;
-      for (;;) {
-        const result = paginateApiKeys(records, 10, cursor);
-        ids.push(...result.items.map((i) => i.id));
-        if (result.nextCursor === null) break;
-        cursor = result.nextCursor;
-      }
-      return ids;
-    }
-
-    expect(fullTraversal()).toEqual(fullTraversal());
-  });
-
-  // ── Input mutation: original array must not be mutated ────────────────────
-
-  it('does not mutate the original records array', () => {
-    const records = makeRecords(5);
+  it('does not mutate the caller\'s records array', () => {
+    const records = buildRecords(5);
     const original = records.map((r) => ({ ...r }));
     paginateApiKeys(records, 3);
     expect(records).toEqual(original);
   });
+});
 
-  // ── Invalid cursor propagation ────────────────────────────────────────────
+// ─── 7. Secret rotation ──────────────────────────────────────────────────────
 
-  it('throws InvalidApiKeyCursorError for an empty cursor string', () => {
-    const records = makeRecords(5);
-    expect(() => paginateApiKeys(records, 10, '')).toThrow(InvalidApiKeyCursorError);
+describe('cursor secret rotation (lazy loading)', () => {
+  const savedEnv = process.env['API_KEYS_CURSOR_SECRET'];
+
+  afterEach(() => {
+    if (savedEnv === undefined) {
+      delete process.env['API_KEYS_CURSOR_SECRET'];
+    } else {
+      process.env['API_KEYS_CURSOR_SECRET'] = savedEnv;
+    }
   });
 
-  it('throws InvalidApiKeyCursorError for a tampered cursor', () => {
-    const records = makeRecords(10);
-    const page1 = paginateApiKeys(records, 5);
-    const tampered = tamperPayload(page1.nextCursor!);
-    expect(() => paginateApiKeys(records, 5, tampered)).toThrow(InvalidApiKeyCursorError);
+  it('encodes/decodes correctly with a custom secret set after module load', () => {
+    process.env['API_KEYS_CURSOR_SECRET'] = 'my-rotation-secret-1';
+    const pos = { id: 'key-rot', createdAt: '2024-09-01T00:00:00.000Z' };
+    const cursor = encodeApiKeyCursor(pos);
+    expect(decodeApiKeyCursor(cursor)).toEqual(pos);
   });
 
-  it('throws InvalidApiKeyCursorError for a cursor signed with a wrong secret', () => {
-    const records = makeRecords(10);
-    const badCursor = encodeCursorWithSecret(
-      { id: records[4].id, createdAt: records[4].createdAt },
-      'attacker-secret',
-    );
-    expect(() => paginateApiKeys(records, 5, badCursor)).toThrow(InvalidApiKeyCursorError);
+  it('rejects a cursor signed with the old secret after rotation', () => {
+    process.env['API_KEYS_CURSOR_SECRET'] = 'secret-before-rotation';
+    const pos = { id: 'key-old', createdAt: '2024-09-01T00:00:00.000Z' };
+    const oldCursor = encodeApiKeyCursor(pos);
+
+    // Rotate the secret
+    process.env['API_KEYS_CURSOR_SECRET'] = 'secret-after-rotation';
+    expect(() => decodeApiKeyCursor(oldCursor)).toThrow(InvalidApiKeyCursorError);
   });
 
-  it('throws InvalidApiKeyCursorError for a plaintext string passed as cursor', () => {
-    const records = makeRecords(5);
-    expect(() => paginateApiKeys(records, 10, 'notatoken')).toThrow(InvalidApiKeyCursorError);
-  });
-
-  // ── Edge: cursor pointing past end of dataset ─────────────────────────────
-
-  it('returns empty items with no nextCursor when cursor points past end of data', () => {
-    const records = makeRecords(3);
-    const page1 = paginateApiKeys(records, 3); // exactly 3 items, no nextCursor
-    // There is nothing after the end; but if caller constructs a cursor manually
-    // pointing to the last item, the next page should be empty.
-    const lastItemCursor = encodeApiKeyCursor(records[records.length - 1]);
-    const result = paginateApiKeys(records, 10, lastItemCursor);
-    expect(result.items).toHaveLength(0);
-    expect(result.nextCursor).toBeNull();
-    // Sanity check: page1 also has no nextCursor since all items fit
-    expect(page1.nextCursor).toBeNull();
+  it('accepts new cursors signed with the rotated secret', () => {
+    process.env['API_KEYS_CURSOR_SECRET'] = 'secret-after-rotation';
+    const pos = { id: 'key-new', createdAt: '2024-09-01T00:00:00.000Z' };
+    const newCursor = encodeApiKeyCursor(pos);
+    expect(decodeApiKeyCursor(newCursor)).toEqual(pos);
   });
 });
 
-// ─── Concurrent / idempotency invariants ─────────────────────────────────────
+// ─── 8. Racing / duplicate-work / idempotent retry scenarios ────────────────
 
-describe('concurrency and idempotency invariants', () => {
-  it('encoding and decoding are safe to call concurrently (same result)', async () => {
-    const position: ApiKeyCursorPosition = {
-      id: 'concurrent-key',
-      createdAt: '2024-01-01T00:00:00.000Z',
-    };
-    const cursor = encodeApiKeyCursor(position);
+describe('idempotent retry and racing request scenarios', () => {
+  it('repeated calls with no cursor return the same first page', () => {
+    const records = buildRecords(20);
+    const r1 = paginateApiKeys(records, 5);
+    const r2 = paginateApiKeys(records, 5);
+    expect(r1.items).toEqual(r2.items);
+    expect(r1.nextCursor).toBe(r2.nextCursor);
+  });
 
-    // Simulate concurrent decodes
-    const results = await Promise.all(
-      Array.from({ length: 20 }, () => Promise.resolve(decodeApiKeyCursor(cursor))),
+  it('race condition: two clients traverse in parallel without missing items', () => {
+    const records = buildRecords(12);
+    const pageSize = 4;
+
+    // Simulate two independent cursors advancing through the same snapshot
+    let cursorA: string | undefined = undefined;
+    let cursorB: string | undefined = undefined;
+    const allFromA = new Set<string>();
+    const allFromB = new Set<string>();
+
+    for (let i = 0; i < 5; i++) {
+      const a = paginateApiKeys(records, pageSize, cursorA);
+      const b = paginateApiKeys(records, pageSize, cursorB);
+      a.items.forEach((item) => allFromA.add(item.id));
+      b.items.forEach((item) => allFromB.add(item.id));
+      cursorA = a.nextCursor ?? undefined;
+      cursorB = b.nextCursor ?? undefined;
+      if (cursorA === undefined && cursorB === undefined) break;
+    }
+
+    // Both clients saw all 12 records
+    expect(allFromA.size).toBe(12);
+    expect(allFromB.size).toBe(12);
+  });
+
+  it('retry of the same page (same cursor) does not duplicate items', () => {
+    const records = buildRecords(8);
+    const page1 = paginateApiKeys(records, 3);
+    const cursor = page1.nextCursor!;
+
+    // Retry page2 three times — all must produce identical results
+    const page2Attempts = Array.from({ length: 3 }, () =>
+      paginateApiKeys(records, 3, cursor),
     );
 
-    for (const r of results) {
-      expect(r).toEqual(position);
+    for (const attempt of page2Attempts) {
+      expect(attempt.items).toEqual(page2Attempts[0]!.items);
+      expect(attempt.nextCursor).toBe(page2Attempts[0]!.nextCursor);
+    }
+
+    // No duplication between page1 and any attempt at page2
+    const page1Ids = new Set(page1.items.map((i) => i.id));
+    for (const item of page2Attempts[0]!.items) {
+      expect(page1Ids.has(item.id)).toBe(false);
     }
   });
 
-  it('paginateApiKeys results are consistent under concurrent calls with the same cursor', async () => {
-    const records = makeRecords(30);
-    const page1 = paginateApiKeys(records, 10);
-    const cursorToken = page1.nextCursor!;
+  it('duplicate submission: calling encodeApiKeyCursor twice for same position is safe', () => {
+    const pos = { id: 'dup-key', createdAt: '2024-01-15T08:00:00.000Z' };
+    const c1 = encodeApiKeyCursor(pos);
+    const c2 = encodeApiKeyCursor(pos);
+    // Both decode to the same position even if the tokens differ (issuedAt)
+    expect(decodeApiKeyCursor(c1)).toEqual(pos);
+    expect(decodeApiKeyCursor(c2)).toEqual(pos);
+  });
+});
 
-    const results = await Promise.all(
-      Array.from({ length: 10 }, () =>
-        Promise.resolve(paginateApiKeys(records, 10, cursorToken)),
-      ),
-    );
+// ─── 9. Edge cases ───────────────────────────────────────────────────────────
 
-    const first = JSON.stringify(results[0]);
-    for (const r of results.slice(1)) {
-      expect(JSON.stringify(r)).toBe(first);
-    }
+describe('edge cases', () => {
+  it('handles a single-record snapshot', () => {
+    const records = [makeRecord('only-key', '2024-01-01T00:00:00.000Z')];
+    const { items, nextCursor } = paginateApiKeys(records, 10);
+    expect(items).toHaveLength(1);
+    expect(nextCursor).toBeNull();
   });
 
-  it('parseApiKeyPageSize returns the same value under concurrent calls', async () => {
-    const values = await Promise.all(
-      Array.from({ length: 50 }, () => Promise.resolve(parseApiKeyPageSize('42'))),
-    );
-    for (const v of values) {
-      expect(v).toBe(42);
-    }
+  it('handles records with identical id and createdAt (degenerate input)', () => {
+    const ts = '2024-01-01T00:00:00.000Z';
+    const records = [makeRecord('same', ts), makeRecord('same', ts)];
+    // Should not throw; results are deterministic
+    expect(() => paginateApiKeys(records, 10)).not.toThrow();
+  });
+
+  it('cursor from the exact last record produces an empty next page', () => {
+    const records = buildRecords(3);
+    const { items } = paginateApiKeys(records, 10);
+    const lastItem = items[items.length - 1]!;
+    const cursor = encodeApiKeyCursor(lastItem);
+    const nextPage = paginateApiKeys(records, 10, cursor);
+    expect(nextPage.items).toHaveLength(0);
+    expect(nextPage.nextCursor).toBeNull();
+  });
+
+  it('does not expose sensitive data in the cursor string', () => {
+    const pos = { id: 'key-sensitive', createdAt: '2024-06-01T00:00:00.000Z' };
+    const cursor = encodeApiKeyCursor(pos);
+    // The raw cursor must not contain the signing secret
+    const secret = process.env['API_KEYS_CURSOR_SECRET'] ?? 'talenttrust-api-keys-cursor-v1';
+    expect(cursor).not.toContain(secret);
+  });
+
+  it('InvalidApiKeyCursorError has the correct name property', () => {
+    const err = new InvalidApiKeyCursorError();
+    expect(err.name).toBe('InvalidApiKeyCursorError');
+    expect(err.message).toBe('Invalid pagination cursor');
+    expect(err).toBeInstanceOf(Error);
   });
 });

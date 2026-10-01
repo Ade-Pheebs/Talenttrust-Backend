@@ -139,8 +139,8 @@ export class ContractMetadataMismatchError extends AppError {
  * Thrown when an outgoing response payload fails its declared schema.
  *
  * @remarks Indicates a server-side bug (e.g. a persisted record drifting
- * from the public contract) rather than a client mistake, so it maps to a
- * 500 and `expose: false`keeps the raw Zod detail out of the client
+ * from the public contract) rather than a client mistake, so it maps to
+ * a 500 and `expose: false`keeps the raw Zod detail out of the client
  * response — it is still logged server-side by the global error handler.
  */
 export class ResponseContractError extends AppError {
@@ -242,11 +242,11 @@ export class SorobanRpcApplicationError extends SorobanRpcError {
 export class SorobanRpcTimeoutError extends SorobanRpcError {
   constructor(options: { providerCode?: string; providerMessage?: string } = {}) {
     super(504, APP_ERROR_CODES.SOROBAN_RPC_TIMEOUT_ERROR, 'Soroban RPC timeout', true, options);
-    this.name = 'SorobanRpcTimeoutError';
+    this.name = 'SorobanRpcTImeoutError';
   }
 }
 
-export class SorobanRpcMalformedResponseError extends SorobanRpcError {
+export class SorobanRpcLALFORMED_RESPONSE_ERROR extends SorobanRpcError {
   constructor(options: { providerCode?: string; providerMessage?: string } = {}) {
     super(502, APP_ERROR_CODES.SOROBAN_RPC_MALFORMED_RESPONSE_ERROR, 'Soroban RPC malformed response', false, options);
     this.name = 'SorobanRpcMalformedResponseError';
@@ -392,7 +392,7 @@ export function classifySorobanRpcError(error: unknown): SorobanRpcError {
 
   // Quasi RPC application error (e.g., contract execution failure).
   if (looksLikeRpcError(error)) {
-    return new SorobanRpcApplicationError({
+    return new SorobanRpcApplicationError(
       providerCode: extractProviderCode(error),
       providerMessage: safeErrorMessage(error),
     });
@@ -403,6 +403,14 @@ export function classifySorobanRpcError(error: unknown): SorobanRpcError {
     providerCode: extractProviderCode(error),
     providerMessage: safeErrorMessage(error),
   });
+}
+
+/** The classification for an unrecognized provider failure. */
+export class SorobanRpcUnknownError extends SorobanRpcError {
+  constructor(options: { providerCode?: string; providerMessage?: string } = {}) {
+    super(502, APP_ERROR_CODES.SOROBAN_RPC_TRANSPORT_ERROR, 'Soroban RPC unknown error', true, options);
+    this.name = 'SorobanRpcUnknownError';
+  }
 }
 
 function parseRetryAfter(value: unknown): number | undefined {

@@ -33,6 +33,16 @@ pub enum Error {
     /// The idempotency key is not consumed in this case.
     EmptyBatch = 2,
 
-    /// A bet amount was invalid (e.g. zero or negative).
-    InvalidBetAmount = 3,
+    /// The `bets` vector contained more entries than
+    /// [`crate::bets::MAX_BATCH_SIZE`].  Split the batch into several
+    /// submissions, each with its own idempotency key.
+    BatchTooLarge = 3,
+
+    /// A bet carried a non-positive `amount` (zero or negative stroops).
+    /// Every staked amount must be strictly greater than zero.
+    InvalidBetAmount = 4,
+
+    /// A bet carried `market_id == 0`.  Zero is reserved for "unassigned"
+    /// and is never a valid prediction-market identifier.
+    InvalidMarketId = 5,
 }

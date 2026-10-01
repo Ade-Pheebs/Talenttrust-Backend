@@ -254,7 +254,7 @@ export class ContractsBulkController {
           version,
           title: item.title,
           description: item.description,
-          amount: item.amount ?? item.budget,
+          budget: item.amount ?? item.budget,
           status: item.status,
           milestones: item.milestones,
         });

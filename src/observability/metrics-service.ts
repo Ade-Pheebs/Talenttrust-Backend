@@ -15,12 +15,10 @@ import {
   assertServiceStatus,
   assertWebhookOutcome,
   assertContractsRequestMetric,
-  assertReputationRequestMetric,
   ContractsErrorCause,
   ContractsRequestMetric,
   ContractsRequestStatus,
   DisputesErrorCause,
-  ReputationRequestMetric,
   WebhookOutcome as ValidatedWebhookOutcome,
 } from './metrics-validation';
 import { DEFAULT_HISTOGRAM_BUCKETS, validateHistogramBuckets } from './observability-config';
@@ -38,6 +36,15 @@ export type {
  * input types are colocated.
  */
 export type WebhookOutcome = ValidatedWebhookOutcome;
+
+/** Input shape for recordDisputesRequest. */
+export interface DisputesRequestMetricInput {
+  method: string;
+  route: string;
+  statusCode: number;
+  errorCause: string;
+  durationSeconds: number;
+}
 
 /**
  * Canonical list of metric family names documented in docs/observability.md.
@@ -123,6 +130,8 @@ export interface MetricsServiceLike {
   recordWebhookDelivery: (outcome: WebhookOutcome) => void;
   setWebhookDlqDepth: (depth: number) => void;
   recordDisputesRequest: (input: DisputesRequestMetricInput) => void;
+  recordCacheHit?: (cacheName: string) => void;
+  recordCacheMiss?: (cacheName: string) => void;
   startRateLimitMetricsSampling?: (limiter: any, intervalMs?: number) => void;
   stopRateLimitMetricsSampling?: () => void;
   recordMilestoneOperation: (

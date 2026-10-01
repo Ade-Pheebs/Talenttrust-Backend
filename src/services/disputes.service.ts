@@ -533,7 +533,8 @@ export class DisputesService {
       id: 'dispute-001',
       contractId: 'contract-001',
       status: 'open',
-      createdAt: new Date(now.getTime() - 86400000), // 1 day ago
+      version: 0,
+      createdAt: new Date(now.getTime() - 86400000),
       updatedAt: new Date(now.getTime() - 86400000),
       deletedAt: null,
     });
@@ -541,8 +542,9 @@ export class DisputesService {
       id: 'dispute-002',
       contractId: 'contract-002',
       status: 'under_review',
-      createdAt: new Date(now.getTime() - 172800000), // 2 days ago
-      updatedAt: new Date(now.getTime() - 3600000), // 1 hour ago
+      version: 0,
+      createdAt: new Date(now.getTime() - 172800000),
+      updatedAt: new Date(now.getTime() - 3600000),
       deletedAt: null,
     });
   }

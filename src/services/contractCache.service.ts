@@ -165,20 +165,22 @@ export class ContractCacheService {
   }
 
   invalidateContract(id: string): void {
-    this.cache.invalidate(CACHE_KEY_CONTRACT(id));
+    this.cache.delete(CACHE_KEY_CONTRACT(id));
     this.recordInvalidation('contract_update');
     this.updateEntryGauge();
   }
 
   invalidateLists(): void {
-    this.cache.invalidate(CACHE_KEY_ALL_CONTRACTS);
+    this.cache.delete(CACHE_KEY_ALL_CONTRACTS);
     this.recordInvalidation('list_invalidation');
     this.updateEntryGauge();
   }
 
   invalidateAll(): void {
     this.recordInvalidation('full_clear');
-    this.cache.clear();
+    // SWRCache has no clear(); delete all keys individually
+    const keys = Array.from((this.cache as any).cache?.keys?.() ?? []) as string[];
+    for (const k of keys) this.cache.delete(k);
     this.updateEntryGauge();
   }
 }

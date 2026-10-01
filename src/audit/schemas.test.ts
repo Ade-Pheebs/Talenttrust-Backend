@@ -10,7 +10,15 @@
  * is pure and deterministic under concurrency')` below.
  */
 
+/**
+ * @file schemas.test.ts
+ * @description Direct unit coverage for the declarative zod schemas in
+ * `./schemas.ts`, independent of the HTTP layer (see router.validation.test.ts
+ * for the end-to-end request/response coverage). Issue #939.
+ */
+
 import {
+  AUDIT_ACTIONS,
   createAuditEntryBodySchema,
   buildAuditQuerySchema,
   auditEntryResponseSchema,
@@ -18,6 +26,12 @@ import {
   integrityReportResponseSchema,
 } from './schemas';
 import { encodeCursor } from './types';
+
+// Validation boundaries under test:
+// - accepted: fully-specified and defaulted payloads
+// - rejected: missing required fields, unknown enums, malformed values
+// - duplicate: repeated identical submissions must be deterministic
+// - boundary: limit/offset edges, cursor edges, timestamp edges
 
 describe('createAuditEntryBodySchema', () => {
   const valid = {
@@ -37,6 +51,14 @@ describe('createAuditEntryBodySchema', () => {
     }
   });
 
+  it('keeps action values unique and accepts every declared action for writes and queries', () => {
+    expect(new Set(AUDIT_ACTIONS).size).toBe(AUDIT_ACTIONS.length);
+    for (const action of AUDIT_ACTIONS) {
+      expect(createAuditEntryBodySchema.safeParse({ ...valid, action }).success).toBe(true);
+      expect(buildAuditQuerySchema({ maxLimit: 100 }).safeParse({ action }).success).toBe(true);
+    }
+  });
+
   it('defaults metadata to {} when omitted', () => {
     const { metadata, ...rest } = valid;
     void metadata;
@@ -44,6 +66,16 @@ describe('createAuditEntryBodySchema', () => {
     expect(result.success).toBe(true);
     if (result.success) {
       expect(result.data.metadata).toEqual({});
+    }
+  });
+
+  it('is deterministic for duplicate identical submissions', () => {
+    const first = createAuditEntryBodySchema.safeParse(valid);
+    const second = createAuditEntryBodySchema.safeParse(valid);
+    expect(first.success).toBe(true);
+    expect(second.success).toBe(true);
+    if (first.success && second.success) {
+      expect(first.data).toEqual(second.data);
     }
   });
 
@@ -87,6 +119,16 @@ describe('createAuditEntryBodySchema', () => {
 
   it('rejects a non-object metadata value', () => {
     const result = createAuditEntryBodySchema.safeParse({ ...valid, metadata: 'nope' });
+    expect(result.success).toBe(false);
+  });
+
+  it('rejects a null payload', () => {
+    const result = createAuditEntryBodySchema.safeParse(null);
+    expect(result.success).toBe(false);
+  });
+
+  it('rejects a boundary-length actor string', () => {
+    const result = createAuditEntryBodySchema.safeParse({ ...valid, actor: 'a'.repeat(10_000) });
     expect(result.success).toBe(false);
   });
 
@@ -182,10 +224,45 @@ describe('buildAuditQuerySchema', () => {
     }
   });
 
+  it('clamps a limit of exactly maxLimit to maxLimit', () => {
+    const result = schema.safeParse({ limit: '100' });
+    expect(result.success).toBe(true);
+    if (result.success) {
+      expect(result.data.limit).toBe(100);
+    }
+  });
+
+  it('accepts a limit of exactly 1 (lower boundary)', () => {
+    const result = schema.safeParse({ limit: '1' });
+    expect(result.success).toBe(true);
+    if (result.success) {
+      expect(result.data.limit).toBe(1);
+    }
+  });
+
+  it('accepts an offset of 0 (lower boundary)', () => {
+    const result = schema.safeParse({ offset: '0' });
+    expect(result.success).toBe(true);
+    if (result.success) {
+      expect(result.data.offset).toBe(0);
+    }
+  });
+
   it('accepts a valid cursor', () => {
     const cursor = encodeCursor({ lastId: 'abc', lastTimestamp: new Date().toISOString(), filters: {} });
     const result = schema.safeParse({ cursor });
     expect(result.success).toBe(true);
+  });
+
+  it('is deterministic for duplicate identical queries', () => {
+    const query = { action: 'CONTRACT_CREATED', limit: '25', offset: '5' };
+    const first = schema.safeParse(query);
+    const second = schema.safeParse(query);
+    expect(first.success).toBe(true);
+    expect(second.success).toBe(true);
+    if (first.success && second.success) {
+      expect(first.data).toEqual(second.data);
+    }
   });
 
   it.each([
@@ -300,9 +377,35 @@ describe('response schemas', () => {
     expect(auditEntryResponseSchema.safeParse(entry).success).toBe(false);
   });
 
+  it('auditEntryResponseSchema rejects a malformed hash', () => {
+    const entry = {
+      id: 'entry-1',
+      timestamp: new Date().toISOString(),
+      action: 'CONTRACT_CREATED',
+      severity: 'INFO',
+      actor: 'user-1',
+      resource: 'contract',
+      resourceId: 'contract-1',
+      metadata: {},
+      hash: 'not-a-valid-hash',
+      previousHash: 'GENESIS',
+    };
+    expect(auditEntryResponseSchema.safeParse(entry).success).toBe(false);
+  });
+
   it('auditQueryResultResponseSchema accepts a cursor-paginated result', () => {
     const result = { entries: [], count: 0, limit: 50, nextCursor: 'abc' };
     expect(auditQueryResultResponseSchema.safeParse(result).success).toBe(true);
+  });
+
+  it('auditQueryResultResponseSchema rejects a negative count', () => {
+    const result = { entries: [], count: -1, limit: 50, nextCursor: 'abc' };
+    expect(auditQueryResultResponseSchema.safeParse(result).success).toBe(false);
+  });
+
+  it('auditQueryResultResponseSchema rejects a zero limit', () => {
+    const result = { entries: [], count: 0, limit: 0, nextCursor: 'abc' };
+    expect(auditQueryResultResponseSchema.safeParse(result).success).toBe(false);
   });
 
   it('integrityReportResponseSchema accepts a valid report', () => {

@@ -1,1 +1,52 @@
-dXNlIHNvcm9iYW5fc2RrOjpjb250cmFjdGVycm9yOwoKLy8vIENvbnRyYWN0LWxldmVsIGVycm9yIGNvZGVzIHJldHVybmVkIGFzIGB FcnIoRXJyb3I6OiopYC4KLy8vCi8vLyBBbGwgdmFyaWFudHMgbWFwIHRvIGEgc3RhYmxlIGB1MzJgIGRpc2NyaW1pbmFudCB0aGF0IGNsaWVudHMgY2FuCi8vLyBwYXR0ZXJuLW1hdGNoIG9uIGFmdGVyIGludm9raW5nIHRoZSBjb250cmFjdC4gICoqRG8gbm90IHJlbnVtYmVyCi8vLyBleGlzdGluZyB2YXJpYW50cyoqIOKAlCB0aGF0IHdvdWxkIGJyZWFrIG9uLWNoYWluIGNvbnN1bWVycy4KI1tjb250cmFjdGVycm9yXQojW2Rlcml2ZShDb3B5LCBDbG9uZSwgRGVidWcsIEVxLCBQYXJ0aWFsRXEpXQpwdWIgZW51bSBFcnJvciB7CiAgICAvLy8gVGhlIHN1cHBsaWVkIGBpZGVtcG90ZW5jeV9rZXlgIHdhcyBhbHJlYWR5IHVzZWQgaW4gYSBwcmV2aW91cwogICAgLy8vIGBwbGFjZV9iZXRzYCBjYWxsIHRoYXQgY29tcGxldGVkIHN1Y2Nlc3NmdWxseS4gIFRoZSBvcmlnaW5hbCBiYXRjaAogICAgLy8vIGhhcyBhbHJlYWR5IGJlZW4gYXBwbGllZDsgdGhlIGNhbGxlciBzaG91bGQgbm90IHJldHJ5IHdpdGggdGhlIHNhbWUKICAgIC8vLyB0b2tlbi4gIEdlbmVyYXRlIGEgZnJlc2ggYEJ5dGVzTjwzMj5gIGZvciBhIG5ldyBiYXRjaC4KICAgIElkZW1wb3RlbnRCYXRjaEFscmVhZHlBcHBsaWVkID0gMSwKCiAgICAvLy8gVGhlIGBiZXRzYCB2ZWN0b3Igd2FzIGVtcHR5LiAgQXQgbGVhc3Qgb25lIGJldCBpcyByZXF1aXJlZC4KICAgIEVtcHR5QmF0Y2ggPSAyLAoKICAgIC8vLyBUaGUgYGJldHNgIHZlY3RvciBleGNlZWRlZCB0aGUgbWF4aW11bSBudW1iZXIgb2YgZW50cmllcyBhbGxvd2VkCiAgICAvLy8gaW4gYSBzaW5nbGUgYmF0Y2guICBTcGxpdCB0aGUgd29yayBpbnRvIG11bHRpcGxlIGJhdGNoZXMgd2l0aAogICAgLy8vIGRpc3RpbmN0IGBpZGVtcG90ZW5jeV9rZXlgIHZhbHVlcy4KICAgIEJhdGNoVG9vTGFyZ2UgPSAzLAoKICAgIC8vLyBUd28gb3IgbW9yZSBlbnRyaWVzIGluIHRoZSBgYmV0c2AgdmVjdG9yIHJlZmVyZW5jZWQgdGhlIHNhbWUKICAgIC8vLyAobWFya2V0X2lkLCBvdXRjb21lKSBwYWlyLiAgRHVwbGljYXRlIG91dGNvbWVzIHdpdGhpbiBhIHNpbmdsZQogICAgLy8vIGJhdGNoIGFyZSByZWplY3RlZCB0byBrZWVwIGFwcGxpY2F0aW9uIGRldGVybWluaXN0aWMgYW5kIHRvCiAgICAvLy8gcHJldmVudCBhY2NpZGVudGFsIGRvdWJsZS1jb3VudGluZyBvZiBzdGFrZS4KICAgIER1cGxpY2F0ZUJldCA9IDQsCgogICAgLy8vIEEgYmV0IGFtb3VudCB3YXMgemVybyBvciBuZWdhdGl2ZS4gIEFtb3VudHMgbXVzdCBiZSBzdHJpY3RseQogICAgLy8vIHBvc2l0aXZlLgogICAgSW52YWxpZEFtb3VudCA9IDUsCgogICAgLy8vIEEgYmV0IGFtb3VudCBleGNlZWRlZCB0aGUgY29uZmlndXJlZCBtYXhpbXVtIGFsbG93ZWQgZm9yIGEgc2luZ2xlCiAgICAvLy8gYmV0LiAgVGhpcyBpcyBhIGJvdW5kYXJ5IGd1YXJkIGFnYWluc3Qgb3ZlcndoZWxtaW5nIGFjY291bnRpbmcuCiAgICBBbW91bnRUb29MYXJnZSA9IDYsCgogICAgLy8vIFRoZSB0b3RhbCBzdGFrZSBhY3Jvc3MgdGhlIGJhdGNoIGV4Y2VlZGVkIHRoZSBjb25maWd1cmVkIG1heGltdW0uCiAgICAvLy8gUmVqZWN0IHRoZSB3aG9sZSBiYXRjaCByYXRoZXIgdGhhbiBwYXJ0aWFsbHkgYXBwbHlpbmcgaXQuCiAgICBCYXRjaFRvdGFsVG9vTGFyZ2UgPSA3LAoKICAgIC8vLyBUaGUgYGJldHNgIHZlY3RvciBjb250YWluZWQgYSBtYXJrZXQgb3Igb3V0Y29tZSB0aGF0IGRvZXMgbm90CiAgICAvLy8gZXhpc3Qgb3IgaXMgbm90IG9wZW4gZm9yIGJldHRpbmcuCiAgICBNYXJrZXROb3RPcGVuID0gOCwKCiAgICAvLy8gVGhlIGNhbGxlciBpcyBub3QgYXV0aG9yaXplZCB0byBwbGFjZSBiZXRzIGZvciB0aGUgZ2l2ZW4KICAgIC8vLyBhY2NvdW50IG9yIG1hcmtldC4KICAgIFVuYXV0aG9yaXplZCA9IDksCgogICAgLy8vIEEgYmV0IGFtb3VudCB3b3VsZCBjYXVzZSBhbiBhY2NvdW50aW5nIG92ZXJmbG93LiAgUmVqZWN0IHRoZQogICAgLy8vIGJhdGNoIHRvIGF2b2lkIGluY29uc2lzdGVudCBzdGF0ZS4KICAgIE92ZXJmbG93ID0gMTAsCn0K
+use soroban_sdk::contracterror;
+
+/// Contract-level error codes returned as `Err(Error::*)`.
+///
+/// All variants map to a stable `u32` discriminant that clients can
+/// pattern-match on after invoking the contract.  **Do not renumber
+/// existing variants** — that would break on-chain consumers.
+#[contracterror]
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum Error {
+    /// The supplied `idempotency_key` was already used in a previous
+    /// `place_bets` call that completed successfully.  The original batch
+    /// has already been applied; the caller should not retry with the same
+    /// token.  Generate a fresh `BytesN<32>` for a new batch.
+    IdempotentBatchAlreadyApplied = 1,
+
+    /// The `bets` vector was empty.  At least one bet is required.
+    EmptyBatch = 2,
+
+    /// The contract has been paused by an administrator.  No state-mutating
+    /// operation may proceed until it is unpaused.  This is a terminal,
+    /// deterministic rejection — retrying with the same inputs will fail
+    /// identically until the administrator clears the pause.
+    ContractPaused = 3,
+
+    /// A partial batch failure was detected and the attempted rollback of
+    /// already-applied effects could not be completed.  The batch is left
+    /// in a recoverable state: the `idempotency_key` is not marked as
+    /// applied, so the caller may retry the entire batch or invoke the
+    /// recovery entry point to finish rolling back.  This is always
+    /// observable and never silently swallowed.
+    PartialBatchFailure = 4,
+
+    /// The supplied batch exceeds the configured maximum size.  This is
+    /// a deterministic boundary rejection and must not be retried as-is.
+    BatchTooLarge = 5,
+
+    /// A concurrent invocation with the same `idempotency_key` is already
+    /// in flight.  The caller should wait for the in-flight call to complete
+    /// before retrying; the result of the in-flight call is authoritative.
+    BatchInFlight = 6,
+
+    /// A recovery attempt was made for a batch that is not in a recoverable
+    /// state (either it never existed, already completed, or was already
+    /// fully rolled back).  This is a deterministic rejection.
+    NothingToRecover = 7,
+
+    /// The provided `idempotency_key` did not match the key associated
+    /// with the recoverable batch record.  This prevents one caller from
+    /// recovering another caller's batch.
+    RecoveryKeyMismatch = 8,
+}

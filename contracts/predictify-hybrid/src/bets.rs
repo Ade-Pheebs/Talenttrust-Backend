@@ -63,15 +63,11 @@ pub const MAX_BATCH_SIZE: u32 = 100;
 /// will be removed in a future version.  Callers should generate a random
 /// 32-byte token for every batch.
 ///
-/// # Concurrency invariants
+/// # Determinism
 ///
-/// * The `(caller, idempotency_key)` marker is written to instance storage
-///   before any batch state is mutated, so a re-entrant or racing call on
-///   the same ledger observes the marker and fails fast with
-///   [`Error::IdempotentBatchAlreadyApplied`].
-/// * The marker's TTL is extended on every successful write so the
-///   deduplication window is at least [`IDEM_KEY_TTL_LEDGERS`] ledgers from
-///   the most recent submission.
+/// The idempotency key is committed to storage before any batch side
+/// effects.  If batch application fails, the key is rolled back so that
+/// a retry with the same key is treated as a fresh submission.
 pub fn place_bets(
     env: &Env,
     caller: Address,
@@ -113,23 +109,21 @@ pub fn place_bets(
     // ------------------------------------------------------------------
     // A zero key opts out of deduplication (deprecated backward compat).
     let zero_key: BytesN<32> = BytesN::from_array(env, &[0u8; 32]);
-    // Track whether we consumed an idempotency marker so we can roll it
-    // back if a later step fails, keeping retries idempotent.
-    let mut consumed_idem: Option<DataKey> = None;
+    let mut idem_key: Option<DataKey> = None;
     if idempotency_key != zero_key {
-        let idem_key = DataKey::PlaceBetsIdem(caller.clone(), idempotency_key.clone());
+        let key = DataKey::PlaceBetsIdem(caller.clone(), idempotency_key.clone());
 
-        if env.storage().instance().has(&idem_key) {
+        if env.storage().instance().has(&key) {
             return Err(Error::IdempotentBatchAlreadyApplied);
         }
 
         // Mark the key as consumed before applying the batch so that
         // concurrent invocations on the same ledger also fail fast.
-        env.storage().instance().set(&idem_key, &true);
+        env.storage().instance().set(&key, &true);
         env.storage()
             .instance()
             .extend_ttl(IDEM_KEY_TTL_LEDGERS, IDEM_KEY_TTL_LEDGERS);
-        consumed_idem = Some(idem_key);
+        idem_key = Some(key);
     }
 
     // ------------------------------------------------------------------
@@ -138,19 +132,17 @@ pub fn place_bets(
     // TODO: replace with real market-state mutations once the market
     //       storage module is added.  For now we emit a diagnostic event
     //       so the batch is observable on-chain.
-    //
-    // Any failure raised by future batch-application logic must not leave
-    // the idempotency marker behind, otherwise a legitimate retry would be
-    // rejected as a duplicate.  We therefore guard the marker with an
-    // explicit rollback on error.
     let apply_result: Result<(), Error> = (|| {
         env.events()
-            .publish((Symbol::new(env, "place_bets"), caller.clone()), batch_len);
+            .publish((Symbol::new(env, "place_bets"), caller.clone()), bets.len());
         Ok(())
     })();
 
+    // Deterministic failure recovery: if the batch application failed,
+    // roll back the idempotency marker so a retry with the same key is
+    // treated as a fresh submission rather than a duplicate.
     if let Err(err) = apply_result {
-        if let Some(key) = consumed_idem {
+        if let Some(key) = idem_key {
             env.storage().instance().remove(&key);
         }
         return Err(err);

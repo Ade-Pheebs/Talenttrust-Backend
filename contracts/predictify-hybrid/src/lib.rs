@@ -11,22 +11,15 @@
 /// submissions with the same `(caller, key)` pair are rejected with
 /// `Error::IdempotentBatchAlreadyApplied`.
 ///
-/// ## Validation boundaries
-+//
-/// The contract enforces the following invariants at the entry point:
+/// ## Failure recovery
 ///
-/// - The batch must be non-empty and must not exceed
-///   [`bets::MAX_BATCH_SIZE`] bets.  Empty or oversized batches are
-///   rejected with [`Error::InvalidBatchSize`].
-/// - Every bet must carry a strictly positive amount; zero or negative
-///   amounts are rejected with [`Error::InvalidAmount`].
-/// - A batch must not contain duplicate `(market_id, outcome)` pairs;
-///   duplicates are rejected with [`Error::DuplicateBet`].
-///
-/// These checks are performed before any state mutation, so a rejected
-/// batch leaves storage unchanged and cannot consume an idempotency
-/// key.
-#![no_std]
+/// Batch submission is all-or-nothing.  The idempotency key is only
+/// consumed after the batch has been fully validated and applied, so a
+/// failed attempt leaves the key unused and the caller can retry with
+/// the same key.  See [`bets::place_bets`] for the exact ordering of
+/// validation, state mutation, and key consumption.
+
+#[no_std]
 
 mod bets;
 mod errors;

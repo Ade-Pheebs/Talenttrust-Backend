@@ -126,6 +126,13 @@ export function attachTerminalHandlers(app: express.Application): void {
   app.use(errorHandler);
 }
 
+/**
+ * Creates the Express application with all routes and middleware wired.
+ *
+ * @param options - Factory options. Omitting it is equivalent to passing
+ *                an empty object.
+ * @returns The configured Express application.
+ */
 export function createApp(options?: AppFactoryOptions): express.Application {
   const includeTerminalHandlers = options?.includeTerminalHandlers ?? true;
   const env = validateEnv();
@@ -143,7 +150,13 @@ export function createApp(options?: AppFactoryOptions): express.Application {
   app.use(metricsService.trackHttpRequest.bind(metricsService));
 
   const db = getDb();
-  ReputationService.initialize(db);
+  // Fire-and-forget initialization is safe here because ensureReputationInitialized
+  // guarantees the underlying work runs at most once and concurrent callers share
+  // the same in-flight promise. Errors are surfaced through the returned promise
+  // and must not be swallowed silently.
+  void ensureReputationInitialized(db).catch((err) => {
+    console.error('[app] ReputationService initialization failed', err);
+  });
 
   app.get('/metrics', metricsAuthMiddleware, async (_req, res) => {
     res.setHeader('Content-Type', metricsService.contentType);
@@ -169,9 +182,9 @@ export function createApp(options?: AppFactoryOptions): express.Application {
   app.use('/api/v1/admin/deploy', deployRouter);
   app.use('/api/v1', rpcEventsRouter);
   if (features.webhooksEnabled) {
-    app.use('/api/v1/webhook-subscriptions', webhookSubscriptionRouter);
+    mountRouter(app, '/api/v1/webhook-subscriptions', webhookSubscriptionRouter);
   }
-  app.use('/api/v1/metrics', metricsAuthMiddleware, createMetricsRouter(metricsService));
+  mountRouter(app, '/api/v1/metrics', metricsAuthMiddleware, createMetricsRouter(metricsService));
 
   if (includeTerminalHandlers) {
     attachTerminalHandlers(app);

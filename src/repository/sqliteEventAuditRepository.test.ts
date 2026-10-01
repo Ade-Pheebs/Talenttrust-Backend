@@ -68,10 +68,8 @@ describe('SqliteEventAuditRepository — transactional event + projection', () =
   });
 
   it('rolls back the audit when the projection insert fails (projection constraint)', async () => {
-    // Force the projection insert (runs after the audit insert in the same
-    // transaction) to violate NOT NULL, so the audit must also roll back.
-    // `null` (not `undefined`) reliably raises SQLITE_CONSTRAINT_NOTNULL.
-    const badProjection = makeProjection({ data: null as unknown as string });
+    // Force the projection insert to fail by passing null for entity_id (PRIMARY KEY NOT NULL)
+    const badProjection = makeProjection({ entityId: null as unknown as string });
 
     await expect(
       repo.persistEventAndProjection(makeAudit(), badProjection),

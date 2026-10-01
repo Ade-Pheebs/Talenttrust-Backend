@@ -51,9 +51,9 @@ import { auditService, AuditService } from './service';
 import { auditExportService, AuditExportService, type AuditExportFilters, type AuditExportResult } from './exportService';
 import type { AuditQuery } from './types';
 import { buildAuditQuerySchema, type AuditQueryParams } from './schemas';
+import { validateCreateAuditEntry, readValidatedBody } from './inputValidation';
 import { mapZodErrorToDetails, type ValidationErrorResponse } from '../middleware/validate.middleware';
-import { idempotencyMiddleware } from '../middleware/idempotency';
-import { validateCreateAuditEntryInput, type AuditValidationIssue } from './inputValidation';
+import { createIdempotencyMiddleware } from '../middleware/idempotency';
 import { validateRequest } from '../middleware/validate.middleware';
 import { toAuditEntryResponseDto } from './dto/audit.dto';
 import { validateAuditQuery, validateAuditEntryBody, validateAuditBulkBody } from './dto/audit.dto';
@@ -289,54 +289,30 @@ export function createAuditRouter(options: AuditRouterOptions = {}): Router {
    */
   router.post(
     '/',
-    idempotencyMiddleware,
     ...accessMiddleware,
+    validateCreateAuditEntry,
+    createIdempotencyMiddleware({
+      cacheResponse: (res) => res.statusCode >= 200 && res.statusCode < 300,
+    }),
     (req: Request, res: Response): void => {
       try {
-        const validationResult = validateCreateAuditEntryInput(req.body);
-
-        if (!validationResult.ok) {
-          res.status(400).json(
-            buildValidationIssuesResponse(getRequestId(res), validationResult.issues),
-          );
-          return;
-        }
-
-        const entry = service.log(validationResult.data);
-        if (!parseResult.success) {
-          const requestId = getRequestIdFromUtils(res);
-          const correlationId = getCorrelationId(res);
-          res.status(400).json(buildValidationErrorResponse(requestId, correlationId, parseResult.error));
-          return;
-        }
-
         // Propagate correlation ID from request context to audit entry
         const correlationId = getCorrelationId(res);
-        const entryData = parseResult.data;
+        const entryData = readValidatedBody(res);
         if (correlationId && !entryData.correlationId) {
           entryData.correlationId = correlationId;
         }
 
         const entry = service.log(entryData);
         res.status(201).json(entry);
-      } catch (error) {
+      } catch {
         const requestId = getRequestIdFromUtils(res);
         const correlationId = getCorrelationId(res);
-
-        if (isClientInputError(error)) {
-          // Preserve the documented legacy validation shape (`error` is a
-          // string) for compatibility with existing callers.
-          res.status(400).json({
-            error: (error as Error).message,
-            code: 'validation_error',
-            requestId,
-            ...(correlationId !== undefined && { correlationId }),
-          });
-          return;
-        }
-
-        // A persistence/driver failure must not be echoed to the caller.
-        res.status(500).json(buildInternalErrorResponse(requestId, correlationId, 'Failed to write audit entry'));
+        res.status(500).json({
+          error: 'Unable to write audit entry',
+          requestId,
+          ...(correlationId !== undefined && { correlationId }),
+        });
       }
     },
   );

@@ -108,6 +108,17 @@ export function resetAuthCache(): void {
   authCache = null;
 }
 
+/**
+ * Install a specific auth cache instance (test seam).
+ *
+ * Mirrors `setMetadataStore` in `src/database/sqliteStore.ts`: tests need a
+ * cache with deterministic TTL/capacity and a direct handle to assert on,
+ * without reaching through the lazily-initialised environment-backed singleton.
+ */
+export function setAuthCache(cache: AuthCache | null): void {
+  authCache = cache;
+}
+
 export interface ApiKeyInfo {
   id: string;
   name: string;
@@ -701,73 +712,21 @@ export function isValidSaltHashFormat(storedCredential: string): boolean {
 }
 
 /**
- * Returns true when the key is active and not expired as the provided
- * reference time.
+ * Reads and verifies an API key against the store, bypassing the cache.
  *
- * INV-3: expiration is evaluated against a single captured timestamp so
- * concurrent calls cannot disagree on whether a key is expired.
+ * Deliberately side-effect free with respect to caching: the *cache* owns the
+ * concurrency policy (single flight and the invalidation epoch — see
+ * {@link AuthCache.getOrLoad}), while this function stays a pure
+ * read → verify → record step. That split is what lets a burst of concurrent
+ * requests with the same key share one lookup, one PBKDF2 verification and one
+ * write instead of each doing its own.
+ *
+ * @param apiKey   - The plain API key to verify.
+ * @param selector - Pre-computed selector for `apiKey` (also used to backfill
+ *                   legacy rows that predate the index).
+ * @returns The API key info if the credential is valid and unexpired, else null.
  */
-function isKeyUsable(key: ApiKey, now: Date): boolean {
-  if (!key.is_active) {
-    return false;
-  }
-  if (key.expires_at && now > key.expires_at) {
-    return false;
-  }
-  return true;
-}
-
-/**
- * Validates an API key and returns the associated key info if valid.
- * 
- * Validates input format before performing cryptographic operations.
- *
- * Contract:
- * - Input must be a non-empty string
- * - Returns null for invalid keys, expired keys, or malformed input
- * - Returns ApiKeyInfo for valid, active, non-expired keys
- * - Updates last_used_at timestamp on successful validation
- * - Auto-deactivates expired keys on validation attempt
- * - Backfills key_selector for legacy keys (lazy migration)
- * - Never throws; always returns ApiKeyInfo or null for deterministic behavior
- * - Handles malformed stored credentials gracefully (fails closed)
- *
- * Invariants enforced on this path:
- * - Only active, non-expired keys are returned as valid.
- * - Malformed stored credentials fail closed before PBKDF2 is invoked.
- * - The cache is only written after every check passes (INV-2).
- * - Expired keys are deactivated and never cached (INV-3).
- * - Last-used writes are monotonic (INV-6).
- *
- * @param apiKey - The plain API key to validate.
- * @returns The API key info if valid, null otherwise.
- * @throws ApiKeyValidationError if input format is invalid
- */
-export async function validateApiKey(apiKey: string): Promise<ApiKeyInfo | null> {
-  if (typeof apiKey !== 'string' || apiKey.length === 0) {
-    return null;
-  }
-
-  // Compute the deterministic selector for O(1) indexed lookup
-  const selector = computeKeySelector(apiKey);
-  const now = new Date();
-
-  // Check cache first
-  const cache = getAuthCache();
-  const cached = cache.get(selector);
-  if (cached) {
-    // Cache entries are only written after a full verification and expiry
-    // check, but we still re-evaluate expiry against the current clock so a
-    // key that expires between cache writes is not served past its window.
-    if (cached.expiresAt && now > cached.expiresAt) {
-      cache.invalidate(selector);
-      await deactivateApiKey(cached.id);
-      return null;
-    }
-    return cached;
-  }
-  const cacheGeneration = cache.getGeneration();
-
+async function loadApiKeyInfo(apiKey: string, selector: string): Promise<ApiKeyInfo | null> {
   // Try indexed lookup first (fast path, O(1) via key_selector)
   let dbKey: ApiKey | undefined;
   try {
@@ -830,66 +789,52 @@ export async function validateApiKey(apiKey: string): Promise<ApiKeyInfo | null>
   // Skip re-verification for keys found via the legacy fallback — they already
   // passed the PBKDF2 check inside the loop.
   if (!pbkdf2Verified && !verifyApiKey(apiKey, salt, hash)) {
-    return { info: null, definitive: true };
+    return null;
+  }
+  
+  // Check if key has expired before recording usage: an expired credential is
+  // rejected and deactivated, and must not look freshly used in the audit trail.
+  if (dbKey.expires_at && new Date() > dbKey.expires_at) {
+    await database.deactivateApiKey(dbKey.id);
+    return null;
   }
 
-  // Serialize mutations on this key ID so concurrent validations cannot
-  // double-backfill or double-deactivate, and cannot observe a partially
-  // applied state transition.
-  const keyId = dbKey.id;
-  const result = await keyMutex.run(keyId, async () => {
-    // Re-read the row inside the critical section so we observe any writes
-    // that committed while we were waiting for the mutex (e.g. a concurrent
-    // rotation or deactivation).
-    const current = await database.getApiKeyById(keyId);
-    if (!current || !current.is_active) {
-      // Key was deactivated or removed concurrently — fail closed and
-      // do not repopulate the cache.
-      cache.invalidate(selector);
-      return null;
-    }
+  // Single write for both bookkeeping fields. Previously this was two calls
+  // (selector backfill, then last_used_at), which doubled the write volume on
+  // the authentication hot path for exactly the legacy rows that need backfill.
+  const bookkeeping: { last_used_at: Date; key_selector?: string } = { last_used_at: new Date() };
+  if (!dbKey.key_selector) {
+    bookkeeping.key_selector = selector;
+  }
+  await database.updateApiKey(dbKey.id, bookkeeping);
 
-    // If the stored credential changed concurrently (e.g. rotation), the
-    // old key must no longer validate.
-    if (current.key_hash !== dbKey.key_hash) {
-      cache.invalidate(selector);
-      return null;
-    }
+  return {
+    id: dbKey.id,
+    name: dbKey.name,
+    scope: dbKey.scope,
+    createdBy: dbKey.created_by,
+    createdAt: dbKey.created_at,
+    expiresAt: dbKey.expires_at,
+    isActive: dbKey.is_active
+  };
+}
 
-    // Backfill the selector for legacy keys so future lookups hit the fast path
-    if (!current.key_selector) {
-      await database.updateApiKey(keyId, { key_selector: selector });
-    }
-
-    // Update last used timestamp
-    await database.updateApiKey(keyId, { last_used_at: new Date() });
-
-    // Check if key has expired
-    if (current.expires_at && new Date() > current.expires_at) {
-      await database.deactivateApiKey(keyId);
-      cache.invalidate(selector);
-      return null;
-    }
-
-    const info = {
-      id: current.id,
-      name: current.name,
-      scope: current.scope,
-      createdBy: current.created_by,
-      createdAt: current.created_at,
-      expiresAt: current.expires_at,
-      isActive: current.is_active
-    };
-
-    // Cache the successful validation result only after all writes commit.
-    cache.set(selector, info);
-    return info;
-  });
-
-  // Cache the successful validation result
-  cache.set(selector, result, cacheGeneration);
-
-  return { info, definitive: true };
+/**
+ * Validates an API key and returns the associated key info if valid.
+ *
+ * Concurrency: validation is funnelled through
+ * {@link AuthCache.getOrLoad}, so N simultaneous requests carrying the same key
+ * perform exactly one store lookup, one PBKDF2 verification and one bookkeeping
+ * write, and all observe the same result. A successful load is only published to
+ * the cache if no revocation invalidated it while it was in flight.
+ *
+ * @param apiKey - The plain API key to validate.
+ * @returns The API key info if valid, null otherwise.
+ */
+export async function validateApiKey(apiKey: string): Promise<ApiKeyInfo | null> {
+  // Compute the deterministic selector for O(1) indexed lookup
+  const selector = computeKeySelector(apiKey);
+  return getAuthCache().getOrLoad(selector, () => loadApiKeyInfo(apiKey, selector));
 }
 
 /**

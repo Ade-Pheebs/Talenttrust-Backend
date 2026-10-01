@@ -11,6 +11,23 @@
  *   - TTL-based expiration
  *   - LRU eviction when capacity is reached
  *
+ * Concurrency (INV-C1 / INV-C2 below)
+ * -------------------------------
+ * The cache is shared by every concurrent request, so two properties matter as
+ * much as hit rate:
+ *
+ * INV-C1 — Single flight: concurrent misses for the same selector run the loader
+ *          exactly once. A burst of requests carrying the same API key must not
+ *          each perform a database read plus a PBKDF2 verification (10,000
+ *          synchronous iterations) and each write `last_used_at`; those
+ *          duplicates serialise on the event loop and turn one request into N.
+ *
+ * INV-C2 — No stale repopulation: an in-flight load that resolves *after* a
+ *          concurrent invalidation (deactivate / rotate / user-wide purge) must
+ *          not publish its result. Otherwise the pre-revocation identity wins
+ *          the race and keeps authenticating for a whole TTL after the key was
+ *          revoked.
+ *
  * Metrics:
  *   - Cache hits and misses are tracked via Prometheus counters
  *
@@ -51,78 +68,22 @@ export interface AuthCacheStats {
 }
 
 /**
- * Returns true when the value is a valid, non-empty string.
- */
-function isNonEmptyString(value: unknown): value is string {
-  return typeof value === 'string' && value.length > 0;
-}
-
-/**
- * Returns true when the value is a finite, non-negative number.
- */
-function isNonNegativeFiniteNumber(value: unknown): value is number {
-  return typeof value === 'number' && Number.isFinite(value) && value >= 0;
-}
-
-/**
- * Returns true when the value is a finite, positive integer.
- */
-function isPositiveInteger(value: unknown): value is number {
-  return Number.isInteger(value) && value > 0;
-}
-
-/**
- * Validates the shape of an `ApiKeyInfo` object. This is a defensive check
- * at the cache boundary: callers are expected to have already validated the
- * key, but the cache must not silently store malformed objects that would
- * later break invalidation-by-user-ID or authorization decisions.
- */
-function assertValidApiKeyInfo(info: unknown): asserts info is ApiKeyInfo {
-  if (info === null || typeof info !== 'object') {
-    throw new TypeError('AuthCache.set: info must be an ApiKeyInfo object');
-  }
-
-  const candidate = info as Record<string, unknown>;
-
-  if (!isNonEmptyString(candidate.id)) {
-    throw new TypeError('AuthCache.set: info.id must be a non-empty string');
-  }
-
-  if (!isNonEmptyString(candidate.createdBy)) {
-    throw new TypeError('AuthCache.set: info.createdBy is required for invalidation-by-user');
-  }
-
-  if (!Array.isArray(candidate.scope)) {
-    throw new TypeError('AuthCache.set: info.scope must be an array');
-  }
-
-  if (typeof candidate.isActive !== 'boolean') {
-    throw new TypeError('AuthCache.set: info.isActive must be a boolean');
-  }
-
-  if (!(candidate.createdAt instanceof Date)) {
-    throw new TypeError('AuthCache.set: info.createdAt must be a Date');
-  }
-
-  if (candidate.expiresAt !== null && !(candidate.expiresAt instanceof Date)) {
-    throw new TypeError('AuthCache.set: info.expiresAt must be a Date or null');
-  }
-}
-
-/**
- * LRU cache with TLL for auth read responses.
+ * Whether a credential's own `expiresAt` has passed.
  *
- * The cache is bounded by `maxEntries` and by `ttlMs`. All mutations are
- * synchronous, so the invariants below hold after every public method returns:
- *
- *   1. `this.cache.size <= this.maxEntries`.
- *   2. Every entry in `this.cache` is either fresh (`now <= expiresAt`) or
- *      will be dropped on the next access/cleanup.
- *   3. `get()` returns a defensive copy of the cached info, so the caller
- *      cannot mutate cached state.
- *   4. `set()` stores a defensive copy of the info, so the caller cannot
- *      mutate cached state after the call.
- *   5. @throws `TypeError` for invalid inputs and leaves the cache unchanged.
+ * Distinct from {@link CacheEntry.expiresAt}, which is the cache's own TTL for
+ * the entry. A credential can expire while its cached entry is still within TTL
+ * (e.g. a key issued with a short lifetime), so both have to be checked before
+ * an identity is served.
+ */
+function isCredentialExpired(info: ApiKeyInfo): boolean {
+  if (!info.expiresAt) return false;
+  const expiresAt =
+    info.expiresAt instanceof Date ? info.expiresAt.getTime() : new Date(info.expiresAt).getTime();
+  return Number.isFinite(expiresAt) && Date.now() >= expiresAt;
+}
+
+/**
+ * LRU cache with TTL for auth read responses.
  */
 export class AuthCache {
   private cache: Map<string, CacheEntry>;
@@ -133,35 +94,25 @@ export class AuthCache {
   private misses: Counter<string>;
   private hitCount: number;
   private missCount: number;
-  
-  // Concurrency control: tracks in-flight operations to prevent duplicate work
-  private inFlightOps: Map<string, InFlightOperation<ApiKeyInfo | null>>;
-  // Write operation lock: ensures set/invalidate operations are atomic
-  private writeLock: Promise<void>;
-  // Tracks timing boundaries for testing and observability
-  private operationTimings: Map<string, number[]>;
-
-  // LRU list metadata. head = MRU, tail = LRU.
-  private lruHead: LruNode | null;
-  private lruTail: LruNode | null;
-  private lruNodes: Map<string, LruNode>;
-
-  constructor(options: AuthCacheOptions, register?: Registry) {
-    if (options === null || typeof options !== 'object') {
-      throw new TypeError('AuthCache: options must be an object');
-    }
-
-    if (!isNonNegativeFiniteNumber(options.ttlMs)) {
-      throw new TypeError('AuthCache: ttlMs must be a finite, non-negative number');
-    }
-
-    if (!isPositiveInteger(options.maxEntries)) {
-      throw new TypeError('AuthCache: maxEntries must be a positive integer');
-    }
+  /** INV-C1: in-flight loads keyed by selector, shared by concurrent callers. */
+  private inFlight: Map<string, Promise<ApiKeyInfo | null>>;
+  /**
+   * INV-C2: monotonically increasing counter bumped by every invalidation.
+   *
+   * A load records the epoch it started in and refuses to publish if the epoch
+   * moved underneath it. Bumping globally (rather than per selector) also
+   * covers `invalidateByUserId` and `clear`, where the selectors to bump are not
+   * known up front. The cost is only that loads in flight at the exact moment of
+   * a write are not cached — writes are rare, so this is cheap and strictly
+   * safer than trying to be precise.
+   */
+  private epoch: number;
 
     this.ttlMs = options.ttlMs;
     this.maxEntries = options.maxEntries;
     this.cache = new Map();
+    this.inFlight = new Map();
+    this.epoch = 0;
     this.hitCount = 0;
     this.missCount = 0;
     this.lruHead = null;
@@ -284,6 +235,11 @@ export class AuthCache {
    * 
    * Thread-safe: Uses write lock to ensure atomic updates.
    *
+   * INV-C1 corollary: a cached identity is handed to every request that hits it,
+   * so it is frozen. Without this, a request that mutates `req.apiKey` (for
+   * example filtering `scope` in place) would silently rewrite the authorization
+   * view seen by every other concurrent request sharing the entry.
+   *
    * @param selector - The key selector (SHA-256 hash of the API key)
    * @param info - The API key info to cache
    * @throws TypeError if `selector` or `info` is invalid
@@ -299,7 +255,7 @@ export class AuthCache {
     const cacheExpiresAt = now + this.ttlMs;
     const keyExpiresAt = info.expiresAt?.getTime();
     const entry: CacheEntry = {
-      info: cloneApiKeyInfo(info),
+      info: Object.freeze(info),
       expiresAt: now + this.ttlMs,
       lastAccessed: now,
     };
@@ -342,6 +298,59 @@ export class AuthCache {
   }
 
   /**
+   * Returns a cached identity, or runs `loader` once for concurrent callers of
+   * the same selector and caches a successful result.
+   *
+   * Semantics:
+   * - cache hit (and the credential has not itself expired) → returns immediately.
+   * - concurrent miss → every caller receives the *same* promise, so the loader
+   *   runs exactly once (INV-C1).
+   * - the loader's result is published only if no invalidation happened while it
+   *   was in flight (INV-C2).
+   * - a `null` result (unknown / rejected credential) is deliberately **not**
+   *   cached, so a revoked key re-checks against the store rather than being
+   *   pinned; concurrent callers still share the single load.
+   * - a rejected load rejects for every joined caller and is not cached; the
+   *   in-flight entry is cleared so the next attempt retries.
+   *
+   * @param selector - The key selector (SHA-256 digest of the API key).
+   * @param loader   - Produces the identity to cache on a miss.
+   */
+  async getOrLoad(
+    selector: string,
+    loader: () => Promise<ApiKeyInfo | null>
+  ): Promise<ApiKeyInfo | null> {
+    const cached = this.get(selector);
+    if (cached) {
+      if (!isCredentialExpired(cached)) {
+        return cached;
+      }
+      // The credential outlived its own expiry while still inside the cache TTL:
+      // drop it and fall through to a fresh load.
+      this.invalidate(selector);
+    }
+
+    const existing = this.inFlight.get(selector);
+    if (existing) {
+      return existing;
+    }
+
+    const epoch = this.epoch;
+    const pending = (async () => {
+      const info = await loader();
+      if (info !== null && this.epoch === epoch) {
+        this.set(selector, info);
+      }
+      return info;
+    })().finally(() => {
+      this.inFlight.delete(selector);
+    });
+
+    this.inFlight.set(selector, pending);
+    return pending;
+  }
+
+  /**
    * Invalidate a cache entry by selector.
    * 
    * Thread-safe: Uses write lock to ensure atomic invalidation.
@@ -355,6 +364,7 @@ export class AuthCache {
     }
 
     this.cache.delete(selector);
+    this.epoch++;
   }
 
   /**
@@ -376,7 +386,8 @@ export class AuthCache {
         selectorsToDelete.push(selector);
       }
     });
-    selectorsToDelete.forEach(selector => this.removeEntry(selector));
+    selectorsToDelete.forEach(selector => this.cache.delete(selector));
+    this.epoch++;
   }
 
   /**
@@ -385,9 +396,7 @@ export class AuthCache {
   clear(): void {
     this.generation += 1;
     this.cache.clear();
-    this.lruHead = null;
-    this.lruTail = null;
-    this.lruNodes.clear();
+    this.epoch++;
   }
 
   /**

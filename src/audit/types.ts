@@ -65,7 +65,32 @@ export const AUDIT_ACTIONS = [
 ] as const;
 
 /** Categories of sensitive state changes that must be audited. */
-export type AuditAction = (typeof AUDIT_ACTIONS)[number];
+export type AuditAction =
+  | 'CONTRACT_CREATED'
+  | 'CONTRACT_UPDATED'
+  | 'CONTRACT_CANCELLED'
+  | 'CONTRACT_COMPLETED'
+  | 'CONTRACT_DELETED'
+  | 'PAYMENT_INITIATED'
+  | 'PAYMENT_RELEASED'
+  | 'PAYMENT_DISPUTED'
+  | 'REPUTATION_UPDATED'
+  | 'REPUTATION_CORRECTED'
+  | 'USER_CREATED'
+  | 'USER_UPDATED'
+  | 'USER_DELETED'
+  | 'AUTH_LOGIN'
+  | 'AUTH_LOGOUT'
+  | 'AUTH_FAILED'
+  | 'AUTH_LOCKOUT_TRIGGERED'
+  | 'AUTH_LOCKOUT_RELEASED'
+  | 'ADMIN_ACTION' | 'ENDPOINT_ACCESS'
+  | 'ENDPOINT_MUTATION'
+  | 'DEPLOYMENT_PROMOTED'
+  | 'DEPLOYMENT_ROLLED_BACK'
+  | 'MILESTONES_CREATED'
+  | 'MILESTONES_UPDATED'
+  | 'MILESTONES_DELETED';
 
 export const AUDIT_SEVERITIES = ['INFO', 'WARNING', 'CRITICAL'] as const;
 

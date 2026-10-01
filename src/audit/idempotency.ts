@@ -1,1 +1,261 @@
-aW1wb3J0IHsgY3JlYXRlSGFzaCB9IGZyb20gJ2NyeXB0byc7CmltcG9ydCB0eXBlIHsgQXVkaXRFbnRyeSwgQ3JlYXRlQXVkaXRFbnRyeUlucHV0IH0gZnJvbSAnLi90eXBlcyc7CgpleHBvcnQgaW50ZXJmYWNlIElkZW1wb3RlbmN5UmVjb3JkIHsKICBib2R5SGFzaDogc3RyaW5nOwogIHJlc3BvbnNlOiBBdWRpdEVudHJ5OwogIGNyZWF0ZWRBdDogbnVtYmVyOwp9CgpleHBvcnQgaW50ZXJmYWNlIElkZW1wb3RlbmN5U3RvcmVPcHRpb25zIHsKICBtYXhTaXplPzogbnVtYmVyOwogIHR0bE1zPzogbnVtYmVyOwp9CgpleHBvcnQgaW50ZXJmYWNlIElkZW1wb3RlbmN5UmVzb2x1dGlvbiB7CiAgLyoqIFRydWUgd2hlbiB0aGUgY2FsbGVyIG11c3QgcGVyZm9ybSB0aGUgd29yayBhbmQgdGhlbiBjb21taXQgdGhlIHJlc3VsdC4gKi8KICBleGVjdXRlOiBib29sZWFuOwogIC8qKiBUaGUgY2FjaGVkIHJlc3BvbnNlIHdoZW4gYGV4ZWN1dGVgIGlzIGZhbHNlLiAqLwogIHJlc3BvbnNlPzogQXVkaXRFbnRyeTsKfQoKY29uc3QgREVGQVVMVF9NQVhfU0laRSA9IDEwMDA7CmNvbnN0IERFRkFVTFRfVFRMX01TID0gODZfNDAwXzAwMDsKCmZ1bmN0aW9uIGhhc2hCb2R5KGlucHV0OiBDcmVhdGVBdWRpdEVudHJ5SW5wdXQpOiBzdHJpbmcgewogIGNvbnN0IHBheWxvYWQgPSBKU09OLnN0cmluZ2lmeSh7CiAgICBhY3Rpb246IGlucHV0LmFjdGlvbiwKICAgIHNldmVyaXR5OiBpbnB1dC5zZXZlcml0eSwKICAgIGFjdG9yOiBpbnB1dC5hY3RvciwKICAgIHJlc291cmNlOiBpbnB1dC5yZXNvdXJjZSwKICAgIHJlc291cmNlSWQ6IGlucHV0LnJlc291cmNlSWQsCiAgICBtZXRhZGF0YTogaW5wdXQubWV0YWRhdGEsCiAgfSk7CiAgcmV0dXJuIGNyZWF0ZUhhc2goJ3NoYTI1NicpLnVwZGF0ZShwYXlsb2FkLCAndXRmOCcpLmRpZ2VzdCgnaGV4Jyk7Cn0KCi eightKipUaGUgY29yZSBpbnZhcmlhbnQgb2YgdGhpcyBzdG9yZSBpcyB0aGF0IGEgZ2l2ZW4gaWRlbXBvdGVuY3kga2V5IG1hcHMgdG8gYXQgbW9zdCBvbmUgY29tbWl0dGVkIHJlc3BvbnNlIGZvciBhIGdpdmVuIGJvZHkgaGFzaC4gQ29uY3VycmVudCBjYWxsZXJzIG11c3QgYmUgYWJsZSB0byBjbGFpbSBhIGtleSBhdG9taWNhbGx5IGJlZm9yZSBwZXJmb3JtaW5nIHdvcmsgc28gdGhhdCBkdXBsaWNhdGUgcmVxdWVzdHMgZG8gbm90IGV4ZWN1dGUgdGhlIHNpZGUgZWZmZWN0IHR3aWNlLiAqLwpleHBvcnQgY2xhc3MgSWRlbXBvdGVuY3lTdG9yZSB7CiAgcHJpdmF0ZSByZWFkb25seSBzdG9yZSA9IG5ldyBNYXA8c3RyaW5nLCBJZGVtcG90ZW5jeVJlY29yZD4oKTsKICAvKiogS2V5cyB0aGF0IGhhdmUgYmVlbiBjbGFpbWVkIGJ1dCBub3QgeWV0IGNvbW1pdHRlZC4gKi8KICBwcml2YXRlIHJlYWRvbmx5IGluRmxpZ2h0ID0gbmV3IE1hcDxzdHJpbmcsIHN0cmluZz4oKTsKICBwcml2YXRlIHJlYWRvbmx5IG1heFNpemU6IG51bWJlcjsKICBwcml2YXRlIHJlYWRvbmx5IHR0bE1zOiBudW1iZXI7CgogIGNvbnN0cnVjdG9yKG9wdGlvbnM6IElkZW1wb3RlbmN5U3RvcmVPcHRpb25zID0ge30pIHsKICAgIHRoaXMubWF4U2l6ZSA9IG9wdGlvbnMubWF4U2l6ZSA/PyBERUZBVUxUX01BWF9TSVpFOwogICAgdGhpcy50dGxNcyA9IG9wdGlvbnMudHRsTXMgPz8gREVGQVVMVF9UVExfTVM7CiAgfQoKICBnZXQoa2V5OiBzdHJpbmcpOiBJZGVtcG90ZW5jeVJlY29yZCB8IHVuZGVmaW5lZCB7CiAgICBjb25zdCByZWNvcmQgPSB0aGlzLnN0b3JlLmdldChrZXkpOwogICAgaWYgKCFyZWNvcmQpIHsKICAgICAgcmV0dXJuIHVuZGVmaW5lZDsKICAgIH0KCiAgICBpZiAoRGF0ZS5ub3coKSAtIHJlY29yZC5jcmVhdGVkQXQgPiB0aGlzLnR0bE1zKSB7CiAgICAgIHRoaXMuc3RvcmUuZGVsZXRlKGtleSk7CiAgICAgIHJldHVybiB1bmRlZmluZWQ7CiAgICB9CgogICAgcmV0dXJuIHJlY29yZDsKICB9CgogIC8qKgogICAqIEF0b21pY2FsbHkgcmVzZXJ2ZSBhbiBpZGVtcG90ZW5jeSBrZXkgZm9yIGV4ZWN1dGlvbi4KICAgKgogICAqIFJldHVybnMgYGV4ZWN1dGU6IGZhbHNlYCB3aXRoIHRoZSBjYWNoZWQgcmVzcG9uc2Ugd2hlbiBhIGNvbW1pdHRlZCByZWNvcmQKICAgKiBhbHJlYWR5IGV4aXN0cyBmb3IgdGhlIGtleSBhbmQgdGhlIGJvZHkgaGFzaCBtYXRjaGVzLiBSZXR1cm5zIGBleGVjdXRlOiB0cnVlYAogICAqIHdoZW4gdGhlIGNhbGxlciBvd25zIHRoZSBjbGFpbSBhbmQgbXVzdCBjYWxsIGBjb21taXRgIG9yIGByZWxlYXNlYC4KICAgKgogICAqIEB0aHJvd3Mgd2hlbiB0aGUga2V5IGlzIGFscmVhZHkgY2xhaW1lZCBieSBhbm90aGVyIGluLWZsaWdodCByZXF1ZXN0IG9yCiAgICogd2hlbiB0aGUga2V5IGlzIHJldXNlZCB3aXRoIGEgZGlmZmVyZW50IGJvZHkgKGJvZHkgY29uZmxpY3QpLgogICAqLwogIGNsYWltKGtleTogc3RyaW5nLCBpbnB1dDogQ3JlYXRlQXVkaXRFbnRyeUlucHV0KTogSWRlbXBvdGVuY3lSZXNvbHV0aW9uIHsKICAgIGNvbnN0IGJvZHlIYXNoID0gaGFzaEJvZHkoaW5wdXQpOwogICAgY29uc3QgZXhpc3RpbmcgPSB0aGlzLmdldChrZXkpOwoKICAgIGlmIChleGlzdGluZykgewogICAgICBpZiAoZXhpc3RpbmcuYm9keUhhc2ggIT09IGJvZHlIYXNoKSB7CiAgICAgICAgdGhyb3cgbmV3IElkZW1wb3RlbmN5Q29uZmxpY3RFcnJvcihrZXkpOwogICAgICB9CiAgICAgIHJldHVybiB7IGV4ZWN1dGU6IGZhbHNlLCByZXNwb25zZTogZXhpc3RpbmcucmVzcG9uc2UgfTsKICAgIH0KCiAgICBjb25zdCBpbmZsaWdodEhhc2ggPSB0aGlzLmluRmxpZ2h0LmdldChrZXkpOwogICAgaWYgKGluZmxpZ2h0SGFzaCAhPT0gdW5kZWZpbmVkKSB7CiAgICAgIGlmIChpbmZsaWdodEhhc2ggIT09IGJvZHlIYXNoKSB7CiAgICAgICAgdGhyb3cgbmV3IElkZW1wb3RlbmN5Q29uZmxpY3RFcnJvcihrZXkpOwogICAgICB9CiAgICAgIHRocm93IG5ldyBJZGVtcG90ZW5jeUluRmxpZ2h0RXJyb3Ioa2V5KTsKICAgIH0KCiAgICB0aGlzLmV2aWN0RXhwaXJlZCgpOwogICAgdGhpcy5ldmljdE9sZGVzdElmTmVlZGVkKCk7CiAgICB0aGlzLmluRmxpZ2h0LnNldChrZXksIGJvZHlIYXNoKTsKICAgIHJldHVybiB7IGV4ZWN1dGU6IHRydWUgfTsKICB9CgogIC8qKgogICAqIENvbW1pdCB0aGUgcmVzdWx0IG9mIGFuIGluLWZsaWdodCBjbGFpbS4gSWdub3JlcyBjb21taXRzIGZvciBrZXlzIHRoYXQKICAgKiBhcmUgbm90IGN1cnJlbnRseSBjbGFpbWVkIGJ5IHRoaXMgc3RvcmUsIGFuZCByZWplY3RzIGJvZHkgbWlzbWF0Y2hlcy4KICAgKi8KICBjb21taXQoa2V5OiBzdHJpbmcsIGlucHV0OiBDcmVhdGVBdWRpdEVudHJ5SW5wdXQsIHJlc3BvbnNlOiBBdWRpdEVudHJ5KTogdm9pZCB7CiAgICBjb25zdCBib2R5SGFzaCA9IGhhc2hCb2R5KGlucHV0KTsKICAgIGNvbnN0IGluZmxpZ2h0SGFzaCA9IHRoaXMuaW5GbGlnaHQuZ2V0KGtleSk7CiAgICBpZiAoaW5mbGlnaHRIYXNoID09PSB1bmRlZmluZWQpIHsKICAgICAgLy8gTm90IGNsYWltZWQgYnkgdGhpcyBzdG9yZTsgbm90aGluZyB0byBjb21taXQuCiAgICAgIHJldHVybjsKICAgIH0KICAgIGlmIChpbmZsaWdodEhhc2ggIT09IGJvZHlIYXNoKSB7CiAgICAgIHRoaXMuaW5GbGlnaHQuZGVsZXRlKGtleSk7CiAgICAgIHRocm93IG5ldyBJZGVtcG90ZW5jeUNvbmZsaWN0RXJyb3Ioa2V5KTsKICAgIH0KCiAgICB0aGlzLmluRmxpZ2h0LmRlbGV0ZShrZXkpOwogICAgdGhpcy5zdG9yZS5zZXQoa2V5LCB7CiAgICAgIGJvZHlIYXNoLAogICAgICByZXNwb25zZSwKICAgICAgY3JlYXRlZEF0OiBEYXRlLm5vdygpLAogICAgfSk7CiAgfQoKICAvKioKICAgKiBSZWxlYXNlIGFuIGluLWZsaWdodCBjbGFpbSB3aXRob3V0IGNvbW1pdHRpbmcgYSByZXN1bHQuIFVzZSB0aGlzIG9uIGZhaWx1cmUKICAgKiBzbyB0aGF0IGEgbGF0ZXIgcmV0cnkgY2FuIHJlLWNsYWltIHRoZSBrZXkuCiAgICovCiAgcmVsZWFzZShrZXk6IHN0cmluZyk6IHZvaWQgewogICAgdGhpcy5pbkZsaWdodC5kZWxldGUoa2V5KTsKICB9CgogIC8qKgogICAqIENvbnZlbmllbmNlIHdyYXBwZXIgdGhhdCBjbGFpbXMsIGV4ZWN1dGVzLCBhbmQgY29tbWl0cyBvciByZWxlYXNlcy4KICAgKiBUaGUgcHJvdmlkZWQgZm4gbXVzdCBiZSBpZGVtcG90ZW50IG9yIGF0IGxlYXN0IHNhZmUgdG8gcmV0cnkgYWZ0ZXIgZmFpbHVyZS4KICAgKi8KICBhc3luYyBydW5FeGNsdXNpdmUoCiAgICBrZXk6IHN0cmluZywKICAgIGlucHV0OiBDcmVhdGVBdWRpdEVudHJ5SW5wdXQsCiAgICBmbjogKCkgPT4gUHJvbWlzZTxBdWRpdEVudHJ5PiB8IEF1ZGl0RW50cnksCiAgKTogUHJvbWlzZTxBdWRpdEVudHJ5PiB7CiAgICBjb25zdCByZXNvbHV0aW9uID0gdGhpcy5jbGFpbShrZXksIGlucHV0KTsKICAgIGlmICghcmVzb2x1dGlvbi5leGVjdXRlKSB7CiAgICAgIHJldHVybiByZXNvbHV0aW9uLnJlc3BvbnNlIGFzIEF1ZGl0RW50cnk7CiAgICB9CgogICAgdHJ5IHsKICAgICAgY29uc3QgcmVzcG9uc2UgPSBhd2FpdCBmbigpOwogICAgICB0aGlzLmNvbW1pdChrZXksIGlucHV0LCByZXNwb25zZSk7CiAgICAgIHJldHVybiByZXNwb25zZTsKICAgIH0gY2F0Y2ggKGVycm9yKSB7CiAgICAgIHRoaXMucmVsZWFzZShrZXkpOwogICAgICB0aHJvdyBlcnJvcjsKICAgIH0KICB9CgogIC8qKgogICAqIEJhY2t3YXJkcy1jb21wYXRpYmxlIGRpcmVjdCB3cml0ZS4gUHJvZmVyIGBjbGFpbWAvYGNvbW1pdGAgZm9yIGNvbmN1cnJlbnQKICAgKiBzYWZldHkuIFRoaXMgbWV0aG9kIGlzIGF0b21pYyB3aXRoaW4gYSBzaW5nbGUgZXZlbnQgbG9vcCB0dXJuIGFuZCB3aWxsCiAgICogb3ZlcndyaXRlIGFuIGV4aXN0aW5nIHJlY29yZCBmb3IgdGhlIGtleS4KICAgKi8KICBzZXQoa2V5OiBzdHJpbmcsIGlucHV0OiBDcmVhdGVBdWRpdEVudHJ5SW5wdXQsIHJlc3BvbnNlOiBBdWRpdEVudHJ5KTogdm9pZCB7CiAgICB0aGlzLmV2aWN0RXhwaXJlZCgpOwogICAgdGhpcy5ldmljdE9sZGVzdElmTmVlZGVkKCk7CiAgICB0aGlzLmluRmxpZ2h0LmRlbGV0ZShrZXkpOwogICAgdGhpcy5zdG9yZS5zZXQoa2V5LCB7CiAgICAgIGJvZHlIYXNoOiBoYXNoQm9keShpbnB1dCksCiAgICAgIHJlc3BvbnNlLAogICAgICBjcmVhdGVkQXQ6IERhdGUubm93KCksCiAgICB9KTsKICB9CgogIGRlbGV0ZShrZXk6IHN0cmluZyk6IHZvaWQgewogICAgdGhpcy5zdG9yZS5kZWxldGUoa2V5KTsKICAgIHRoaXMuaW5GbGlnaHQuZGVsZXRlKGtleSk7CiAgfQoKICBzaXplKCk6IG51bWJlciB7CiAgICB0aGlzLmV2aWN0RXhwaXJlZCgpOwogICAgcmV0dXJuIHRoaXMuc3RvcmUuc2l6ZTsKICB9CgogIC8qKiBOdW1iZXIgb2Yga2V5cyBjdXJyZW50bHkgY2xhaW1lZCBidXQgbm90IHlldCBjb21taXR0ZWQuICovCiAgaW5GbGlnaHRDb3VudCgpOiBudW1iZXIgewogICAgcmV0dXJuIHRoaXMuaW5GbGlnaHQuc2l6ZTsKICB9CgogIGNsZWFyKCk6IHZvaWQgewogICAgdGhpcy5zdG9yZS5jbGVhcigpOwogICAgdGhpcy5pbkZsaWdodC5jbGVhcigpOwogIH0KCiAgcHJpdmF0ZSBldmljdEV4cGlyZWQoKTogdm9pZCB7CiAgICBjb25zdCBub3cgPSBEYXRlLm5vdygpOwogICAgZm9yIChjb25zdCBba2V5LCByZWNvcmRdIG9mIHRoaXMuc3RvcmUpIHsKICAgICAgaWYgKG5vdyAtIHJlY29yZC5jcmVhdGVkQXQgPiB0aGlzLnR0bE1zKSB7CiAgICAgICAgdGhpcy5zdG9yZS5kZWxldGUoa2V5KTsKICAgICAgfQogICAgfQogIH0KCiAgcHJpdmF0ZSBldmljdE9sZGVzdElmTmVlZGVkKCk6IHZvaWQgewogICAgaWYgKHRoaXMuc3RvcmUuc2l6ZSA8IHRoaXMubWF4U2l6ZSkgewogICAgICByZXR1cm47CiAgICB9CiAgICBjb25zdCBvbGRlc3RLZXkgPSB0aGlzLnN0b3JlLmtleXMoKS5uZXh0KCkudmFsdWU7CiAgICBpZiAob2xkZXN0S2V5ICE9PSB1bmRlZmluZWQpIHsKICAgICAgdGhpcy5zdG9yZS5kZWxldGUob2xkZXN0S2V5KTsKICAgIH0KICB9Cn0KCmV4cG9ydCBjbGFzcyBJZGVtcG90ZW5jeUNvbmZsaWN0RXJyb3IgZXh0ZW5kcyBFcnJvciB7CiAgY29uc3RydWN0b3IocHVibGljIHJlYWRvbmx5IGtleTogc3RyaW5nKSB7CiAgICBzdXBlcihgSWRlbXBvdGVuY3kga2V5ICR7a2V5fSByZXVzZWQgd2l0aCBhIGRpZmZlcmVudCByZXF1ZXN0IGJvZHlgKTsKICAgIHRoaXMubmFtZSA9ICdJZGVtcG90ZW5jeUNvbmZsaWN0RXJyb3InOwogIH0KfQoKZXhwb3J0IGNsYXNzIElkZW1wb3RlbmN5SW5GbGlnaHRFcnJvciBleHRlbmRzIEVycm9yIHsKICBjb25zdHJ1Y3RvcihwdWJsaWMgcmVhZG9ubHkga2V5OiBzdHJpbmcpIHsKICAgIHN1cGVyKGBJZGVtcG90ZW5jeSBrZXkgJHtrZXl9IGlzIGFscmVhZHkgYmVpbmcgcHJvY2Vzc2VkYCk7CiAgICB0aGlzLm5hbWUgPSAnSWRlbXBvdGVuY3lJbkZsaWdodEVycm9yJzsKICB9Cn0KCmV4cG9ydCBmdW5jdGlvbiBoYXNoSWRlbXBvdGVuY3lJbnB1dChpbnB1dDogQ3JlYXRlQXVkaXRFbnRyeUlucHV0KTogc3RyaW5nIHsKICByZXR1cm4gaGFzaEJvZHkoaW5wdXQpOwp9CgpleHBvcnQgY29uc3QgaWRlbXBvdGVuY3lTdG9yZSA9IG5ldyBJZGVtcG90ZW5jeVN0b3JlKCk7Cg==
+/**
+ * @module audit/idempotency
+ * @description Idempotency store for audit entry creation.
+ *
+ * Concurrency model:
+ * - Node's event loop is single-threaded, so synchronous method bodies are
+ *   effectively atomic with respect to other JavaScript execution.
+ * - However, callers may await between a "get" and a "set" (e.g. across an
+ *   await boundary in an async request handler). Two racing requests can
+ *   both observe "miss" and both proceed to append, causing duplicate audit
+ *   entries and a branched hash chain.
+ * - To harden against this, the store exposes an atomic
+ *   `claim()` operation that reserves a key before the caller awaits any
+ *   I/O. A second concurrent claim for the same key either returns the
+ *   existing record (fast path) or receives a distinct `'in-flight'` status.
+ *
+ * Invariants:
+ * - A given key is at most once in the `in-flight` state at any time.
+ * - A key in the `in-flight` state cannot be reclaimed by another caller
+ *   until it is committed or released.
+ * - Once committed, the record is immutable for the remainder of its TTL.
+ * - Expired records are treated as absent by every read path.
+ * - Body hashes are compared on commit; a mismatch is a client error,
+ *   not a silent overwrite.
+ */
+
+import { createHash } from 'crypto';
+import type { AuditEntry, CreateAuditEntryInput } from './types';
+
+export interface IdempotencyRecord {
+  bodyHash: string;
+  response: AuditEntry;
+  createdAt: number;
+}
+
+export interface IdempotencyStoreOptions {
+  maxSize?: number;
+  ttlMs?: number;
+  /**
+   * Optional clock supplied by tests or callers that need deterministic
+   * time behaviour. Defaults to `Date.now`.
+   */
+  clock?: () => number;
+}
+
+/**
+ * Result of an attempt to claim a key for in-flight execution.
+ *
+ * - `claime`: the caller owns the key and must eventually call
+ *   `commit()` or `release()`.
+ * - `completed`: an existing record was found; the caller must return
+ *   the cached response instead of re-executing.
+ * - `in-flight`: another caller is already executing this key.
+ */
+export type ClaimResult =
+  | { status: 'claimed' }
+  | { status: 'completed'; record: IdempotencyRecord }
+  | { status: 'in-flight' };
+
+const DEFAULT_MAX_SIZE = 1000;
+const DEFAULT_TTL_MS = 86_400_000;
+
+function hashBody(input: CreateAuditEntryInput): string {
+  const payload = JSON.stringify({
+    action: input.action,
+    severity: input.severity,
+    actor: input.actor,
+    resource: input.resource,
+    resourceId: input.resourceId,
+    metadata: input.metadata,
+  });
+  return createHash('sha256').update(payload, 'utf8').digest('hex');
+}
+
+/**
+ * Thrown when a caller attempts to commit a key with a body hash that differs
+ * from the one recorded at claim time. This is a client error (conflicting
+ * payloads for the same idempotency key) and must not be swallowed.
+ */
+export class IdempotencyConflictError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'IdempotencyConflictError';
+  }
+}
+
+/**
+ * Thrown when a caller attempts to commit or release a key that is not
+ * currently claimed by them.
+ */
+export class IdempotencyStateError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'IdempotencyStateError';
+  }
+}
+
+export class IdempotencyStore {
+  private readonly store = new Map<string, IdempotencyRecord>();
+  /**
+   * Keys that have been claimed but not yet committed or released.
+   * Value is the body hash recorded at claim time, so commit can verify
+   * the caller is still working on the same payload.
+   */
+  private readonly inFlight = new Map<string, string>();
+  private readonly maxSize: number;
+  private readonly ttlMs: number;
+  private readonly clock: () => number;
+
+  constructor(options: IdempotencyStoreOptions = {}) {
+    this.maxSize = options.maxSize ?? DEFAULT_MAX_SIZE;
+    this.ttlMs = options.ttlMs ?? DEFAULT_TTL_MS;
+    this.clock = options.clock ?? (() => Date.now());
+  }
+
+  get(key: string): IdempotencyRecord | undefined {
+    const record = this.store.get(key);
+    if (!record) {
+      return undefined;
+    }
+
+    if (this.clock() - record.createdAt > this.ttlMs) {
+      this.store.delete(key);
+      return undefined;
+    }
+
+    return record;
+  }
+
+  /**
+   * Atomically reserve a key for execution.
+   *
+   * This is the concurrency-safe entry point for callers that need to
+   * guarantee a single audit entry per key even when multiple requests are
+   * in flight. The caller must not await anything between claim and the
+   * decision to execute.
+   *
+   * @param key - Idempotency key (typically the client-supplied header).
+   * @param input - The payload being attempted; used to bind the claim
+   *   to a specific body hash so a conflicting payload fails loud.
+   */
+  claim(key: string, input: CreateAuditEntryInput): ClaimResult {
+    const existing = this.get(key);
+    if (existing) {
+      return { status: 'completed', record: existing };
+    }
+
+    if (this.inFlight.has(key)) {
+      return { status: 'in-flight' };
+    }
+
+    // Ensure we have room for the eventual commit before claiming.
+    this.evictExpired();
+    this.ensureCapacity();
+
+    this.inFlight.set(key, hashBody(input));
+    return { status: 'claimed' };
+  }
+
+  /**
+   * Persist the result of a claimed key. The body hash must match the one
+   * recorded at claim time; otherwise the caller is attempting to commit
+   * a different payload under the same key and we raise
+   * `IdempotencyConflictError`.
+   */
+  commit(key: string, input: CreateAuditEntryInput, response: AuditEntry): void {
+    const inFlightHash = this.inFlight.get(key);
+    if (inFlightHash === undefined) {
+      throw new IdempotencyStateError(
+        `Attempted to commit key ${key} without an active claim`,
+      );
+    }
+
+    const bodyHash = hashBody(input);
+    if (bodyHash !== inFlightHash) {
+      throw new IdempotencyConflictError(
+        `Idempotency key ${key} was claimed with a different payload`,
+      );
+    }
+
+    this.inFlight.delete(key);
+    this.store.set(key, {
+      bodyHash,
+      response,
+      createdAt: this.clock(),
+    });
+  }
+
+  /**
+   * Release a claim without persisting a result. Use this on failure so a
+   * retry can proceed instead of being blocked by an orphaned claim.
+   */
+  release(key: string): void {
+    this.inFlight.delete(key);
+  }
+
+  /**
+   * @deprecated Use `claim` + `commit``. Retained for backward
+   * compatibility with existing callers. Still atomic within the event
+   * loop, but does not protect against callers that await between get/set.
+   */
+  set(key: string, input: CreateAuditEntryInput, response: AuditEntry): void {
+    this.evictExpired();
+    this.ensureCapacity();
+
+    this.store.set(key, {
+      bodyHash: hashBody(input),
+      response,
+      createdAt: this.clock(),
+    });
+  }
+
+  delete(key: string): void {
+    this.store.delete(key);
+    this.inFlight.delete(key);
+  }
+
+  size(): number {
+    this.evictExpired();
+    return this.store.size;
+  }
+
+  /** Number of keys currently claimed but not yet committed. */
+  inFlightCount(): number {
+    return this.inFlight.size;
+  }
+
+  clear(): void {
+    this.store.clear();
+    this.inFlight.clear();
+  }
+
+  private ensureCapacity(): void {
+    if (this.store.size < this.maxSize) {
+      return;
+    }
+
+    // Evict the oldest committed record. We never evict in-flight keys
+    // because that would allow a concurrent caller to claim the same key
+    // and produce a duplicate audit entry.
+    const oldestKey = this.store.keys().next().value;
+    if (oldestKey !== undefined) {
+      this.store.delete(oldestKey);
+    }
+  }
+
+  private evictExpired(): void {
+    const now = this.clock();
+    for (const [key, record] of this.store) {
+      if (now - record.createdAt > this.ttlMs) {
+        this.store.delete(key);
+      }
+    }
+  }
+}
+
+export function hashIdempotencyInput(input: CreateAuditEntryInput): string {
+  return hashBody(input);
+}
+
+export const idempotencyStore = new IdempotencyStore();

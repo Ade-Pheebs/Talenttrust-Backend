@@ -20,28 +20,17 @@ import { AUDIT_ACTIONS, AUDIT_SEVERITIES, decodeCursor } from './types';
 import { createDefaultAuditRepository, type AuditLogRepository } from './repository';
 import { auditExportService, AuditExportService, type AuditExportFilters, type AuditExportResult } from './exportService';
 import { AuditCache, type AuditCacheOptions } from './auditCache';
+import {
+  idempotencyStore as defaultIdempotencyStore,
+  IdempotencyStore,
+  type IdempotencyStoreOptions,
+} from './idempotency';
 
 export interface AuditServiceOptions {
   /** Cache options for audit read responses. */
   cache?: AuditCacheOptions;
-  /**
-   * Maximum number of audit entries to accumulate in a single batch before
-   * flushing to the repository. Defaults to 1 (every log is flushed immediately).
-   * Setting this > 1 enables coalescing of concurrent logs into a batch while
-   * preserving deterministic ordering.
-   */
-  batchSize?: number;
-  /**
-   * Maximum number of milliseconds a batch may remain open before being
-   * flushed. Only applies when `batchSize > 1`. Defaults to 0.
-   */
-  batchFlushIntervalMs?: number;
-  /**
-   * Maximum number of retries for a transient repository failure. Defaults to 0
-   * (no retries). Retries are idempotent because the service deduplicates by
-   * correlationId + action + resourceId + timestamp within an in-memory window.
-   */
-  maxRetries?: number;
+  /** Idempotency store options for write de-duplication. */
+  idempotency?: IdempotencyStoreOptions;
 }
 
 export const VALID_ACTIONS = new Set<AuditAction>(AUDIT_ACTIONS);
@@ -329,61 +318,14 @@ export function parseAuditQuery(
  */
 export class AuditService {
   private cache: AuditCache | null;
-  private readonly dedupeWindowMs: number;
-  private readonly maxRetries: number;
-  /** Map of dedupe key -> persisted entry + expiry timestamp. */
-  private readonly dedupeMap = new Map<string, { entry: AuditEntry; expiresAt: number }>();
-  /** Serialises concurrent appends to the repository. */
-  private appendChain: Promise<unknown> = Promise.resolve();
+  private readonly idempotencyStore: IdempotencyStore;
 
   constructor(
     private readonly repository: AuditLogRepository = createDefaultAuditRepository(),
     private readonly options: AuditServiceOptions = {},
   ) {
     this.cache = options.cache ? new AuditCache(options.cache) : null;
-    this.dedupeWindowMs = Math.max(0, options.batchFlushIntervalMs ?? 0);
-    this.maxRetries = Math.max(0, options.maxRetries ?? 0);
-  }
-
-  /**
-   * Computes a deterministic dedupe key for an audit input. Two inputs that
-   * share the same correlationId, action, resourceId, and timestamp are treated
-   * as the same logical event. When no correlationId is present, the key is
-   * derived from actor + action + resourceId + timestamp so duplicate retries
-   * still collapse.
-   */
-  private dedupeKey(input: CreateAuditEntryInput): string {
-    const correlation = input.correlationId ?? '';
-    const timestamp = input.timestamp ?? '';
-    return [correlation, input.action, input.actor, input.resource, input.resourceId, timestamp].join('|');
-  }
-
-  private pruneExpiredDedupeEntries(now: number): void {
-    for (const [key, record] of this.dedupeMap) {
-      if (record.expiresAt <= now) {
-        this.dedupeMap.delete(key);
-      }
-    }
-  }
-
-  /**
-   * Serialises async work against the repository so concurrent callers cannot
-   * interleave appends. The chain is always reset to a resolved promise even on
-   * failure, ensuring one failed write cannot block future writes.
-   */
-  private async withAppendLock <T>(fn: () => T | Promise<T>): Promise<T> {
-    const previous = this.appendChain;
-    let release!: () => void;
-    const next = new Promise<void>((resolve) => {
-      release = resolve;
-    });
-    this.appendChain = previous.then(() => next, () => next);
-    await previous.catch(() => undefined);
-    try {
-      return await fn();
-    } finally {
-      release();
-    }
+    this.idempotencyStore = new IdempotencyStore(options.idempotency);
   }
 
   /**
@@ -429,42 +371,48 @@ export class AuditService {
   }
 
   /**
-   * Async variant of `log` that serialises concurrent appends and retries
-   * transient repository failures idempotently. Retries re-use the same dedupe
-   * key, so a retry after a partial failure never double-appends.
+   * Records an audit event idempotently.
+   *
+   * When `idempotencyKey` is provided, the service guarantees that at
+   * most one audit entry is appended for that key, even under concurrent
+   * or repeated calls. The first caller to claim the key executes the
+   * append; every other caller receieves the cached entry.
+   *
+   * Three outcomes are possible:
+   * - claimed: this caller won the race and the entry is appended.
+   * - completed: an entry already exists for this key; the cached entry
+   *   is returned and no append occurs.
+   * - in-flight: another caller is already executing this key. This is
+   *   surfaced as a conflict error so the caller can retry with backoff
+   *   rather than blindly duplicating work.
+   *
+   * @param input - Event details.
+   * @param idempotencyKey - Optional client-supplied key.
+   * @returns The persisted or cached AuditEntry.
    */
-  async logAsync(input: CreateAuditEntryInput): Promise<AuditEntry> {
-    return this.withAppendLock(async () => {
-      const now = Date.now();
-      this.pruneExpiredDedupeEntries(now);
+  logIdempotent(input: CreateAuditEntryInput, idempotencyKey: string): AuditEntry {
+    const claim = this.idempotencyStore.claim(idempotencyKey, input);
 
-      const key = this.dedupeKey(input);
-      const existing = this.dedupeMap.get(key);
-      if (existing && existing.expiresAt > now) {
-        return existing.entry;
-      }
+    if (claim.status === 'completed') {
+      return claim.record.response;
+    }
 
-      let lastError: unknown = undefined;
-      for (let attempt = 0; attempt <= this.maxRetries; attempt++) {
-        try {
-          const entry = this.repository.append(input);
-          if (this.dedupeWindowMs > 0) {
-            this.dedupeMap.set(key, { entry, expiresAt: Date.now() + this.dedupeWindowMs });
-          }
-          if (this.cache) {
-            this.cache.invalidateByResourceId(input.resourceId);
-          }
-          return entry;
-        } catch (err) {
-          lastError = err;
-          console.error(
-            `[AuditService] Failed to persist audit entry (attempt ${attempt + 1}/${this.maxRetries + 1}):",
-            err,
-          );
-        }
-      }
-      throw lastError;
-    });
+    if (claim.status === 'in-flight') {
+      throw new Error(
+        `Audit entry for idempotency key ${idempotencyKey} is already in flight`,
+      );
+    }
+
+    try {
+      const entry = this.log(input);
+      this.idempotencyStore.commit(idempotencyKey, input, entry);
+      return entry;
+    } catch (err) {
+      // Failure must not leave an orphaned claim behind, otherwise retries
+      // would be permanently blocked for this key.
+      this.idempotencyStore.release(idempotencyKey);
+      throw err;
+    }
   }
 
   /**
@@ -731,29 +679,43 @@ export class AuditService {
   /**
    * Retrieves a single audit entry by ID.
    */
-  getEntry(id: string): AuditEntry | undefined {
-    return this.repository.findById(id);
+  getById(id: string): AuditEntry | undefined {
+    return this.repository.getById(id);
   }
 
   /**
-   * Queries audit entries with the given filters.
+   * Returns all audit entries.
    */
-  query(query: AuditQuery): AuditEntry[] {
+  getAll(): AuditEntry[] {
+    return this.repository.getAll();
+  }
+
+  /**
+   * Queries the audit log with optional filters.
+   */
+  query(query: AuditQuery = {}): AuditEntry[] {
     return this.repository.query(query);
   }
 
   /**
-   * Queries audit entries using cursor-based pagination.
+   * Queries the audit log with cursor-based pagination.
+   */
+  queryWithCursor(query: AuditQuery = {}): AuditQueryResult {
+    return this.repository.queryWithCursor(query);
+  }
+
+  /**
+   * Verifies the integrity of the audit hash chain.
    */
   queryWithCursor(query: AuditQuery): AuditQueryResult {
     return this.repository.queryWithCursor(query);
   }
 
   /**
-   * Returns an integrity report for the audit log.
+   * Returns the number of audit entries.
    */
-  getIntegrityReport(): IntegrityReport {
-    return this.repository.getIntegrityReport();
+  count(): number {
+    return this.repository.count();
   }
 }
 

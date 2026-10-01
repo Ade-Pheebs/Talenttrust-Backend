@@ -48,16 +48,13 @@ import type { AuditLogRepository } from './repository';
 export const GENESIS_HASH = 'GENESIS';
 
 /**
- * Thrown (as a plain `Error` carrying this exact message) when a cursor was
- * produced under different filters than the query that presented it.
- *
- * Exported and shared with {@link SqliteAuditRepository} so both storage
- * backends reject filter drift with an identical, assertable signal — the
- * in-memory store used to swallow this condition and silently restart
- * pagination, which is a correctness bug rather than a recoverable input
- * error.
+ * Maximum number of entries retained in the in-memory log.
+ * Bounds memory growth under sustained concurrent appends.
  */
-export const CURSOR_FILTER_MISMATCH_MESSAGE = 'Cursor filters do not match query filters';
+const MAX_LOG_SIZE = 100_000;
+
+/** Maximum number of concurrent append operations allowed. */
+const MAX_CONCURRENT_APPENDS = 1;
 
 /**
  * Computes the SHA-256 hash for an audit entry.
@@ -144,23 +141,22 @@ export class AuditStore implements AuditLogRepository {
   /** Internal append-only log. Never mutate directly. */
   private readonly log: AuditEntry[] = [];
 
-  /** Serializes append operations across concurrent callers. */
-  private readonly mutex = new AsyncMutex();
+  private _appendGuard = false;
+  private _pendingAppends = 0;
+  private _lastAppendError: Error | undefined;
 
-  /**
-   * Appends a new entry to the log.
-   *
-   * @description The append is atomic and serialized: the previous hash is
-   * read, the new entry hash computed, and the entry pushed within a single
-   * exclusive section. Concurrent appends cannot observe stale previous hashes
-  * or produce a forked chain.
-   *
-   * @param input - The audit entry data.
-   * @returns The frozen, chained entry that was appended.
-   * @rejects If a re-entrant append is detected.
-   */
-  append(input: CreateAuditEntryInput): Promise<AuditEntry> {
-    return this.mutex.runExclusive(() => {
+  append(input: CreateAuditEntryInput): AuditEntry {
+    if (this._appendGuard) {
+      throw new Error('AuditStore append re-entrancy detected');
+    }
+
+    if (this._pendingAppends >= MAX_CONCURRENT_APPENDS) {
+      throw new Error('AuditStore append concurrency limit exceeded');
+    }
+
+    this._appendGuard = true;
+    this._pendingAppends += 1;
+    try {
       const previousHash =
         this.log.length === 0 ? GENESIS_HASH
         : this.log[this.log.length - 1].hash;
@@ -184,10 +180,20 @@ export class AuditStore implements AuditLogRepository {
         hash: computeEntryHash(partial),
       });
 
+      if (this.log.length >= MAX_LOG_SIZE) {
+        throw new Error('AuditStore log capacity exceeded');
+      }
+
       this.log.push(entry);
       Object.freeze(this.log);
       return entry;
-    });
+    } catch (err) {
+      this._lastAppendError = err instanceof Error ? err : new Error(String(err));
+      throw this._lastAppendError;
+    } finally {
+      this._pendingAppends -= 1;
+      this._appendGuard = false;
+    }
   }
 
   /**
@@ -408,6 +414,9 @@ export class AuditStore implements AuditLogRepository {
    */
   _reset(): void {
     this.log.length = 0;
+    this._appendGuard = false;
+    this._pendingAppends = 0;
+    this._lastAppendError = undefined;
   }
 }
 

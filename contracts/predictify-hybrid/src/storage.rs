@@ -9,6 +9,15 @@ use soroban_sdk::{contracttype, Address, BytesN, Symbol};
 // If you need a longer window, increase this constant and redeploy.
 pub const IDEM_KEY_TTL_LEDGERS: u32 = 17_280; // ~24 h at 5 s/ledger
 
+/// Maximum number of bets in a single `place_bets` batch.
+///
+/// This bound is enforced before any state mutation so that an
+/// oversized batch is rejected atomically without consuming the
+/// caller's idempotency key. The value is deliberately small enough
+/// to keep the batch and its emitted events well within the network'
+/// transaction resource limits, and large enough for realistic use.
+pub const MAX_BATCH_SIZE: u32 = 100;
+
 /// Storage keys used by the contract.
 //
 // `PlaceBetsIdem(user, key)` stores a sentinel `true` value once a
@@ -22,7 +31,7 @@ pub const IDEM_KEY_TTL_LEDGERS: u32 = 17_280; // ~24 h at 5 s/ledger
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum DataKey {
-    /// Idempotency sentinel for a `place_bets` call.
+    /// Idempotency receipt for a `place_bets` call.
     /// Keyed by (caller address, 32-byte token supplied by the caller).
     PlaceBetsIdem(Address, BytesN <32>),
 

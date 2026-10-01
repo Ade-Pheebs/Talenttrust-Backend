@@ -312,6 +312,34 @@ export const rateLimitConfig = {
   } satisfies RateLimiterConfig,
 
   /**
+   * API Keys management tier.
+   */
+  apiKeys: {
+    maxRequests: toCount(process.env.RL_API_KEYS_MAX, 60),
+    windowMs: toMs(process.env.RL_API_KEYS_WINDOW_MS, 60_000),
+    abuseThreshold: toCount(process.env.RL_API_KEYS_ABUSE_THRESHOLD, 5),
+    blockWindowMs: toMs(process.env.RL_API_KEYS_BLOCK_WINDOW_MS, 300_000),
+    blockDurationMs: toMs(process.env.RL_API_KEYS_BLOCK_DURATION_MS, 600_000),
+    maxBlockDurationMs: toMs(process.env.RL_API_KEYS_MAX_BLOCK_MS, 86_400_000),
+    sendHeaders: true,
+    ...sharedStore,
+  } satisfies RateLimiterConfig,
+
+  /**
+   * Webhooks API subscription management tier.
+   */
+  webhooksApi: {
+    maxRequests: toCount(process.env.RL_WEBHOOKS_API_MAX, 60),
+    windowMs: toMs(process.env.RL_WEBHOOKS_API_WINDOW_MS, 60_000),
+    abuseThreshold: toCount(process.env.RL_WEBHOOKS_API_ABUSE_THRESHOLD, 5),
+    blockWindowMs: toMs(process.env.RL_WEBHOOKS_API_BLOCK_WINDOW_MS, 300_000),
+    blockDurationMs: toMs(process.env.RL_WEBHOOKS_API_BLOCK_DURATION_MS, 600_000),
+    maxBlockDurationMs: toMs(process.env.RL_WEBHOOKS_API_MAX_BLOCK_MS, 86_400_000),
+    sendHeaders: true,
+    ...sharedStore,
+  } satisfies RateLimiterConfig,
+
+  /**
    * Webhook token bucket configuration for rate limiting outbound webhook deliveries.
    */
   webhook: {

@@ -52,14 +52,16 @@ export class ContractEventProcessor {
 
     // Advance the checkpoint for this contract network only after the event is successfully persisted.
     // We only move the checkpoint forward to avoid regressing on out-of-order or reorged payloads.
-    const { network, contract, ledger, sequence } = validation.event;
+    const { network, ledger, sequence, contractId } = validation.event;
+    const contract = contractId;
+    const ledgerStr = ledger !== undefined ? String(ledger) : '0';
     try {
-      const currentCheckpoint = await this.checkpointRepository.getCheckpoint(network, contract);
+      const currentCheckpoint = await this.checkpointRepository.getCheckpoint(network ?? 'default', contract);
       if (currentCheckpoint === null || sequence > currentCheckpoint.sequence) {
         await this.checkpointRepository.saveCheckpoint({
-          network,
+          network: network ?? 'default',
           contract,
-          ledger,
+          ledger: ledgerStr,
           sequence,
         });
       }

@@ -43,7 +43,7 @@ export function decodeCursor(cursor: string): CursorPosition {
     throw new Error('Invalid pagination cursor: malformed');
   }
 
-  // Base64url strict charset (RFC 4648 §5). Rejects padding =), whitespace, or other encodings.
+  // Base64url strict charset (RFC 4648 §5). Rejects padding (=), whitespace, or other encodings.
   if (!/^[A-Za-z0-9_-]+$/.test(cursor)) {
     throw new Error('Invalid pagination cursor: malformed');
   }
@@ -60,7 +60,7 @@ export function decodeCursor(cursor: string): CursorPosition {
     typeof parsed !== 'object' ||
     parsed === null ||
     typeof (parsed as Record<string, unknown>)['createdAt'] !== 'string' ||
-    typeof (parsed as Record<string, unknown>)[id'] !== 'string'
+    typeof (parsed as Record<string, unknown>)['id'] !== 'string'
   ) {
     throw new Error('Invalid pagination cursor: missing required fields');
   }
@@ -121,7 +121,7 @@ export interface CursorQueryError {
  * decode-then-catch block.
  *
  * @param rawCursor - The raw `req.query['cursor']` value (usually `string | undefined`).
- * @returns `{ ok: true, cursor }`when the value is absent or decodes successfully,
+ * @returns `{ ok: true, cursor }` when the value is absent or decodes successfully,
  *   otherwise `{ ok: false, message }` with the same message `decodeCursor` throws.
  */
 export function resolveCursorQueryParam(rawCursor: unknown): CursorQueryOk | CursorQueryError {
@@ -202,6 +202,9 @@ export interface CursorRepository {
 export class InMemoryCursorRepository implements CursorRepository {
   private readonly cursorsBySourceId = new Map<string, IndexerCursor>();
 
+  // Checkpoint store keyed by "network:contract"
+  private readonly checkpoints = new Map<string, { network: string; contract: string; ledger: number; eventSequence: number }>();
+
   async getCursor(sourceId: string): Promise<IndexerCursor | null> {
     return this.cursorsBySourceId.get(sourceId) ?? null;
   }
@@ -235,8 +238,11 @@ export class InMemoryCursorRepository implements CursorRepository {
     if (existing === undefined) {
       // No cursor to rewind — create one at the target sequence.
       const now = new Date().toISOString();
+      const parsed = parseSourceId(sourceId);
       const cursor: IndexerCursor = {
+        ...parseSourceId(sourceId),
         sourceId,
+        ...parsed,
         lastSequence: toSequence,
         updatedAt: now,
       };
@@ -269,4 +275,17 @@ export class InMemoryCursorRepository implements CursorRepository {
   async deleteCursor(sourceId: string): Promise<boolean> {
     return this.cursorsBySourceId.delete(sourceId);
   }
+
+  async getCheckpoint(network: string, contract: string): Promise<{ network: string; contract: string; ledger: number; eventSequence: number } | null> {
+    return this.checkpoints.get(`${network}:${contract}`) ?? null;
+  }
+
+  async updateCheckpoint(network: string, contract: string, ledger: number, eventSequence: number): Promise<void> {
+    this.checkpoints.set(`${network}:${contract}`, { network, contract, ledger, eventSequence });
+  }
+
+  async listCheckpoints(): Promise<Array<{ network: string; contract: string; ledger: number; eventSequence: number }>> {
+    return Array.from(this.checkpoints.values());
+  }
 }
+

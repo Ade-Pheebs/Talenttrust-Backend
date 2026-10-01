@@ -260,7 +260,7 @@ describe('ContractEventIndexer', () => {
     it('does not advance the cursor when a projection write fails', async () => {
       const source = 'network-1:contract-1:ethereum';
       const failingEventRepository = new InMemoryContractEventRepository();
-      jest.spyOn(failingEventRepository, 'save').mockRejectedValue(new Error('projection write failed'));
+      jest.spyOn(failingEventRepository, 'saveEvent').mockRejectedValue(new Error('projection write failed'));
       const failingProcessor = new ContractEventProcessor(failingEventRepository);
       const failingIndexer = new ContractEventIndexer(failingProcessor, cursorRepository);
 

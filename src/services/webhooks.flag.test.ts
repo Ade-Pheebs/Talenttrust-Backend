@@ -148,7 +148,7 @@ describe('WEBHOOKS_ENABLED=true (flag ON)', () => {
     await service.trigger('contract.created', { id: 'abc' });
 
     expect(mockFindAll).toHaveBeenCalledTimes(1);
-    expect(mockFindAll).toHaveBeenCalledWith({ eventType: 'contract.created', active: true });
+    expect(mockFindAll).toHaveBeenCalledWith({ eventType: 'contract.created', active: true, tenantId: 'default' });
   });
 
   it('trigger() delivers to each active matching subscription', async () => {

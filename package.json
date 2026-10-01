@@ -26,7 +26,7 @@
     "test:docs": "swagger-cli validate docs/openapi.yaml"
   },
   "engines": {
-    "node": ">=18"
+    "node": ">=22"
   },
   "keywords": [
     "blockchain",

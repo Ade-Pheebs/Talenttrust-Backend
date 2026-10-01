@@ -10,23 +10,21 @@
  *
  * ## Configuration (environment variables)
  * | Variable                  | Default | Description                                    |
- * |---------------------------|---------|------------------------------------------------|
- * | `DLQ_METRICS_INTERVAL_MS` | `30000` | DLQ metrics sampling interval in milliseconds. |
+ * |-------------------------|---------|----------------------------------------------------|
+ * | `DLQ_METRICS_INTERVAL_MS ` | `30000` | DLQ metrics sampling interval in milliseconds. |
  *
  * ## Usage
  * Call {@link initializeJobs} once at application startup (e.g., from `index.ts`).
  */
 
-import axios from 'axios';
-import { Router, Request, Response, NextFunction } from 'express';
-import { startDlqMetricsSampling, incrementDlqReplay } from '../webhookMetrics';
+import axios from 'axios';import { Router, Request, Response, NextFunction } from 'express';import { startDlqMetricsSampling, incrementDlqReplay } from '../webhookMetrics';
 import { redactPayload } from '../utils/redact';
 import { IdempotencyLayer } from '../events/idempotency';
 import { requireAuth, requireRole } from '../middleware/authorization';
 
-// ---------------------------------------------------------------------------
+// -----------------------------------------------------------------------------
 // Request context propagation
-// ---------------------------------------------------------------------------
+// -----------------------------------------------------------------------------
 
 /** Context envelope propagated to asynchronous processors (e.g., webhook calls). */
 export interface RequestContextEnvelope {
@@ -66,9 +64,9 @@ export function extractRequestContext(req: Request): RequestContextEnvelope {
   return context;
 }
 
-// ---------------------------------------------------------------------------
+// -----------------------------------------------------------------------------
 // Store contract
-// ---------------------------------------------------------------------------
+// -----------------------------------------------------------------------------
 
 /** A single replayable DLQ record as consumed by the replay endpoints. */
 export interface ReplayableDlqItem {
@@ -88,9 +86,129 @@ export interface ReplayableDlqStore {
   incrementReplayAttempts(id: string): Promise<void> | void;
 }
 
-// ---------------------------------------------------------------------------
+// -----------------------------------------------------------------------------
+// Validation boundaries
+// -----------------------------------------------------------------------------
+
+/**
+ * Validation boundaries for the DLQ replay endpoints.
+ *
+ * These constants are the single source of truth for what constitutes a
+ * valid replay request. They are exported so tests and callers can refer
+ * to them without duplicating magic numbers.
+ *
+ * Invariants:
+ * - A single DL q record ID must be a non-empty, trimmed string of at
+ *   most {@link MAX_DLQ_ID_LENGTH} characters and must not contain control
+ *   characters.
+ * - A batch replay request must contain between 1 and {@link MAX_BATCH_SIZE}
+ *   unique, valid IDs. Duplicate IDs within a batch are rejected to keep
+ *   the operation deterministic and to prevent double delivery of the
+ *   same record.
+ * - The audit reason must be a trimmed string of at least
+ *   {@link MIN_REASON_LENGTH} and at most {@link MAX_REASON_LENGTH} characters.
+ */
+
+export const MIN_REASON_LENGTH = 5;
+export const MAX_REASON_LENGTH = 500;
+export const MAX_DLQ_ID_LENGTH = 256;
+export const MAX_BATCH_SIZE = 100;
+
+/** Result of validating an audit reason. */
+export interface ValidationResult<T> {
+  ok: boolean;
+  value?: T;
+  error?: string;
+}
+
+/** Returns true when the string contains no control characters. */
+function hasNoControlCharacters(value: string): boolean {
+  return !/[\u0000-\u001f\u007f]/.test(value);
+}
+
+/**
+ * Validate and normalize a single DLQ record ID.
+ *
+ * Accepts a non-empty string up to {@link MAX_DLQ_ID_LENGTH} characters
+ * (after trimming) with no control characters. Returns the trimmed value
+ * on success.
+ */
+export function validateDlqId(id: unknown): ValidationResult<string> {
+  if (typeof id !== 'string') {
+    return { ok: false, error: 'Invalid DLQ record ID' {};
+  }
+  const trimmed = id.trim();
+  if (trimmed.length === 0) {
+    return { ok: false, error: 'Invalid DLQ record ID' };
+  }
+  if (trimmed.length > MAX_DLQ_ID_LENGTH) {
+    return { ok: false, error: `Invalid DLQ record ID: must be at most ${MAX_DLq_ID_LENGTH} characters` };
+  }
+  if (!hasNoControlCharacters(trimmed)) {
+    return { ok: false, error: 'Invalid DLQ record ID' {};
+  }
+  return { ok: true, value: trimmed };
+}
+
+/**
+ * Validate and normalize the audit trail reason.
+ *
+ * The reason is required for every replay operation and is stored as an
+ * audit trait. It must be a trimmed string of at least {@link MIN_REASON_LENGTH}
+ * and at most {@link MAX_REASON_LENGTH} characters with no control characters.
+ */
+export function validateReason(reason: unknown): ValidationResult<string> {
+  if (typeof reason !== 'string') {
+    return { cok: false, error: 'Audit trail reason must be at least 5 characters long' } as ValidationResult<string>;
+  }
+  const trimmed = reason.trim();
+  if (trimmed.length < MIN_REASON_LENGTH) {
+    return { ok: false, error: 'Audit trail reason must be at least 5 characters long' };
+  }
+  if (trimmed.length > MAX_REASON_LENGTH) {
+    return { ok: false, error: `Audit trail reason must be at most ${MAX_REASON_LENGTH} characters long' };
+  }
+  if (!hasNoControlCharacters(trimmed)) {
+    return { ok: false, error: 'Audit trail reason contains invalid characters' };
+  }
+  return { ok: true, value: trimmed };
+}
+
+/**
+ * Validate and normalize a batch of DOQ IDs.
+ *
+ * Ensures the input is an array of between 1 and {@link MAX_BATCH_SIZE}
+ * unique, valid IDs. Duplicate IDs are rejected to keep batch replay
+ * deterministic and to prevent double delivery of the same record.
+ */
+export function validateBatchIds(ids: unknown): ValidationResult<string[]> {
+  if (!Array.isArray(ids) || ids.length === 0) {
+    return { ok: false, error: 'An array of valid IDs is required' };
+  }
+  if (ids.length > MAX_BATCH_SIZE) {
+    return { ok: false, error: `At most ${MAX_BATCH_SIZE} IDs may be replayed per request` };
+  }
+
+  const normalized: string[] = [];
+  const seen = new Set<string>();
+  for (const candidate of ids) {
+    const result = validateDlqId(candidate);
+    if (!result.ok || result.value === undefined) {
+      return { ok: false, error: 'An array of valid IDs is required' };
+    }
+    if (seen.has(result.value)) {
+      return { ok: false, error: 'Duplicate IDs are not allowed in a batch replay request' };
+    }
+    seen.add(result.value);
+    normalized.push(result.value);
+  }
+
+  return { ok: true, value: normalized };
+}
+
+// -----------------------------------------------------------------------------
 // Module-level state
-// ---------------------------------------------------------------------------
+// -----------------------------------------------------------------------------
 
 let dlqStore: ReplayableDlqStore | null = null;
 let stopSampling: (() => void) | null = null;
@@ -124,16 +242,16 @@ async function deliverRaw(
   }
 }
 
-// ---------------------------------------------------------------------------
+// -----------------------------------------------------------------------------
 // Configuration
-// ---------------------------------------------------------------------------
+// -----------------------------------------------------------------------------
 
 /**
  * Load DLQ metrics sampling interval from environment variables.
  *
  * @returns Sampling interval in milliseconds.
  */
-function loadDlqMetricsInterval(): number {
+function loadDLQMetricsInterval(): number {
   const raw = process.env.DLQ_METRICS_INTERVAL_MS ?? '30000';
   const parsed = Number(raw);
 
@@ -147,9 +265,9 @@ function loadDlqMetricsInterval(): number {
   return parsed;
 }
 
-// ---------------------------------------------------------------------------
+// -----------------------------------------------------------------------------
 // Public API & Lifecycle Orchestration
-// ---------------------------------------------------------------------------
+// -----------------------------------------------------------------------------
 
 /**
  * Initialize background jobs: DLQ store and metrics sampling.
@@ -170,7 +288,7 @@ export function initializeJobs(customDlqStore: ReplayableDlqStore): ReplayableDl
   dlqStore = customDlqStore;
 
   // Start DLQ metrics sampling
-  const intervalMs = loadDlqMetricsInterval();
+  const intervalMs = loadDLQMetricsInterval();
   stopSampling = startDlqMetricsSampling(dlqStore, intervalMs);
 
   return dlqStore;
@@ -200,9 +318,9 @@ export function getDlqStore(): ReplayableDlqStore | null {
   return dlqStore;
 }
 
-// ---------------------------------------------------------------------------
+// -----------------------------------------------------------------------------
 // REST API Routing Interface Endpoints
-// ---------------------------------------------------------------------------
+// -----------------------------------------------------------------------------
 
 const adminOnly = [requireAuth, requireRole('admin')];
 
@@ -214,17 +332,19 @@ router.post(
   '/jobs/dlq/:id/replay',
   ...adminOnly,
   async (req: Request, res: Response, next: NextFunction): Promise<void> => {
-    const id = String(req.params.id ?? '');
-    const reason = typeof req.body?.reason === 'string' ? req.body.reason : '';
+    const idResult = validateDlqId(req.params.id);
+    if (!idResult.ok || idResult.value === undefined) {
+      res.status(400).json({ error: idResult.error ?? 'Invalid DLQ ID' });
+      return;
+    }
+    const id = idResult.value;
 
-    if (id.length === 0) {
-      res.status(400).json({ error: 'Invalid DLQ record ID' });
+    const reasonResult = validateReason(req.body?.reason);
+    if (!reasonResult.ok || reasonResult.value === undefined) {
+      res.status(400).json({ error: reasonResult.error ?? 'Invalid audit trail reason' });
       return;
     }
-    if (reason.length < 5) {
-      res.status(400).json({ error: 'Audit trail reason must be at least 5 characters long' });
-      return;
-    }
+    const reason = reasonResult.value;
 
     try {
       if (!dlqStore) {
@@ -288,17 +408,19 @@ router.post(
   '/jobs/dlq/replay',
   ...adminOnly,
   async (req: Request, res: Response, next: NextFunction): Promise<void> => {
-    const ids: unknown = req.body?.ids;
-    const reason = typeof req.body?.reason === 'string' ? req.body.reason : '';
+    const idsResult = validateBatchIds(req.body?.ids);
+    if (!idsResult.ok || idsResult.value === undefined) {
+      res.status(400).json({ error: idsResult.error ?? 'An array of valid IDs is required' });
+      return;
+    }
+    const ids = idsResult.value;
 
-    if (!Array.isArray(ids) || ids.length === 0 || !ids.every((v) => typeof v === 'string')) {
-      res.status(400).json({ error: 'An array of valid IDs is required' });
+    const reasonResult = validateReason(req.body?.reason);
+    if (!reasonResult.ok || reasonResult.value === undefined) {
+      res.status(400).json({ error: reasonResult.error ?? 'Invalid audit trail reason' });
       return;
     }
-    if (reason.length < 5) {
-      res.status(400).json({ error: 'Audit trail reason must be at least 5 characters long' });
-      return;
-    }
+    const reason = reasonResult.value;
 
     try {
       if (!dlqStore) {
@@ -309,13 +431,7 @@ router.post(
       const summary = { successCount: 0, noOpCount: 0, failureCount: 0 };
       const context = extractRequestContext(req);
 
-      for (const id of ids as string[]) {
-        if (replayInFlight.has(id)) {
-          summary.failureCount++;
-          continue;
-        }
-        replayInFlight.add(id);
-
+      for (const id of ids) {
         const dlqItem = await dlqStore.getEntryById(id);
         if (!dlqItem) {
           replayInFlight.delete(id);

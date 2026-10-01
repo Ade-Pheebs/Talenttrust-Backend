@@ -9,9 +9,9 @@
  *
  * Security notes:
  * - Callers MUST sanitise metadata before passing it in — no raw PII.
- * - Logging failures are caught and reported via console.error to avoid
- *   disrupting the primary request flow, but they are also re-thrown in
- *   strict mode so tests can assert on them.
+ * - Persistence failures always propagate; appends are never retried implicitly.
+ * - Cache failures disable caching without changing a committed write's outcome.
+ * - Diagnostics contain fixed operation names, never payloads or dependency errors.
  */
 
 import type { AuditEntry, AuditQuery, AuditSeverity, CreateAuditEntryInput, IntegrityReport, AuditQueryResult } from './types';
@@ -152,27 +152,63 @@ export class AuditService {
     this.cache = options.cache ? new AuditCache(options.cache) : null;
   }
 
+  private reportFailure(operation: string): void {
+    // Dependency messages may contain SQL, credentials or audit metadata. A
+    // broken diagnostic sink must not mask the original failure or commit.
+    try {
+      console.error(`[AuditService] ${operation}`);
+    } catch { /* Preserve the operation's outcome. */ }
+  }
+
+  private useCache<T>(operation: (cache: AuditCache) => T): T | undefined {
+    if (!this.cache) return undefined;
+    try {
+      return operation(this.cache);
+    } catch {
+      // Never read possibly stale data again after an invalidation/read/write
+      // failure. Repository state remains authoritative for this instance.
+      this.cache = null;
+      this.reportFailure('Cache unavailable; caching disabled');
+      return undefined;
+    }
+  }
+
   /**
    * Records an audit event.
    *
    * @param input - Event details. metadata must be pre-sanitised.
    * @returns The persisted, immutable AuditEntry.
-   * @throws Only when options.strict is true and the store throws.
+   * @throws When the repository append fails. No automatic retry is attempted.
    */
   log(input: CreateAuditEntryInput): AuditEntry {
+    let entry: AuditEntry;
     try {
       const entry = this.repository.append(input);
-      
-      // Invalidate cache on write operations
+
+      // A write can change the result of *any* cached read: unfiltered queries
+      // and aggregate result sets contain this entry too, and they are keyed by
+      // their filter object (`query:{}`) rather than by `resourceId`. Invalidating
+      // only the resourceId-scoped keys left those caches serving a snapshot
+      // that predates the write, so a read that raced the write could observe
+      // the old result indefinitely (until the TTL expired). Clearing the whole
+      // read cache is the only invalidation that is correct for every filter
+      // shape; audit reads are cheap relative to the write they follow.
       if (this.cache) {
-        this.cache.invalidateByResourceId(input.resourceId);
+        this.cache.invalidate();
       }
-      
+
       return entry;
     } catch (err) {
-      console.error('[AuditService] Failed to persist audit entry:', err);
+      // Persistence exceptions can contain SQL parameters or request metadata.
+      // Keep the diagnostic stable without leaking the rejected entry.
+      console.error('[AuditService] Failed to persist audit entry', { code: 'audit_persist_failed' });
       throw err;
     }
+    // An append changes unfiltered, actor/action and cursor queries too.
+    // This is outside the persistence failure boundary: a cache fault must
+    // never turn a committed append into a retryable failure.
+    this.useCache(cache => cache.invalidate());
+    return entry;
   }
 
   /**
@@ -251,30 +287,41 @@ export class AuditService {
 
     const exportResult = await exportService.createNdjsonExport(filters);
 
-    this.log({
-      action: 'ADMIN_ACTION',
-      severity: 'CRITICAL',
-      actor: context.actor ?? 'anonymous',
-      resource: 'audit-log',
-      resourceId: 'export',
-      metadata: {
-        operation: 'export',
-        format: 'ndjson',
-        filters: {
-          action: filters.action ?? null,
-          severity: filters.severity ?? null,
-          actor: filters.actor ?? null,
-          resource: filters.resource ?? null,
-          resourceId: filters.resourceId ?? null,
-          from: filters.from ?? null,
-          to: filters.to ?? null,
+    try {
+      this.log({
+        action: 'ADMIN_ACTION',
+        severity: 'CRITICAL',
+        actor: context.actor ?? 'anonymous',
+        resource: 'audit-log',
+        resourceId: 'export',
+        metadata: {
+          operation: 'export',
+          format: 'ndjson',
+          filters: {
+            action: filters.action ?? null,
+            severity: filters.severity ?? null,
+            actor: filters.actor ?? null,
+            resource: filters.resource ?? null,
+            resourceId: filters.resourceId ?? null,
+            from: filters.from ?? null,
+            to: filters.to ?? null,
+          },
+          recordCount: exportResult.recordCount,
+          bytesWritten: exportResult.bytesWritten,
         },
-        recordCount: exportResult.recordCount,
-        bytesWritten: exportResult.bytesWritten,
-      },
-      ipAddress: context.ipAddress,
-      correlationId: context.correlationId,
-    });
+        ipAddress: context.ipAddress,
+        correlationId: context.correlationId,
+      });
+    } catch (error) {
+      // Ownership transfers to the caller only after the compliance event is
+      // persisted. Otherwise remove this request's file, never audit records.
+      try {
+        await exportResult.cleanup();
+      } catch {
+        this.reportFailure('Failed to clean up rejected audit export');
+      }
+      throw error;
+    }
 
     return exportResult;
   }
@@ -377,7 +424,141 @@ export class AuditService {
   }
 
   /**
+   * Convenience wrapper for user management events.
+   * USER_DELETED is WARNING; others are INFO.
+   */
+  logUserEvent(
+    action: Extract<AuditAction, `USER_${string}`>,
+    actor: string,
+    targetUserId: string,
+    metadata: Record<string, unknown> = {},
+    context: { ipAddress?: string; correlationId?: string } = {},
+  ): AuditEntry {
+    const severity: AuditSeverity = action === 'USER_DELETED' ? 'WARNING' : 'INFO';
+    return this.log({
+      action,
+      severity,
+      actor,
+      resource: 'user',
+      resourceId: targetUserId,
+      metadata,
+      ...context,
+    });
+  }
+
+  /**
+   * Convenience wrapper for dispute lifecycle events.
+   * DISPUTE_UPDATED is WARNING; others are INFO.
+   */
+  logDisputeEvent(
+    action: Extract<AuditAction, `DISPUTE_${string}`>,
+    actor: string,
+    disputeId: string,
+    metadata: Record<string, unknown> = {},
+    context: { ipAddress?: string; correlationId?: string } = {},
+  ): AuditEntry {
+    const severity: AuditSeverity = action === 'DISPUTE_UPDATED' ? 'WARNING' : 'INFO';
+    return this.log({
+      action,
+      severity,
+      actor,
+      resource: 'dispute',
+      resourceId: disputeId,
+      metadata,
+      ...context,
+    });
+  }
+
+  /**
+   * Queries the audit log with optional filters.
+   *
+   * @param query - Filter and pagination options.
+   * @returns Matching entries in insertion order.
+   */
+  query(query: AuditQuery = {}): AuditEntry[] {
+    // Check cache first. The array stored in the cache is a snapshot owned by
+    // the cache, so a hit is handed out as a fresh copy: a caller that sorts or
+    // truncates the result cannot mutate what a concurrent reader sees.
+    if (this.cache) {
+      const cached = this.cache.get(query, 'query');
+      if (cached) {
+        return [...(cached as AuditEntry[])];
+      }
+    }
+
+    // Cache miss - fetch from repository
+    const entries = this.repository.query(query);
+
+    // Store a copy so mutations of the returned array cannot poison the cache.
+    if (this.cache) {
+      this.cache.set(query, [...entries], 'query');
+    }
+
+    return entries;
+  }
+
+  /**
+   * Queries the audit log with cursor-based pagination.
+   *
+   * @param query - Filter and pagination options including cursor.
+   * @returns Paginated result with entries and next cursor.
+   */
+  queryWithCursor(query: AuditQuery = {}): AuditQueryResult {
+    // Check cache first. Both the result object and its `entries` array are
+    // copied out of the cache so a caller cannot mutate the shared snapshot.
+    if (this.cache) {
+      const cached = this.cache.get(query, 'queryWithCursor');
+      if (cached) {
+        const result = cached as AuditQueryResult;
+        return { ...result, entries: [...result.entries] };
+      }
+    }
+
+    // Cache miss - fetch from repository
+    const result = this.repository.queryWithCursor(query);
+
+    // Store a copy so mutations of the returned object/array cannot poison the
+    // cache.
+    if (this.cache) {
+      this.cache.set(query, { ...result, entries: [...result.entries] }, 'queryWithCursor');
+    }
+
+    return result;
+  }
+
+  /**
+   * Streams audit entries for export use cases without loading all rows.
+   */
+  stream(query: AuditQuery = {}): IterableIterator<AuditEntry> {
+    return this.repository.stream(query);
+  }
+
+  /**
    * Retrieves a single audit entry by ID.
+   */
+  getById(id: string): AuditEntry | undefined {
+    // Check cache first. A hit is copied out of the cache so a caller cannot
+    // mutate the entry a concurrent reader will receive.
+    if (this.cache) {
+      const cached = this.cache.get({}, 'getById', id);
+      if (cached) {
+        return { ...(cached as AuditEntry) };
+      }
+    }
+
+    // Cache miss - fetch from repository
+    const entry = this.repository.getById(id);
+
+    // Store a copy so mutations of the returned entry cannot poison the cache.
+    if (this.cache && entry) {
+      this.cache.set({}, { ...entry }, 'getById', id);
+    }
+
+    return entry;
+  }
+
+  /**
+   * Retrieves a single entry by ID (alias method).
    */
   getEntry(id: string): AuditEntry | undefined {
     return this.repository.findById(id);

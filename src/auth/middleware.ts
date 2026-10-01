@@ -36,8 +36,7 @@ export function requirePermission(resource: Resource, action: Action) {
     // mutate the parent context object so concurrent requests cannot observe
     // each other's actor id.
     const current = getContext() ?? {};
-    const enriched = { ...current, actorId: user.id };
-
+    const enriched = { ...current, actorId: user.userId };
     requestContextStorage.run(enriched, () => {
       let allowed: boolean;
       try {

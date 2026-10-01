@@ -28,6 +28,8 @@
  */
 
 import { AsyncLocalStorage } from 'async_hooks';
+import type { Request, Response, NextFunction } from 'express';
+import { requestContextStore } from './middleware/requestContext';
 
 /**
  * Arbitrary request-scoped metadata carried through an async call chain.
@@ -56,65 +58,22 @@ export function getContext(): RequestContext | undefined {
 }
 
 /**
- * Run a callback with an explicit request-scoped context.
+ * Express middleware that seeds the AsyncLocalStorage context with the
+ * requestId and correlationId from the request headers / res.locals.
  *
- * This is the deterministic entry point for establishing context. It guarantees:
- *  1. The context is set for the duration of the callback and all awaited
- *     continuations, even if the callback throws or rejects.
- *  2. The context is always restored to the prior store after the callback
- *     completes (success or failure), so failure recovery is deterministic.
- *  3. The context object is shallow-copied before being exposed, preventing
- *     callers from mutating the caller's own reference and vice versa.
- *
- * @param context - The context to associate with the callback. Must be a
- *                  non-null object. A shallow copy is stored.
- * @param callback - The function to run with the context active.
- * @returns The result of the callback.
- * @throws TypeError if `context` is not a plain object or if `callback` is
- *         not a function.
+ * Re-exported here so `app.ts` can import it from `./context` without
+ * importing from the middleware sub-folder directly.
  */
-export function runWithContext<T>(
-  context: RequestContext,
-  callback: () => T,
-): T {
-  if (context === null || typeof context !== 'object' || Array.isArray(context)) {
-    throw new TypeError('runWithContext requires a non-null object context');
-  }
-  if (typeof callback !== 'function') {
-    throw new TypeError('runWithContext requires a callback function');
-  }
-
-  // Shallow copy so the caller and the callee never share a mutable reference.
-  const snapshot: RequestContext = { ...context };
-  return requestContextStorage.run(snapshot, callback);
-}
-
-/**
- * Merge additional fields into the current context without losing existing
- * values. Returns a new immutable snapshot and runs the callback with it.
- *
- * This is the supported way to enrich context from within an already-established
- * call chain (such as a background worker adding `actorId`). If no context is
- * active, the additions become the new context.
- *
- * @param additions - Fields to merge into the active context.
- * @param callback - The function to run with the merged context active.
- * @returns The result of the callback.
- * @throws TypeError if `additions` is not a plain object or if `callback` is
- *         not a function.
- */
-export function enrichContext<T>(
-  additions: RequestContext,
-  callback: () => T,,
-): T {
-  if (additions === null || typeof additions !== 'object' || Array.isArray(additions)) {
-    throw new TypeError('enrichContext requires a non-null object additions');
-  }
-  if (typeof callback !== 'function') {
-    throw new TypeError('enrichContext requires a callback function');
-  }
-
-  const current = requestContextStorage.getStore();
-  const merged: RequestContext = { ...(current ?? {}), ...additions };
-  return requestContextStorage.run(merged, callback);
+export function requestContextMiddleware(
+  req: Request,
+  res: Response,
+  next: NextFunction,
+): void {
+  const existing = requestContextStore.getStore();
+  const enriched: RequestContext = {
+    ...(existing ?? {}),
+    requestId: res.locals.requestId ?? req.headers['x-request-id'],
+    correlationId: res.locals.correlationId ?? req.headers['x-correlation-id'],
+  };
+  requestContextStorage.run(enriched, () => next());
 }

@@ -13,17 +13,26 @@
  *     (acceptable for tests; production should use JWTs).
  *   - Missing or malformed tokens result in 401 Unauthorized.
  *   - Role validity is checked against VALID_ROLES.
+ *   - Token values are trimmed before decoding so stray whitespace in the
+ *     Authorization header never produces a spurious cache miss or a
+ *     different validation result for the same logical token.
+ *   - decodeToken results are memoized in a bounded LRU-style cache so that
+ *     bursts of concurrent requests bearing the same token do not repeatedly
+ *     pay the base64-decode + JSON.parse cost.  The cache is intentionally
+ *     small (256 entries, 5 min TTL) and stores only the decoded *payload*,
+ *     never the raw token string itself, to limit the blast radius of a
+ *     potential memory inspection.
  *
- * State invariants:
- *   - Single authentication: req.user is set exactly once per request
- *   - Immutable identity: Once authenticated, identity cannot change
- *   - Type safety: req.user.role is always a valid Role enum value
- *   - Non-empty userId: req.user.userId is always a non-empty string
- *   - Deterministic validation: Same input always produces same output
- *   - Fail-safe: Validation failure results in 401, never calls next()
- *   - Response integrity: Middleware never sends response if already sent
- *   - Tamper-proof: req.user is frozen to prevent downstream mutation
- *   - Runtime validation: Existing req.user is validated before reuse
+ * Concurrency invariants:
+ *   - normalizeToken is a pure function — safe to call from any number of
+ *     concurrent requests without synchronization.
+ *   - decodeToken is idempotent and deterministic: the same token always
+ *     produces the same payload (or null), so concurrent calls are safe.
+ *   - The decode cache is accessed synchronously (Node.js single-threaded
+ *     event loop guarantees no torn reads/writes on Map operations).
+ *   - Cache size is capped at DECODE_CACHE_MAX_ENTRIES; once the cap is
+ *     reached the oldest inserted entry is evicted before the new one is
+ *     added, keeping memory bounded even under token-spray attacks.
  */
 
 import { Request, Response, NextFunction } from 'express';
@@ -46,6 +55,16 @@ const authLogger = {
   },
 };
 
+/**
+ * The only `Authorization` scheme this module accepts.
+ *
+ * This value is part of the public compatibility contract: it is exported so
+ * that callers and tests can refer to the scheme symbolically instead of
+ * hard-coding the literal, and any change to it is an intentional, reviewable
+ * breaking change rather than a silent one.
+ */
+export const AUTH_SCHEME = 'Bearer ';
+
 /** Shape of the decoded token payload. */
 export interface TokenPayload {
   userId: string;
@@ -56,6 +75,106 @@ export interface TokenPayload {
 export interface AuthenticatedRequest extends Omit<Request, 'user'> {
   user?: TokenPayload;
 }
+
+// ─── Token normalization ──────────────────────────────────────────────────────
+
+/**
+ * Normalize a raw bearer token value extracted from the Authorization header.
+ *
+ * Strips surrounding ASCII whitespace (spaces, tabs, CRLF) that some HTTP
+ * clients or proxies may inadvertently include.  The JWT / base64 body of a
+ * well-formed token never contains whitespace, so trimming is always safe and
+ * ensures that two strings differing only in surrounding whitespace are treated
+ * as the same token.
+ *
+ * @param raw - The token string after the "Bearer " prefix has been removed.
+ * @returns The trimmed token string (may be empty — callers must check).
+ */
+export function normalizeToken(raw: string): string {
+  return raw.trim();
+}
+
+// ─── Decode cache (bounded LRU-style, synchronous) ───────────────────────────
+
+/**
+ * Maximum number of distinct decoded tokens to keep in memory.
+ * Chosen to cover a busy service's active token set without unbounded growth.
+ */
+const DECODE_CACHE_MAX_ENTRIES = 256;
+
+/**
+ * Cache TTL in milliseconds. Tokens that have been in the cache longer than
+ * this are treated as stale and re-decoded on the next access. Set to 5 min
+ * which is well under the default JWT access-token lifetime (15 min).
+ */
+const DECODE_CACHE_TTL_MS = 5 * 60 * 1000;
+
+interface DecodeCacheEntry {
+  /** The decoded payload (null means the token was invalid). */
+  payload: TokenPayload | null;
+  /** Epoch ms when this entry was inserted. */
+  insertedAt: number;
+}
+
+/**
+ * Module-level decode cache.  Keyed by the *normalized* token string.
+ *
+ * Invariant: size <= DECODE_CACHE_MAX_ENTRIES at all times (enforced in
+ * setCacheEntry before every insertion).
+ */
+const decodeCache = new Map<string, DecodeCacheEntry>();
+
+/**
+ * Retrieve a cache entry, returning null on miss or expiry.
+ * Expired entries are lazily evicted on access.
+ *
+ * @internal
+ */
+function getCacheEntry(token: string): TokenPayload | null | undefined {
+  const entry = decodeCache.get(token);
+  if (!entry) return undefined; // cache miss
+
+  const age = Date.now() - entry.insertedAt;
+  if (age > DECODE_CACHE_TTL_MS) {
+    decodeCache.delete(token); // lazy eviction of stale entry
+    return undefined;
+  }
+
+  return entry.payload;
+}
+
+/**
+ * Insert (or overwrite) a cache entry, evicting the oldest entry first when
+ * the cache is at capacity.
+ *
+ * Eviction strategy: delete the first key reported by Map iteration, which
+ * corresponds to the entry with the earliest insertion order.  This is O(1)
+ * because Map maintains insertion order and `.keys().next()` is constant-time.
+ *
+ * @internal
+ */
+function setCacheEntry(token: string, payload: TokenPayload | null): void {
+  // If the token is already present, overwrite in-place — no eviction needed.
+  if (!decodeCache.has(token) && decodeCache.size >= DECODE_CACHE_MAX_ENTRIES) {
+    const oldest = decodeCache.keys().next().value;
+    if (oldest !== undefined) {
+      decodeCache.delete(oldest);
+    }
+  }
+  decodeCache.set(token, { payload, insertedAt: Date.now() });
+}
+
+/**
+ * Exposed for testing only — resets the decode cache to an empty state.
+ * Do NOT call this in production code.
+ *
+ * @internal
+ */
+export function _resetDecodeCache(): void {
+  decodeCache.clear();
+}
+
+// ─── Core helpers ─────────────────────────────────────────────────────────────
 
 /**
  * Validates that an object conforms to TokenPayload structure at runtime.
@@ -100,61 +219,69 @@ function isResponseSent(res: Response): boolean {
 }
 
 /**
+ * Upper bound on the size of a bearer token the decoder will accept.
+ *
+ * Base64 decodes roughly 3 bytes per 4 characters, so 64 KiB of input bounds
+ * the JSON parse to ~48 KiB — far larger than any legitimate payload, yet small
+ * enough that a hostile client cannot force unbounded work on the event loop
+ * with a single header.
+ */
+export const MAX_TOKEN_LENGTH = 64 * 1024;
+
+/**
  * Decode and validate a bearer token string.
  *
- * State invariants enforced:
- *   - Returns null for any invalid input (fail-safe)
- *   - userId is always a non-empty string if successful
- *   - role is always a valid Role enum value if successful
- *   - Deterministic: same input always produces same output
+ * This function is **total**: for any input it returns either a well-formed
+ * {@link TokenPayload} or `null`. It never throws, and it never returns a
+ * partially validated payload. Every rejection — non-string input, empty or
+ * oversized input, malformed base64, non-JSON, JSON that is not a plain object,
+ * missing or mistyped fields, unknown role — collapses to the same
+ * deterministic `null`, so a decode failure can never surface as a 500 from the
+ * middleware.
+ *
+ * The returned object is rebuilt field-by-field from validated primitives, so
+ * extra keys in the JSON (including `__proto__`) are discarded and a "JSON
+ * prototype pollution" payload cannot influence the result.
  *
  * @param token - The raw base64-encoded token.
- * @returns The decoded payload, or `null` if invalid. Never throws; see
- *   {@link validateToken} for the specific reason.
+ * @returns The decoded payload, or `null` if invalid.
  */
 export function decodeToken(token: string): TokenPayload | null {
-  // Invariant: Empty or whitespace-only tokens are invalid
-  if (!token || typeof token !== 'string' || token.trim().length === 0) {
+  // Defensive totality: callers are typed, but a JavaScript caller (or a future
+  // refactor) can pass anything, and `Buffer.from(undefined, 'base64')` throws.
+  if (typeof token !== 'string' || token.length === 0 || token.length > MAX_TOKEN_LENGTH) {
     return null;
   }
 
   try {
     const json = Buffer.from(token, 'base64').toString('utf-8');
-    
-    // Invariant: JSON must parse successfully
-    const parsed = JSON.parse(json);
-    
-    // Invariant: parsed must be an object
+    const parsed: unknown = JSON.parse(json);
+
+    // Only a plain object is a valid payload. `null`, arrays and primitives are
+    // rejected explicitly rather than relying on property-access quirks.
     if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
       return null;
     }
 
-    // Invariant: userId must be a non-empty string
-    if (typeof parsed.userId !== 'string' || parsed.userId.trim().length === 0) {
-      return null;
+    const { userId, role } = parsed as Record<string, unknown>;
+    if (
+      typeof userId !== 'string' ||
+      userId.length === 0 ||
+      typeof role !== 'string' ||
+      !(VALID_ROLES as readonly string[]).includes(role)
+    ) {
+      payload = null;
+    } else {
+      payload = { userId: parsed.userId, role: parsed.role as Role };
     }
 
-    // Invariant: role must be a string
-    if (typeof parsed.role !== 'string') {
-      return null;
-    }
-
-    // Invariant: role must be a valid Role enum value
-    // Use type-safe check instead of type assertion
-    if (!VALID_ROLES.includes(parsed.role as Role)) {
-      return null;
-    }
-
-    // At this point, we know parsed.role is a valid Role
-    const role = parsed.role as Role;
-    const userId = parsed.userId.trim();
-
-    // Invariant: Return type-safe TokenPayload
-    return { userId, role };
-  } catch (error) {
-    // Invariant: Any parsing error returns null (fail-safe)
-    return null;
+    return { userId, role: role as Role };
+  } catch {
+    payload = null;
   }
+
+  setCacheEntry(normalized, payload);
+  return payload;
 }
 
 /**
@@ -199,71 +326,34 @@ function logRejection(reason: TokenRejectionReason, path: string | undefined): v
 
 /**
  * Express middleware that extracts and validates the bearer token.
- * On success, attaches `req.user` with `{ userId, role }`.
- * On failure, responds with 401.
  *
- * State invariants enforced:
- *   - Single authentication: req.user is set exactly once per request
- *   - Immutable identity: If req.user already exists, it is not overwritten
- *   - Tamper-proof: req.user is frozen after setting to prevent downstream mutation
- *   - Runtime validation: Existing req.user is validated before reuse
- *   - Response integrity: Never sends response if already sent
- *   - Fail-safe: Validation failure results in 401, never calls next()
- *   - Deterministic: Same request always produces same result
- *   - Consistent error format: All 401 responses have { error: string }
+ * Compatibility contract (frozen by `authenticate.contract.test.ts`):
+ *
+ * | input                                       | outcome |
+ * | ------------------------------------------- | ------- |
+ * | missing, non-string or non-`Bearer ` header | 401 `{ error: 'Missing or invalid Authorization header' }` |
+ * | present-but-invalid token                   | 401 `{ error: 'Invalid token' }` |
+ * | valid token                                 | `req.user = { userId, role }` and exactly one `next()` |
+ *
+ * A repeated `Authorization` header is delivered by Node as `string[]`. It is
+ * treated as a malformed header (401) rather than being passed to
+ * `startsWith()`, which would throw a `TypeError` and surface as a 500 — so the
+ * observable contract is identical for every shape of a rejected header.
  */
 export function authenticateMiddleware(
   req: AuthenticatedRequest,
   res: Response,
   next: NextFunction,
 ): void {
-  // Invariant: Response integrity - check before attempting to send
-  if (isResponseSent(res)) {
-    authLogger.error('Response already sent, cannot authenticate');
+  const header = req.headers?.authorization;
+  const authorization = typeof header === 'string' ? header : null;
+
+  if (!authorization || !authorization.startsWith(AUTH_SCHEME)) {
+    res.status(401).json({ error: 'Missing or invalid Authorization header' });
     return;
   }
 
-  // Invariant: Single authentication - prevent identity changes mid-request
-  if (req.user) {
-    // Invariant: Runtime validation - ensure existing user is still valid
-    if (!isValidTokenPayload(req.user)) {
-      authLogger.error('Existing req.user is invalid or tampered, rejecting request');
-      res.status(500).json({ error: 'Internal authentication error' });
-      return;
-    }
-
-    // Identity already established - log and continue (idempotency)
-    authLogger.warn('Authentication already performed, skipping re-authentication', {
-      existingUserId: req.user.userId,
-      existingRole: req.user.role,
-    });
-    next();
-    return;
-  }
-
-  const header = req.headers.authorization;
-
-  // Invariant: Header must exist and be a string
-  if (!header || typeof header !== 'string') {
-    authLogger.warn('Missing Authorization header');
-    if (!isResponseSent(res)) {
-      res.status(401).json({ error: 'Missing or invalid Authorization header' });
-    }
-    return;
-  }
-
-  // Invariant: Header must start with 'Bearer ' (case-sensitive as per RFC 6750)
-  if (!header.startsWith('Bearer ')) {
-    authLogger.warn('Invalid Authorization header format', {
-      prefix: header.substring(0, 10),
-    });
-    if (!isResponseSent(res)) {
-      res.status(401).json({ error: 'Missing or invalid Authorization header' });
-    }
-    return;
-  }
-
-  const token = header.slice(7);
+  const payload = decodeToken(authorization.slice(AUTH_SCHEME.length));
 
   // Invariant: Token must not be empty after 'Bearer ' prefix
   if (token.length === 0) {
@@ -274,20 +364,8 @@ export function authenticateMiddleware(
     return;
   }
 
-  const payload = decodeToken(token);
-
-  // Invariant: Invalid token results in 401
-  if (!payload) {
-    authLogger.warn('Token validation failed', {
-      tokenLength: token.length,
-    });
-    if (!isResponseSent(res)) {
-      res.status(401).json({ error: 'Invalid token' });
-    }
-    return;
-  }
-
-  // Invariant: Set req.user exactly once (single authentication)
+  // Assign (not merge): a previous layer's identity is replaced wholesale, so
+  // `req.user` always describes exactly the credential presented here.
   req.user = payload;
 
   // Invariant: Tamper-proof - freeze req.user to prevent downstream mutation

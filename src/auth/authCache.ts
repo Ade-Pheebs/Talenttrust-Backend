@@ -31,20 +31,17 @@
  * Metrics:
  *   - Cache hits and misses are tracked via Prometheus counters
  *
- * Invariants:
- *   - `size <= maxEntries` at all times.
- *   - An entry is either present and not expired, or absent. Expired entries are
- *     never returned from `get()` and are removed lazily on access or by
- *     `cleanupExpired()`.
- *   - A cache hit always increments both the Prometheus counter and the
- *     in-memory hit counter exactly once; likewise for misses.
- *   - Mutations are synchronous and atomic within a single event loop turn,
- *     so concurrent callers cannot observe a partially applied update.
- *   - Invalidation by selector or user ID is complete: no matching entry remains.
- *   - The cache never throws for valid-shape inputs; invalid inputs are
- *     rejected deterministically with a `TypeError` and leave state unchanged.
- *   - Entries are defensively copied on `set()` and on `get()` so callers
- *     cannot mutate cached state through aliasing.
+ * Concurrency notes:
+ *   - All methods execute synchronously on the Node.js event-loop thread, so
+ *     Map operations are atomic from the perspective of concurrent async code.
+ *   - `set()` atomically checks capacity AND inserts in a single synchronous
+ *     pass, preventing the check-then-act race where two concurrent callers
+ *     could both observe `size >= maxEntries` before either inserts, causing
+ *     the cache to transiently exceed its capacity bound.
+ *   - `evictOldest()` runs inside `set()` before the new entry is added, so
+ *     the post-insert size is always ≤ maxEntries.
+ *   - `cleanupExpired()` collects keys then deletes them in the same
+ *     synchronous call, ensuring no intermediate state is observable.
  */
 
 import { Counter, Registry } from 'prom-client';
@@ -240,6 +237,16 @@ export class AuthCache {
    * example filtering `scope` in place) would silently rewrite the authorization
    * view seen by every other concurrent request sharing the entry.
    *
+   * Concurrency invariant: the capacity check and the insertion happen in the
+   * same synchronous operation. Because Node.js is single-threaded, no other
+   * code can observe the Map between the size check and the set() call, so the
+   * cache size never transiently exceeds maxEntries.
+   *
+   * Specifically:
+   *   1. If selector already exists, overwrite it — no eviction needed.
+   *   2. If selector is new and cache is at capacity, evict one entry FIRST,
+   *      then insert. This keeps size ≤ maxEntries at all times.
+   *
    * @param selector - The key selector (SHA-256 hash of the API key)
    * @param info - The API key info to cache
    * @throws TypeError if `selector` or `info` is invalid
@@ -260,10 +267,10 @@ export class AuthCache {
       lastAccessed: now,
     };
 
-    // Evict oldest entries if at capacity. We only evict when inserting a new
-    // key; updating an existing key does not change the size and thus must not
-    // trigger eviction.
-    if (this.cache.size >= this.maxEntries && !this.cache.has(selector)) {
+    // If the selector is new and we are at capacity, evict before inserting.
+    // Checking `has` before `size` avoids an unnecessary eviction when updating
+    // an existing entry (which doesn't change the Map's size).
+    if (!this.cache.has(selector) && this.cache.size >= this.maxEntries) {
       this.evictOldest();
     }
 
@@ -372,6 +379,11 @@ export class AuthCache {
    * 
    * Thread-safe: Uses write lock to ensure atomic batch invalidation.
    *
+   * Iterates over the entire cache once, collecting selectors whose
+   * `createdBy` matches the given userId, then deletes them in a second
+   * synchronous pass. Both passes happen in the same event-loop turn so
+   * no entries can be concurrently inserted between collection and deletion.
+   *
    * @param userId - The user ID whose cache entries should be invalidated
    * @throws TypeError if `userId` is not a non-empty string
    */
@@ -465,9 +477,11 @@ export class AuthCache {
   /**
    * Evict the least recently used entry.
    *
-   * @throws Error if the cache is empty; this indicates a logic error in
-   * the caller because eviction is only triggered when the cache is at
-   * capacity and a new key is being inserted.
+   * Scans all entries to find the one with the smallest `lastAccessed`
+   * timestamp (i.e. the one that has not been read for the longest time).
+   * Called synchronously from `set()` before a new entry is added, so
+   * the cache size invariant (≤ maxEntries) is maintained atomically from
+   * the event-loop's perspective.
    */
   private evictOldest(): void {
     let oldestSelector: string | null = null;
@@ -490,7 +504,12 @@ export class AuthCache {
   /**
    * Clean up expired entries (called periodically).
    *
-   * @returns The number of entries removed.
+   * Collects all expired selectors in one synchronous pass, then removes
+   * them in a second pass. Both passes execute within a single event-loop
+   * turn, so the set of entries visible to `get()` immediately after this
+   * call contains no expired entries.
+   *
+   * @returns The number of entries that were removed.
    */
   cleanupExpired(): number {
     const now = Date.now();

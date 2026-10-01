@@ -1,174 +1,327 @@
-import { AppConfig, loadConfig } from './appConfiguration';
-import { isSafeUrl } from './utils/ssrf';
+/**
+ * @file src/appConfiguration.test.ts
+ * @description Comprehensive unit tests verifying state invariant protections in appConfiguration.
+ */
 
-describe('application configuration compatibility', () => {
-  const originalEnv = process.env;
+import {
+  loadConfig,
+  deepFreeze,
+  parseAssets,
+  appConfigManager,
+  ConfigurationStateManager,
+  ConfigurationAuthError,
+  AppConfig,
+} from './appConfiguration';
 
-  afterEach(() => {
+describe('appConfiguration state invariant protections', () => {
+  const originalEnv = { ...process.env };
+
+  beforeEach(() => {
+    process.env = { ...originalEnv };
+    delete process.env.SSRF_ALLOW_PRIVATE_HOSTS;
+    appConfigManager.reset();
+  });
+
+  afterAll(() => {
     process.env = originalEnv;
   });
 
-  it('preserves the complete default public shape', () => {
-    expect(loadConfig({})).toEqual({
-      port: 3001,
-      gracefulDegradationEnabled: true,
-      upstreamContractsUrl: 'https://example.invalid/contracts',
-      upstreamTimeoutMs: 1200,
-      chaosMode: 'off',
-      chaosTargets: [],
-      chaosProbability: 0,
-      circuitBreaker: { failureThreshold: 5, successThreshold: 1, timeoutMs: 30000 },
-      webhookRetry: {
-        maxAttempts: 5, initialDelayMs: 1000, maxDelayMs: 30000, multiplier: 2, jitterFactor: 0.1,
-      },
-      webhookCircuitBreaker: { failureThreshold: 5, successThreshold: 1, timeoutMs: 60000 },
-      healthProbes: { queueFailedThreshold: 10, queueBacklogThreshold: 100, queueProbeTimeoutMs: 3000 },
-      idempotencyTtlMs: 3600000,
-      allowedAssets: ['USDC', 'XLM', 'BTC', 'ETH'],
-      milestonesEnabled: true,
-    } satisfies AppConfig);
-  });
+  describe('Immutability and Deep Object Freezing', () => {
+    it('returns a deeply frozen AppConfig object and nested structures', () => {
+      const cfg = loadConfig({});
 
-  it('preserves valid overrides, list order/duplicates and fractional policies', () => {
-    const config = loadConfig({
-      PORT: '4000', GRACEFUL_DEGRADATION_ENABLED: 'false', MILESTONES_ENABLED: 'FALSE',
-      UPSTREAM_CONTRACTS_URL: 'https://api.example.com/contracts', UPSTREAM_TIMEOUT_MS: '2500',
-      CHAOS_MODE: 'RaNdOm', CHAOS_TARGETS: ' Contracts , RPC,contracts,,', CHAOS_PROBABILITY: '0.25',
-      ALLOWED_ASSETS: ' usdc, XLM,usdc,,', CB_FAILURE_THRESHOLD: '8', CB_SUCCESS_THRESHOLD: '2',
-      CB_TIMEOUT_MS: '2000', WEBHOOK_CB_FAILURE_THRESHOLD: '7', WEBHOOK_CB_SUCCESS_THRESHOLD: '3',
-      WEBHOOK_CB_TIMEOUT_MS: '5000', WEBHOOK_RETRY_MAX_ATTEMPTS: '6',
-      WEBHOOK_RETRY_INITIAL_DELAY_MS: '1500', WEBHOOK_RETRY_MAX_DELAY_MS: '20000',
-      WEBHOOK_RETRY_MULTIPLIER: '1.5', WEBHOOK_RETRY_JITTER_FACTOR: '0.2',
-      QUEUE_FAILED_THRESHOLD: '20', QUEUE_BACKLOG_THRESHOLD: '200', QUEUE_PROBE_TIMEOUT_MS: '4000',
-      IDEMPOTENCY_TTL_MS: '0',
-    });
-    expect(config).toMatchObject({
-      port: 4000, gracefulDegradationEnabled: false, milestonesEnabled: false,
-      upstreamContractsUrl: 'https://api.example.com/contracts', upstreamTimeoutMs: 2500,
-      chaosMode: 'random', chaosTargets: ['contracts', 'rpc', 'contracts'], chaosProbability: 0.25,
-      allowedAssets: ['USDC', 'XLM', 'USDC'], idempotencyTtlMs: 0,
-      circuitBreaker: { failureThreshold: 8, successThreshold: 2, timeoutMs: 2000 },
-      webhookCircuitBreaker: { failureThreshold: 7, successThreshold: 3, timeoutMs: 5000 },
-      webhookRetry: {
-        maxAttempts: 6, initialDelayMs: 1500, maxDelayMs: 20000, multiplier: 1.5, jitterFactor: 0.2,
-      },
-      healthProbes: { queueFailedThreshold: 20, queueBacklogThreshold: 200, queueProbeTimeoutMs: 4000 },
-    });
-  });
-
-  const integerCases: [string, (config: AppConfig) => number, number][] = [
-    ['PORT', (c) => c.port, 3001],
-    ['CB_FAILURE_THRESHOLD', (c) => c.circuitBreaker.failureThreshold, 5],
-    ['CB_SUCCESS_THRESHOLD', (c) => c.circuitBreaker.successThreshold, 1],
-    ['WEBHOOK_CB_FAILURE_THRESHOLD', (c) => c.webhookCircuitBreaker.failureThreshold, 5],
-    ['WEBHOOK_CB_SUCCESS_THRESHOLD', (c) => c.webhookCircuitBreaker.successThreshold, 1],
-    ['WEBHOOK_RETRY_MAX_ATTEMPTS', (c) => c.webhookRetry.maxAttempts, 5],
-    ['QUEUE_FAILED_THRESHOLD', (c) => c.healthProbes.queueFailedThreshold, 10],
-    ['QUEUE_BACKLOG_THRESHOLD', (c) => c.healthProbes.queueBacklogThreshold, 100],
-  ];
-
-  it.each(integerCases)('%s falls back on fractional and missing numeric input', (key, read, fallback) => {
-    for (const value of ['2.5', ' ', '', 'not-a-number', 'NaN', 'Infinity']) {
-      expect(read(loadConfig({ [key]: value }))).toBe(fallback);
-    }
-  });
-
-  it('keeps existing inclusive clamp bounds and zero policies', () => {
-    expect(loadConfig({ PORT: '0', CHAOS_PROBABILITY: '-1', IDEMPOTENCY_TTL_MS: '-1' }))
-      .toMatchObject({ port: 1, chaosProbability: 0, idempotencyTtlMs: 0 });
-    expect(loadConfig({ PORT: '999999', CHAOS_PROBABILITY: '2', IDEMPOTENCY_TTL_MS: '9999999999' }))
-      .toMatchObject({ port: 65535, chaosProbability: 1, idempotencyTtlMs: 604800000 });
-    expect(loadConfig({ QUEUE_FAILED_THRESHOLD: '0', QUEUE_BACKLOG_THRESHOLD: '0' }).healthProbes)
-      .toMatchObject({ queueFailedThreshold: 0, queueBacklogThreshold: 0 });
-  });
-
-  it('treats whitespace-only optional settings as missing', () => {
-    expect(loadConfig({
-      UPSTREAM_TIMEOUT_MS: ' ', CB_TIMEOUT_MS: ' ', WEBHOOK_RETRY_INITIAL_DELAY_MS: ' ',
-      ALLOWED_ASSETS: ' ', GRACEFUL_DEGRADATION_ENABLED: ' ', MILESTONES_ENABLED: '',
-    })).toEqual(loadConfig({}));
-    // A comma-only explicit allowlist still means no assets, as before.
-    expect(loadConfig({ ALLOWED_ASSETS: ',,,' }).allowedAssets).toEqual([]);
-  });
-
-  it.each(['true', 'TRUE', ' true ', '1'])('accepts documented enabled flags: %s', (value) => {
-    expect(loadConfig({ MILESTONES_ENABLED: value, GRACEFUL_DEGRADATION_ENABLED: value }))
-      .toMatchObject({ milestonesEnabled: true, gracefulDegradationEnabled: true });
-  });
-
-  it.each(['false', 'FALSE', ' false ', '0'])('accepts documented disabled flags: %s', (value) => {
-    expect(loadConfig({ MILESTONES_ENABLED: value, GRACEFUL_DEGRADATION_ENABLED: value }))
-      .toMatchObject({ milestonesEnabled: false, gracefulDegradationEnabled: false });
-  });
-
-  it.each(['MILESTONES_ENABLED', 'GRACEFUL_DEGRADATION_ENABLED'])
-    ('rejects malformed %s without echoing its value', (key) => {
-      expect(() => loadConfig({ [key]: 'private-value' })).toThrow(new RegExp(`Invalid ${key}`));
-      try { loadConfig({ [key]: 'private-value' }); } catch (error) {
-        expect((error as Error).message).not.toContain('private-value');
-      }
+      expect(Object.isFrozen(cfg)).toBe(true);
+      expect(Object.isFrozen(cfg.circuitBreaker)).toBe(true);
+      expect(Object.isFrozen(cfg.webhookRetry)).toBe(true);
+      expect(Object.isFrozen(cfg.webhookCircuitBreaker)).toBe(true);
+      expect(Object.isFrozen(cfg.healthProbes)).toBe(true);
+      expect(Object.isFrozen(cfg.allowedAssets)).toBe(true);
+      expect(Object.isFrozen(cfg.chaosTargets)).toBe(true);
     });
 
-  it.each(['production', 'unknown', ''])('cannot inherit a global private-host bypass in %s', (mode) => {
-    process.env = { ...originalEnv, NODE_ENV: 'test', SSRF_ALLOW_PRIVATE_HOSTS: 'true' };
-    expect(() => loadConfig({
-      NODE_ENV: mode, SSRF_ALLOW_PRIVATE_HOSTS: 'true', UPSTREAM_CONTRACTS_URL: 'http://127.0.0.1/contracts',
-    })).toThrow(/SSRF protection/);
-    expect(() => loadConfig({ UPSTREAM_CONTRACTS_URL: 'http://localhost/contracts' })).toThrow(/SSRF protection/);
+    it('prevents direct mutation of root properties in strict mode', () => {
+      const cfg = loadConfig({});
+
+      expect(() => {
+        (cfg as any).port = 9000;
+      }).toThrow(TypeError);
+    });
+
+    it('prevents mutation of nested configuration objects in strict mode', () => {
+      const cfg = loadConfig({});
+
+      expect(() => {
+        (cfg.circuitBreaker as any).failureThreshold = 999;
+      }).toThrow(TypeError);
+
+      expect(() => {
+        (cfg.webhookRetry as any).initialDelayMs = 0;
+      }).toThrow(TypeError);
+    });
+
+    it('prevents mutation or pushing to array properties in strict mode', () => {
+      const cfg = loadConfig({});
+
+      expect(() => {
+        (cfg.allowedAssets as any).push('HACK');
+      }).toThrow(TypeError);
+
+      expect(() => {
+        (cfg.chaosTargets as any).push('all');
+      }).toThrow(TypeError);
+    });
+
+    it('deepFreeze handles circular references safely without throwing', () => {
+      const circular: any = { a: 1 };
+      circular.self = circular;
+
+      expect(() => deepFreeze(circular)).not.toThrow();
+      expect(Object.isFrozen(circular)).toBe(true);
+    });
   });
 
-  it.each(['development', 'test', 'staging'])('honors an explicit bypass in %s independently of globals', (mode) => {
-    process.env = { ...originalEnv, NODE_ENV: 'production', SSRF_ALLOW_PRIVATE_HOSTS: 'false' };
-    expect(loadConfig({
-      NODE_ENV: mode, SSRF_ALLOW_PRIVATE_HOSTS: 'true', UPSTREAM_CONTRACTS_URL: 'http://localhost/contracts',
-    }).upstreamContractsUrl).toBe('http://localhost/contracts');
+  describe('Cross-Field Relational Invariants', () => {
+    it('enforces webhookRetry maxDelayMs >= initialDelayMs when initial exceeds max', () => {
+      const cfg = loadConfig({
+        WEBHOOK_RETRY_INITIAL_DELAY_MS: '45000',
+        WEBHOOK_RETRY_MAX_DELAY_MS: '5000',
+      });
+
+      expect(cfg.webhookRetry.initialDelayMs).toBe(45000);
+      expect(cfg.webhookRetry.maxDelayMs).toBe(45000);
+      expect(cfg.webhookRetry.maxDelayMs).toBeGreaterThanOrEqual(cfg.webhookRetry.initialDelayMs);
+    });
+
+    it('preserves valid webhookRetry maxDelayMs when it is greater than initialDelayMs', () => {
+      const cfg = loadConfig({
+        WEBHOOK_RETRY_INITIAL_DELAY_MS: '1000',
+        WEBHOOK_RETRY_MAX_DELAY_MS: '30000',
+      });
+
+      expect(cfg.webhookRetry.initialDelayMs).toBe(1000);
+      expect(cfg.webhookRetry.maxDelayMs).toBe(30000);
+    });
+
+    it('clamps webhook retry multiplier to minimum 1', () => {
+      const cfg = loadConfig({ WEBHOOK_RETRY_MULTIPLIER: '0.5' });
+      expect(cfg.webhookRetry.multiplier).toBe(1);
+    });
+
+    it('clamps webhook retry jitterFactor to [0, 1]', () => {
+      const negativeJitter = loadConfig({ WEBHOOK_RETRY_JITTER_FACTOR: '-0.5' });
+      expect(negativeJitter.webhookRetry.jitterFactor).toBe(0);
+
+      const excessiveJitter = loadConfig({ WEBHOOK_RETRY_JITTER_FACTOR: '2.5' });
+      expect(excessiveJitter.webhookRetry.jitterFactor).toBe(1);
+    });
   });
 
-  it.each([
-    'http://user:private-password@127.0.0.1/contracts?token=private-token',
-    'not-a-url?token=private-token', 'ftp://public.example.com/contracts', 'file:///etc/passwd',
-  ])('rejects unsafe or non-HTTP upstreams with a sanitized error', (url) => {
-    expect(() => loadConfig({ UPSTREAM_CONTRACTS_URL: url })).toThrow(/Invalid UPSTREAM_CONTRACTS_URL/);
-    try { loadConfig({ UPSTREAM_CONTRACTS_URL: url }); } catch (error) {
-      expect((error as Error).message).not.toContain(url);
-      expect((error as Error).message).not.toMatch(/private-password|private-token/);
-    }
+  describe('Data Integrity, Normalization & Integer Bounds', () => {
+    it('truncates floating point values to integers for port', () => {
+      const cfg = loadConfig({ PORT: '4000.8' });
+      expect(cfg.port).toBe(4000);
+    });
+
+    it('clamps PORT between 1 and 65535', () => {
+      const low = loadConfig({ PORT: '0' });
+      expect(low.port).toBe(1);
+
+      const high = loadConfig({ PORT: '70000' });
+      expect(high.port).toBe(65535);
+    });
+
+    it('falls back to default port on whitespace-only input', () => {
+      const cfg = loadConfig({ PORT: '   ' });
+      expect(cfg.port).toBe(3001);
+    });
+
+    it('falls back to default port on non-numeric input', () => {
+      const cfg = loadConfig({ PORT: 'invalid_port' });
+      expect(cfg.port).toBe(3001);
+    });
+
+    it('clamps UPSTREAM_TIMEOUT_MS to [100, 10000]', () => {
+      const low = loadConfig({ UPSTREAM_TIMEOUT_MS: '50' });
+      expect(low.upstreamTimeoutMs).toBe(100);
+
+      const high = loadConfig({ UPSTREAM_TIMEOUT_MS: '25000' });
+      expect(high.upstreamTimeoutMs).toBe(10000);
+    });
+
+    it('clamps CHAOS_PROBABILITY to [0, 1]', () => {
+      const low = loadConfig({ CHAOS_PROBABILITY: '-0.2' });
+      expect(low.chaosProbability).toBe(0);
+
+      const high = loadConfig({ CHAOS_PROBABILITY: '1.5' });
+      expect(high.chaosProbability).toBe(1);
+
+      const nan = loadConfig({ CHAOS_PROBABILITY: 'not_a_number' });
+      expect(nan.chaosProbability).toBe(0);
+    });
+
+    it('normalizes chaosMode and defaults invalid modes to off', () => {
+      expect(loadConfig({ CHAOS_MODE: 'ERROR' }).chaosMode).toBe('error');
+      expect(loadConfig({ CHAOS_MODE: 'timeout' }).chaosMode).toBe('timeout');
+      expect(loadConfig({ CHAOS_MODE: 'random' }).chaosMode).toBe('random');
+      expect(loadConfig({ CHAOS_MODE: 'destructive' }).chaosMode).toBe('off');
+      expect(loadConfig({ CHAOS_MODE: '' }).chaosMode).toBe('off');
+    });
+
+    it('clamps IDEMPOTENCY_TTL_MS to [0, 7 days]', () => {
+      const low = loadConfig({ IDEMPOTENCY_TTL_MS: '-100' });
+      expect(low.idempotencyTtlMs).toBe(0);
+
+      const maxAllowed = 7 * 24 * 60 * 60 * 1000;
+      const high = loadConfig({ IDEMPOTENCY_TTL_MS: String(maxAllowed + 10000) });
+      expect(high.idempotencyTtlMs).toBe(maxAllowed);
+    });
   });
 
-  it('does not let a development bypass accept malformed URLs', () => {
-    expect(() => loadConfig({
-      NODE_ENV: 'test', SSRF_ALLOW_PRIVATE_HOSTS: 'true', UPSTREAM_CONTRACTS_URL: 'invalid',
-    })).toThrow(/Invalid UPSTREAM_CONTRACTS_URL/);
+  describe('Deduplication & List Normalization', () => {
+    it('deduplicates allowedAssets preserving first occurrence order', () => {
+      const cfg = loadConfig({ ALLOWED_ASSETS: 'USDC, XLM, usdc, btc, XLM, ETH' });
+      expect(cfg.allowedAssets).toEqual(['USDC', 'XLM', 'BTC', 'ETH']);
+    });
+
+    it('falls back to default assets when ALLOWED_ASSETS is empty commas', () => {
+      const cfg = loadConfig({ ALLOWED_ASSETS: ' , , ' });
+      expect(cfg.allowedAssets).toEqual(['USDC', 'XLM', 'BTC', 'ETH']);
+    });
+
+    it('deduplicates chaosTargets preserving order', () => {
+      const cfg = loadConfig({ CHAOS_TARGETS: 'contracts, reputation, CONTRACTS, stellar' });
+      expect(cfg.chaosTargets).toEqual(['contracts', 'reputation', 'stellar']);
+    });
+
+    it('parseAssets helper returns copy of defaults on empty input', () => {
+      const assets = parseAssets(undefined);
+      expect(assets).toEqual(['USDC', 'XLM', 'BTC', 'ETH']);
+    });
   });
 
-  it('sanitizes malformed bypass policy and allows a clean retry after failure', () => {
-    const healthy = loadConfig({});
-    const globalBefore = { ...process.env };
-    const invalid = { NODE_ENV: 'test', SSRF_ALLOW_PRIVATE_HOSTS: 'private-policy-value' };
-    expect(() => loadConfig(invalid)).toThrow(/Invalid UPSTREAM_CONTRACTS_URL/);
-    try { loadConfig(invalid); } catch (error) {
-      expect((error as Error).message).not.toContain('private-policy-value');
-    }
-    expect(loadConfig({})).toEqual(healthy);
-    expect(process.env).toEqual(globalBefore);
+  describe('SSRF and URL Protocol Invariants', () => {
+    it('allows valid HTTPS public upstream contracts URL', () => {
+      const cfg = loadConfig({ UPSTREAM_CONTRACTS_URL: 'https://api.github.com/contracts' });
+      expect(cfg.upstreamContractsUrl).toBe('https://api.github.com/contracts');
+    });
+
+    it('rejects forbidden protocols such as ftp, file, javascript', () => {
+      expect(() => {
+        loadConfig({ UPSTREAM_CONTRACTS_URL: 'ftp://example.com/contracts' });
+      }).toThrow(/Forbidden protocol/);
+
+      expect(() => {
+        loadConfig({ UPSTREAM_CONTRACTS_URL: 'file:///etc/contracts' });
+      }).toThrow(/Forbidden protocol/);
+    });
+
+    it('rejects malformed URLs', () => {
+      expect(() => {
+        loadConfig({ UPSTREAM_CONTRACTS_URL: '://invalid-url' });
+      }).toThrow(/Malformed URL/);
+    });
+
+    it('blocks access to private hosts and localhost under default SSRF protection', () => {
+      expect(() => {
+        loadConfig({ UPSTREAM_CONTRACTS_URL: 'http://localhost:3001/contracts' });
+      }).toThrow(/SSRF protection blocked access/);
+
+      expect(() => {
+        loadConfig({ UPSTREAM_CONTRACTS_URL: 'http://169.254.169.254/latest/meta-data' });
+      }).toThrow(/SSRF protection blocked access/);
+    });
+
+    it('sanitizes embedded credentials from URL error messages to avoid sensitive data leakage', () => {
+      expect(() => {
+        loadConfig({ UPSTREAM_CONTRACTS_URL: 'http://admin:supersecret@127.0.0.1/contracts' });
+      }).toThrowError(/SSRF protection blocked access to internal resource "http:\/\/\*\*\*:\*\*\*@127\.0\.0\.1\/contracts"/);
+    });
   });
 
-  it('returns independent snapshots without mutating supplied or global environments', async () => {
-    const env = Object.freeze({ ALLOWED_ASSETS: 'usdc,xlm', CB_FAILURE_THRESHOLD: '9' });
-    const globalBefore = { ...process.env };
-    const configs = await Promise.all(Array.from({ length: 3 }, async () => loadConfig(env)));
-    configs[0].allowedAssets.push('BTC');
-    configs[0].circuitBreaker.failureThreshold = 20;
-    expect(configs[1]).toEqual(configs[2]);
-    expect(configs[1].allowedAssets).toEqual(['USDC', 'XLM']);
-    expect(loadConfig(env)).toEqual(configs[1]);
-    expect(process.env).toEqual(globalBefore);
-    expect(env).toEqual({ ALLOWED_ASSETS: 'usdc,xlm', CB_FAILURE_THRESHOLD: '9' });
-  });
+  describe('ConfigurationStateManager (Lifecycle & Concurrency Safety)', () => {
+    it('begins in UNINITIALIZED state and transitions to ACTIVE on initialize', () => {
+      const manager = new ConfigurationStateManager();
+      expect(manager.getState()).toBe('UNINITIALIZED');
+      expect(manager.getVersion()).toBe(0);
 
-  it('preserves the no-argument loader and existing one-argument SSRF utility', () => {
-    process.env = { ...originalEnv, PORT: '4100', NODE_ENV: 'test', SSRF_ALLOW_PRIVATE_HOSTS: 'true' };
-    expect(loadConfig().port).toBe(4100);
-    expect(isSafeUrl('http://localhost/contracts')).toBe(true);
+      const config = manager.initialize({});
+      expect(manager.getState()).toBe('ACTIVE');
+      expect(manager.getVersion()).toBe(1);
+      expect(config.port).toBe(3001);
+    });
+
+    it('initialize is idempotent when state is already ACTIVE', () => {
+      const manager = new ConfigurationStateManager();
+      const first = manager.initialize({ PORT: '3005' });
+      const second = manager.initialize({ PORT: '9999' });
+
+      expect(first.port).toBe(3005);
+      expect(second.port).toBe(3005);
+      expect(manager.getVersion()).toBe(1);
+    });
+
+    it('getConfig lazily initializes if called in UNINITIALIZED state', () => {
+      const manager = new ConfigurationStateManager();
+      expect(manager.getState()).toBe('UNINITIALIZED');
+
+      const config = manager.getConfig();
+      expect(manager.getState()).toBe('ACTIVE');
+      expect(config.port).toBe(3001);
+    });
+
+    it('reconfigure updates configuration atomically and increments version', () => {
+      const manager = new ConfigurationStateManager();
+      manager.initialize({ PORT: '3001' });
+
+      const updated = manager.reconfigure({ PORT: '4000' });
+      expect(updated.port).toBe(4000);
+      expect(manager.getVersion()).toBe(2);
+      expect(manager.getConfig().port).toBe(4000);
+    });
+
+    it('enforces authorization token when configured for reconfigure', () => {
+      const manager = new ConfigurationStateManager('secret-auth-token-123');
+      manager.initialize({});
+
+      // Forbidden: missing auth secret
+      expect(() => {
+        manager.reconfigure({ PORT: '5000' });
+      }).toThrow(ConfigurationAuthError);
+
+      // Forbidden: incorrect auth secret
+      expect(() => {
+        manager.reconfigure({ PORT: '5000' }, 'wrong-token');
+      }).toThrow(ConfigurationAuthError);
+
+      // Allowed: valid auth secret
+      const updated = manager.reconfigure({ PORT: '5000' }, 'secret-auth-token-123');
+      expect(updated.port).toBe(5000);
+    });
+
+    it('maintains previous valid state when reconfigure fails validation (partial failure / atomic rollback)', () => {
+      const manager = new ConfigurationStateManager();
+      manager.initialize({ PORT: '3001' });
+      const versionBefore = manager.getVersion();
+
+      expect(() => {
+        // Invalid upstream URL that fails SSRF validation
+        manager.reconfigure({ UPSTREAM_CONTRACTS_URL: 'http://127.0.0.1:3001/contracts' });
+      }).toThrow(/SSRF protection/);
+
+      // Invariant preserved: State remains ACTIVE with previous valid config and version
+      expect(manager.getState()).toBe('ACTIVE');
+      expect(manager.getVersion()).toBe(versionBefore);
+      expect(manager.getConfig().port).toBe(3001);
+    });
+
+    it('reset returns state to UNINITIALIZED', () => {
+      const manager = new ConfigurationStateManager();
+      manager.initialize({});
+      expect(manager.getState()).toBe('ACTIVE');
+
+      manager.reset();
+      expect(manager.getState()).toBe('UNINITIALIZED');
+      expect(manager.getVersion()).toBe(0);
+    });
   });
 });

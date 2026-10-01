@@ -57,7 +57,9 @@ export function classifySorobanError(error: unknown): SorobanFailureClassificati
   const errorObject = error as object;
   const obj = error as Record<string, unknown>;
   const name = typeof obj.name === "string" ? obj.name : undefined;
-  const code = obj.code;
+  const rawCode = obj.code;
+  const code: string | number | undefined =
+    typeof rawCode === "string" || typeof rawCode === "number" ? rawCode : undefined;
   const status = typeof obj.status === "number" ? obj.status : undefined;
   const response = obj.response as Record<string, unknown> | undefined;
   const httpStatus =
@@ -110,7 +112,7 @@ export function classifySorobanError(error: unknown): SorobanFailureClassificati
     errorObject instanceof SyntaxError ||
     (message !== undefined && message.includes("Unexpected token"))
   ) {
-    return { class: "malformed_response", retryable: false, providerCode: code };
+    return { class: "malformed_response", retryable: false, providerCode: typeof code === "string" || typeof code === "number" ? code : undefined };
   }
 
   // Low-level network/transport failures.

@@ -201,6 +201,7 @@ export class AccountLockoutTracker {
   }
 
   private readonly records = new Map<string, FailureRecord>();
+  private readonly locks = new Map<string, Promise<void>>();
   private readonly audit: Pick<AuditService, 'log'>;
   private readonly now: () => number;
   private readonly sleep: (ms: number) => Promise<void>;
@@ -238,6 +239,40 @@ export class AccountLockoutTracker {
   }
 
   // ── Public methods ────────────────────────────────────────────────────────
+
+  /**
+   * Serializes concurrent asynchronous operations for the same identity.
+   * This prevents TOCTOU (Time-of-Check to Time-of-Use) bypasses where
+   * concurrent requests might bypass the `assess()` check before the
+   * first failure is recorded.
+   */
+  async withLock<T>(rawEmail: string, fn: () => Promise<T>): Promise<T> {
+    if (!this.config.enabled) {
+      return fn();
+    }
+    const key = this.keyFor(rawEmail);
+    if (!key) {
+      return fn();
+    }
+
+    const existingLock = this.locks.get(key) || Promise.resolve();
+    let release: () => void;
+    const newLock = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+
+    this.locks.set(key, existingLock.then(() => newLock));
+
+    try {
+      await existingLock;
+      return await fn();
+    } finally {
+      release!();
+      if (this.locks.get(key) === newLock) {
+        this.locks.delete(key);
+      }
+    }
+  }
 
   /**
    * Read-only check. Returns the LIVE (post-decay) state for the given

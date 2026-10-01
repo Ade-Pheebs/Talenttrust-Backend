@@ -13,6 +13,8 @@
 
 #[no_std]
 
+#[cfg(test)]
+mod batch_operations_tests;
 mod bets;
 mod errors;
 mod storage;
@@ -46,10 +48,9 @@ pub struct PredictifyHybrid;
 #[contractimpl]
 impl PredictifyHybrid {
     /// Submit a batch of bets atomically.
-///
-    /// See [`bets::place_bets`] for full documentation. The
-    /// validation boundaries are documented at the crate root and
-/// enforced in ``bets::place_bets``.
+    ///
+    /// See [`bets::place_bets`] for full documentation of the
+    /// validation boundaries and failure modes.
     pub fn place_bets(
         env: Env,
         caller: Address,

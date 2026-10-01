@@ -29,7 +29,7 @@
 
 import { randomUUID } from 'crypto';
 import Database from "../db/betterSqlite3";
-import { computeEntryHash, GENESIS_HASH } from './store';
+import { computeEntryHash, GENESIS_HASH, CURSOR_FILTER_MISMATCH_MESSAGE } from './store';
 import type { AuditEntry, AuditQuery, CreateAuditEntryInput, IntegrityReport, AuditQueryResult, CursorData } from './types';
 import { AUDIT_ACTIONS, AUDIT_SEVERITIES, encodeCursor, decodeCursor } from './types';
 import type { AuditLogRepository } from './repository';
@@ -319,11 +319,65 @@ export class SqliteAuditRepository implements AuditLogRepository {
         previousHash: previousHashRow?.hash ?? GENESIS_HASH,
       };
 
-      const entry: AuditEntry = Object.freeze({
-        ...partial,
-        hash: computeEntryHash(partial),
+    this._appendInProgress = true;
+    try {
+      const insert = this.db.transaction((payload: CreateAuditEntryInput): AuditEntry => {
+        const previousHashRow = this.db
+          .prepare<[], { hash: string }>(
+            'SELECT hash FROM audit_log_entries ORDER BY seq DESC LIMIT 1'
+          )
+          .get();
+
+        const partial: Omit<AuditEntry, 'hash'> = {
+          id: randomUUID(),
+          timestamp: new Date().toISOString(),
+          action: payload.action,
+          severity: payload.severity,
+          actor: payload.actor,
+          resource: payload.resource,
+          resourceId: payload.resourceId,
+          metadata: Object.freeze({ ...payload.metadata }),
+          ipAddress: payload.ipAddress,
+          correlationId: payload.correlationId,
+          previousHash: previousHashRow?.hash ?? GENESIS_HASH,
+        };
+
+        const entry: AuditEntry = Object.freeze({
+          ...partial,
+          hash: computeEntryHash(partial),
+        });
+
+        this.db
+          .prepare<
+            [string, string, string, string, string, string, string, string, string | null, string | null, string, string]
+          >(
+            `INSERT INTO audit_log_entries
+             (id, timestamp, action, severity, actor, resource, resource_id, metadata_json, ip_address, correlation_id, hash, previous_hash)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+          )
+          .run(
+            entry.id,
+            entry.timestamp,
+            entry.action,
+            entry.severity,
+            entry.actor,
+            entry.resource,
+            entry.resourceId,
+            JSON.stringify(entry.metadata),
+            entry.ipAddress ?? null,
+            entry.correlationId ?? null,
+            entry.hash,
+            entry.previousHash
+          );
+
+        return entry;
       });
 
+      return insert(input);
+    } finally {
+      // Always release the guard — even on error — so the caller can recover.
+      this._appendInProgress = false;
+    }
       this.db
         .prepare<
           [string, string, string, string, string, string, string, string, string | null, string | null, string, string]
@@ -416,15 +470,37 @@ export class SqliteAuditRepository implements AuditLogRepository {
       }
 
       try {
-        const cursorData: CursorData = decodeCursor(query.cursor);
-        
-        // Find the sequence number of the last entry from the previous page
+        cursorData = decodeCursor(query.cursor);
+      } catch {
+        // Malformed/undecodable cursor — fall back to the beginning of the
+        // result set rather than propagating a format error.
+        cursorData = { lastId: '', lastTimestamp: '', filters: {} };
+      }
+
+      // Verify filters match cursor BEFORE any DB work.
+      // This is a caller-invariant violation (mixing cursors across queries),
+      // so we throw rather than silently ignoring the mismatch.
+      if (
+        cursorData.lastId !== '' && // skip check when we fell back to empty cursor
+        (cursorData.filters.action !== query.action ||
+          cursorData.filters.severity !== query.severity ||
+          cursorData.filters.actor !== query.actor ||
+          cursorData.filters.resource !== query.resource ||
+          cursorData.filters.resourceId !== query.resourceId ||
+          cursorData.filters.from !== query.from ||
+          cursorData.filters.to !== query.to)
+      ) {
+        throw new Error('Cursor filters do not match query filters');
+      }
+
+      if (cursorData.lastId) {
+        // Find the sequence number of the last entry from the previous page.
         const lastEntryRow = this.db
           .prepare<[string], { seq: number }>(
             'SELECT seq FROM audit_log_entries WHERE id = ?'
           )
           .get(cursorData.lastId);
-        
+
         if (lastEntryRow) {
           startIndex = lastEntryRow.seq;
         }
@@ -514,6 +590,21 @@ export class SqliteAuditRepository implements AuditLogRepository {
     return row?.total ?? 0;
   }
 
+  /**
+   * Verifies the integrity of the entire hash chain.
+   *
+   * Invariants checked:
+   * 1. `previousHash` of each entry equals the `hash` of the preceding entry
+   *    (or GENESIS for the first).
+   * 2. The stored `hash` matches the recomputed hash of the entry's content
+   *    fields (detects field tampering).
+   * 3. No two entries share the same `hash` value — a duplicate hash would
+   *    indicate either a hash-collision attack or a forged insertion that
+   *    copied an existing entry's hash.
+   *
+   * @returns An `IntegrityReport` with `valid: false` and the index/ID of the
+   *   first corrupted entry when any invariant is violated.
+   */
   verifyIntegrity(): IntegrityReport {
     const checkedAt = new Date().toISOString();
     const rows = this.db
@@ -527,6 +618,10 @@ export class SqliteAuditRepository implements AuditLogRepository {
     if (rows.length === 0) {
       return { valid: true, totalEntries: 0, checkedAt };
     }
+
+    // --- Invariant 3: duplicate hash detection ---
+    // Build a set of seen hashes; a collision at any position is a hard failure.
+    const seenHashes = new Set<string>();
 
     let previousHash = GENESIS_HASH;
     for (let index = 0; index < rows.length; index += 1) {
@@ -544,6 +639,19 @@ export class SqliteAuditRepository implements AuditLogRepository {
         };
       }
 
+      // --- Invariant 3: duplicate hash ---
+      if (seenHashes.has(entry.hash)) {
+        return {
+          valid: false,
+          totalEntries: rows.length,
+          firstCorruptedIndex: index,
+          firstCorruptedId: entry.id,
+          checkedAt,
+        };
+      }
+      seenHashes.add(entry.hash);
+
+      // --- Invariant 1: previousHash linkage ---
       if (entry.previousHash !== previousHash) {
         return {
           valid: false,
@@ -554,6 +662,7 @@ export class SqliteAuditRepository implements AuditLogRepository {
         };
       }
 
+      // --- Invariant 2: hash content integrity ---
       const { hash, ...rest } = entry;
       const expectedHash = computeEntryHash(rest);
       if (hash !== expectedHash) {
@@ -570,6 +679,92 @@ export class SqliteAuditRepository implements AuditLogRepository {
     }
 
     return { valid: true, totalEntries: rows.length, checkedAt };
+  }
+
+  /**
+   * Executes a write with deterministic, bounded failure recovery.
+   *
+   * Recovery order is fixed:
+   *   1. missing schema → one `initSchema()` repair, then retry;
+   *   2. serialization conflict → fixed backoff, then retry;
+   *   3. anything else → rethrow immediately (never masked by a retry).
+   *
+   * After {@link MAX_WRITE_ATTEMPTS} attempts the last error is rethrown.
+   *
+   * @param operationName - Short, non-sensitive label used in recovery logs.
+   * @param operation - The transactional write to execute.
+   */
+  private runWriteWithRecovery<T>(operationName: string, operation: () => T): T {
+    const autoRepair = this.options.autoRepairSchema ?? true;
+    let schemaRepairAttempted = false;
+    let lastError: unknown;
+
+    for (let attempt = 1; attempt <= MAX_WRITE_ATTEMPTS; attempt += 1) {
+      try {
+        return operation();
+      } catch (error) {
+        lastError = error;
+
+        if (autoRepair && !schemaRepairAttempted && isMissingSchemaError(error)) {
+          schemaRepairAttempted = true;
+          log.warn('Audit SQLite schema missing; attempting deterministic repair', {
+            operation: operationName,
+            attempt,
+            maxAttempts: MAX_WRITE_ATTEMPTS,
+          });
+          try {
+            this.initSchema();
+          } catch (repairError) {
+            // Repair failed: surface the original failure rather than the
+            // repair error so the caller sees the root cause.
+            log.error('Audit SQLite schema repair failed; rethrowing original error', {
+              operation: operationName,
+              err: repairError,
+            });
+            throw error;
+          }
+          log.info('Audit SQLite schema repaired; retrying write', {
+            operation: operationName,
+            attempt,
+          });
+          continue;
+        }
+
+        if (isSerializationError(error) && attempt < MAX_WRITE_ATTEMPTS) {
+          log.warn('Audit SQLite write serialization conflict; retrying', {
+            operation: operationName,
+            attempt,
+            maxAttempts: MAX_WRITE_ATTEMPTS,
+          });
+          sleepSync(RETRY_BACKOFF_MS * attempt);
+          continue;
+        }
+
+        throw error;
+      }
+    }
+
+    throw lastError;
+  }
+
+  /**
+   * Applies deterministic locking/safety pragmas to the connection.
+   *
+   * These make lock contention recoverable rather than immediately fatal:
+   * `busy_timeout` lets SQLite wait instead of throwing `SQLITE_BUSY`,
+   * `WAL` lets readers and the single writer proceed concurrently, and
+   * `synchronous = NORMAL` is the safe pairing for WAL. Failures here are
+   * non-fatal (a read-only or in-memory connection may reject a pragma) and are
+   * logged at warn level.
+   */
+  private applyConnectionPragmas(): void {
+    try {
+      this.db.pragma('busy_timeout = 5000');
+      this.db.pragma('journal_mode = WAL');
+      this.db.pragma('synchronous = NORMAL');
+    } catch (error) {
+      log.warn('Could not apply audit SQLite connection pragmas', { err: error });
+    }
   }
 
   private initSchema(): void {

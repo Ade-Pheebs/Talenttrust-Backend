@@ -10,18 +10,42 @@
 //! [`storage::IDEM_KEY_TTL_LEDGERS`] ledgers (~24 h).  Repeated
 //! submissions with the same `(caller, key)` pair are rejected with
 //! `Error::IdempotentBatchAlreadyApplied`.
+//!
+//! ## Concurrency and failure models
+//!
+//! The idempotency sentinel is written **before** any bet is applied
+//! (write-ahead).  Because Soroban executes a contract invocation as
+//! a single atomic transaction, a failure during bet application rolls
+//! back the sentinel write as well -- there is no window in which a
+//! partial batch is observable.  Concurrent submissions with the same
+//! `(caller, key)` pair are serialized by the ledger and the second one
+//! is rejected deterministically with `Error::IdempotentBatchAlreadyApplied`.
+#!no_std
 
-#![no_std]
-
+#[cfg(test)]
+mod batch_operations_tests;
 mod bets;
 mod errors;
 mod storage;
 
+/// Re-exported public types and constants.
 pub use bets::Bet;
 pub use errors::Error;
-pub use storage::{DataKey, IDEM_KEY_TTL_LEDGERS};
+pub use storage::{DataKey, IDEM_KEY_TTL_LEDGERS, MAX_BATCH_SIZE};
 
-use soroban_sdk::{contract, contractimpl, Address, BytesN, Env, Vec};
+pub use bets::{BatchReceipt, Bet, MAX_BETS_PER_BATCH};
+pub use errors::Error;
+pub use storage::{DataKey, IDEM_KEY_TTL_LEDGERS, IDEM_KEY_TTL_THRESHOLD_LEDGERS};
+
+use soroban_sdk::{contract, contractimpl, Address, BytesN<32>, Env, Vec};
+
+/// Maximum number of bets accepted in a single ``place_bets``b call.
+///
+/// This is a hard boundary that protects the contract from
+/// unbounded work and from gas exhaustion attacks. It is part of
+/// the public contract surface and must not be changed without a
+/// compatibility plan.
+pub const MAX_BATCH_SIZE: u32 = 32;
 
 #[contract]
 pub struct PredictifyHybrid;
@@ -30,7 +54,8 @@ pub struct PredictifyHybrid;
 impl PredictifyHybrid {
     /// Submit a batch of bets atomically.
     ///
-    /// See [`bets::place_bets`] for full documentation.
+    /// See [`bets::place_bets`] for full documentation of the
+    /// validation boundaries and failure modes.
     pub fn place_bets(
         env: Env,
         caller: Address,
@@ -40,3 +65,6 @@ impl PredictifyHybrid {
         bets::place_bets(&env, caller, bets, idempotency_key)
     }
 }
+
+#[cfg(test)]
+mod batch_operations_tests;

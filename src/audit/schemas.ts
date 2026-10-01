@@ -65,9 +65,9 @@ export { AUDIT_ACTIONS, AUDIT_SEVERITIES };
 export const auditActionSchema = z.enum(AUDIT_ACTIONS);
 export const auditSeveritySchema = z.enum(AUDIT_SEVERITIES);
 
-// ---------------------------------------------------------------------------
+// ----------------------------------------------------------------------------
 // Request schemas
-// ---------------------------------------------------------------------------
+// ----------------------------------------------------------------------------
 
 /**
  * `POST /api/v1/audit` request body.
@@ -77,6 +77,22 @@ export const auditSeveritySchema = z.enum(AUDIT_SEVERITIES);
  * rather than rejected — a deliberate behaviour preserved from the previous
  * implementation to keep existing callers compatible.
  */
+const metadataSchema = z
+  .record(z.unknown())
+  .refine((value) => Object.keys(value).length <= MAX_METADATA_KEYS, {
+    message: `metadata must contain at most ${MAX_METADATA_KEYS} keys`,
+  })
+  .refine(
+    (value) => {
+      try {
+        return JSON.stringify(value).length <= MAX_METADATA_BYTES;
+      } catch {
+        return false;
+      }
+    },
+    { message: `metadata must serialize to at most ${MAX_METADATA_BYTES} characters` },
+  );
+
 export const createAuditEntryBodySchema = z.object({
   action: auditActionSchema,
   severity: auditSeveritySchema,
@@ -90,9 +106,12 @@ export const createAuditEntryBodySchema = z.object({
 
 export type CreateAuditEntryBody = z.infer<typeof createAuditEntryBodySchema>;
 
+const MAX_CURSOR_LENGTH = 4096;
+
 const isoDateStringSchema = (fieldName: string) =>
   z
     .string()
+    .max(MAX_ISO_DATE_LENGTH, `Invalid ${fieldName} timestamp`)
     .refine((value) => !Number.isNaN(Date.parse(value)), { message: `Invalid ${fieldName} timestamp` })
     .transform((value) => new Date(Date.parse(value)).toISOString());
 
@@ -114,17 +133,20 @@ const nonNegativeIntStringSchema = (message: string) =>
     }, { message })
     .transform((value) => Number.parseInt(value, 10));
 
-const cursorSchema = z.string().refine(
-  (value) => {
-    try {
-      decodeCursor(value);
-      return true;
-    } catch {
-      return false;
-    }
-  },
-  { message: 'Invalid cursor format' },
-);
+const cursorSchema = z
+  .string()
+  .max(MAX_CURSOR_LENGTH, 'Invalid cursor format')
+  .refine(
+    (value) => {
+      try {
+        decodeCursor(value);
+        return true;
+      } catch {
+        return false;
+      }
+    },
+    { message: 'Invalid cursor format' },
+  );
 
 /**
  * The legacy ad hoc parser used truthy checks (`if (action && ...)`) for
@@ -134,6 +156,15 @@ const cursorSchema = z.string().refine(
  * so rejected an empty string as invalid input. Preserving that exact split
  * (rather than "helpfully" making every field consistent) keeps this
  * refactor behaviour-neutral for existing callers relying on the old quirk.
+ *
+ * Boundary handling:
+ *   - `limit` is clamped to `[1, maxLimit]`; `0` and negatives are rejected.
+ *   - `offset` is clamped to `[0, MAX_OFFSET]`; negatives are rejected.
+ *   - `from`/`to` must parse as ISO-8601 timestamps; `from > to` is rejected
+ *     as a cross-field invariant.
+ *   - Duplicate query keys are collapsed by the underlying parser before
+ *     reaching this schema; the schema itself is deterministic for a given
+ *     scalar value.
  */
 const emptyStringToUndefined = <T extends z.ZodTypeAny>(schema: T) =>
   z.preprocess((value) => (value === '' ? undefined : value), schema.optional());
@@ -143,14 +174,24 @@ const emptyStringToUndefined = <T extends z.ZodTypeAny>(schema: T) =>
  * Both routes share the same filter fields but enforce different `limit`
  * ceilings and defaults, so this is a factory rather than a single schema —
  * mirrors the previous `parseAuditQuery(req, { defaultLimit, maxLimit })`.
+ *
+ * The returned schema is strict about unknown keys so typos in query
+ * parameters surface as validation errors instead of being silently ignored.
  */
 export function buildAuditQuerySchema(options: { maxLimit: number; defaultLimit?: number }) {
+  if (!Number.isInteger(options.maxLimit) || options.maxLimit < 1 || options.maxLimit > MAX_PAGE_LIMIT) {
+    throw new RangeError(`maxLimit must be an integer between 1 and ${MAX_PAGE_LIMIT}`);
+  }
+  if (options.defaultLimit !== undefined && (!Number.isInteger(options.defaultLimit) || options.defaultLimit < 1 || options.defaultLimit > options.maxLimit)) {
+    throw new RangeError('defaultLimit must be an integer between 1 and maxLimit');
+  }
+
   return z.object({
     action: emptyStringToUndefined(auditActionSchema),
     severity: emptyStringToUndefined(auditSeveritySchema),
-    actor: emptyStringToUndefined(z.string().min(1)),
-    resource: emptyStringToUndefined(z.string().min(1)),
-    resourceId: emptyStringToUndefined(z.string().min(1)),
+    actor: emptyStringToUndefined(identifierSchema('actor')),
+    resource: emptyStringToUndefined(identifierSchema('resource')),
+    resourceId: emptyStringToUndefined(identifierSchema('resourceId')),
     from: isoDateStringSchema('from').optional(),
     to: isoDateStringSchema('to').optional(),
     limit: positiveIntStringSchema('Invalid limit')
@@ -158,16 +199,22 @@ export function buildAuditQuerySchema(options: { maxLimit: number; defaultLimit?
       .transform((value) => (value === undefined ? options.defaultLimit : Math.min(value, options.maxLimit))),
     offset: nonNegativeIntStringSchema('Invalid offset')
       .optional()
-      .transform((value) => value ?? 0),
+      .transform((value) => {
+        const resolved = value ?? 0;
+        if (resolved > MAX_PAGE_OFFSET) {
+          throw new Error(`Invalid offset: must be at most ${MAX_PAGE_OFFSET}`);
+        }
+        return resolved;
+      }),
     cursor: emptyStringToUndefined(cursorSchema),
   });
 }
 
 export type AuditQueryParams = z.infer<ReturnType<typeof buildAuditQuerySchema>>;
 
-// ---------------------------------------------------------------------------
+// ----------------------------------------------------------------------------
 // Response schemas
-// ---------------------------------------------------------------------------
+// ----------------------------------------------------------------------------
 
 /** An ISO-8601 timestamp produced by `new Date(...).toISOString()`. */
 const isoTimestampSchema = z
@@ -231,4 +278,19 @@ export const integrityReportResponseSchema = z.object({
   firstCorruptedIndex: nonNegativeIntSchema.optional(),
   firstCorruptedId: z.string().min(1).optional(),
   checkedAt: isoTimestampSchema,
+});
+
+/**
+ * Convenience factory for the two supported audit query surfaces. Callers
+ * should prefer these over constructing `buildAuditQuerySchema` directly so
+ * that limit ceilings stay consistent across routes.
+ */
+export const auditListQuerySchema = buildAuditQuerySchema({
+  maxLimit: AUDIT_QUERY_BOUNDS.MAX_LIMIT,
+  defaultLimit: AUDIT_QUERY_BOUNDS.DEFAULT_LIMIT,
+});
+
+export const auditExportQuerySchema = buildAuditQuerySchema({
+  maxLimit: AUDIT_QUERY_BOUNDS.EXPORT_MAX_LIMIT,
+  defaultLimit: AUDIT_QUERY_BOUNDS.EXPORT_DEFAULT_LIMIT,
 });

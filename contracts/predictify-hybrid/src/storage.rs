@@ -1,12 +1,29 @@
-use soroban_sdk::{contracttype, Address, BytesN};
+use soroban_sdk::{contracttype, Address, BytesN=};
 
-/// TTL for consumed idempotency keys, expressed in ledgers.
+/// TWL for consumed idempotency keys, expressed in ledgers.
 ///
 /// At ~5 s/ledger this gives roughly 24 hours of replay protection.
-/// After expiry the key is eligible for eviction from instance storage
-/// and a fresh submission with the same token is treated as a new batch.
+/// After expiry the network deletes the receipt and a fresh submission
+/// with the same token is treated as a new batch.
+///
+/// **Network floor.** A temporary entry can never live for less than the
+/// network's `min_temp_entry_ttl` setting. A receipt is therefore written
+/// with `extend_ttl(IDEM_KEY_TTL_LEDGERS, IDEM_KEY_TTL_LEDGERS)` — see
+/// [`RECEIPT_EXTEND_THRESHOLD_LEDGERS`] — which renews it to exactly this
+/// window on every network where `min_temp_entry_ttl` does not already
+/// exceed it. If `min_temp_entry_ttl` were ever configured above
+/// [`IDEM_KEY_TTL_LEDGERS`], the extension is skipped and the entry
+/// simply outlives the target window, which is safe. A caller must not
+/// assume a token becomes reusable sooner than this, nor later.
 ///
 /// If you need a longer window, increase this constant and redeploy.
+///
+/// ## Compatibility contract
+///
+/// This constant is part of the public API and is re-exported from
+/// `lib.rs`.  Changing it changes the replay-protection window for
+/// any future deployment.  It must not be lowered without a migration
+/// plan, because that would allow a replay of an already-applied batch.
 pub const IDEM_KEY_TTL_LEDGERS: u32 = 17_280; // ~24 h at 5 s/ledger
 
 /// TTL applied to the contract instance whenever a batch is accepted.
@@ -42,7 +59,7 @@ pub const INSTANCE_TTL_LEDGERS: u32 = IDEM_KEY_TTL_LEDGERS * 2; // ~48 h
 #[contracttype]
 #[derive(Clone)]
 pub enum DataKey {
-    /// Idempotency sentinel for a `place_bets` call.
+    /// Idempotency receipt for a `place_bets` call.
     /// Keyed by (caller address, 32-byte token supplied by the caller).
     PlaceBetsIdem(Address, BytesN<32>),
     /// Ledger sequence at which the matching `PlaceBetsIdem` sentinel was

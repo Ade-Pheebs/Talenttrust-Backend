@@ -54,6 +54,30 @@ authentication mechanisms and a shared RBAC authorization layer.
 | API Key | `src/auth/apiKeyMiddleware.ts` | `X-API-Key: <key>` | Service-to-service, internal automation |
 | Legacy Bearer | `src/auth/authenticate.ts` | `Authorization: Bearer <base64>` | Demo/test only |
 
+> **⚠️ The legacy bearer path is not a security boundary.** Its tokens are
+> structurally validated but never signed and never expire, so anyone who can
+> base64-encode `{"userId":"x","role":"admin"}` can mint an administrator.
+> Production traffic is authenticated by `requireAuth`
+> (`src/middleware/authorization.ts`). The validation boundaries below exist to
+> make the legacy path's accepted input deterministic and to stop a malformed
+> header from being silently accepted as an alias for a valid credential — not
+> to make it trustworthy. Do not add new consumers.
+>
+> **Accepted input** (`src/auth/authenticate.ts`):
+>
+> | Boundary | Rule |
+> |----------|------|
+> | Header grammar | Exactly `Bearer ` + one non-space credential, nothing after it. Comma-joined duplicates (RFC 7230 §3.2.2), CRLF, and extra whitespace are rejected |
+> | Encoding | Standard base64 (RFC 4648 §4, **not** base64url), length a multiple of 4, padding only as trailing `=`/`==`, and an exact decode/encode round-trip |
+> | Size | Credential ≤ `MAX_TOKEN_LENGTH` (4096) chars, checked before any decode |
+> | Payload | A JSON object (not array/number/string/null); `userId` and `role` read as own properties only |
+> | `userId` | 1–`MAX_USER_ID_LENGTH` (128) printable ASCII (`A-Za-z0-9._:@-`) — no whitespace or control characters |
+> | `role` | Member of `VALID_ROLES` |
+>
+> Rejections are logged as `auth_legacy_bearer_rejected` with a stable `reason`
+> (see §3.1.1). The 401 response bodies are unchanged from before this change.
+
+
 **Key middleware entry points:**
 
 | Middleware | Module | Purpose |
@@ -167,10 +191,33 @@ fail closed on malformed data.
 | `authorization_deny_unresolved_resource` | `warn` | Resource not in `PERMISSION_MATRIX` — possible misconfigured route or unsanitised input |
 | `authorization_deny_unresolved_action` | `warn` | Action not in matrix |
 | `authorization_deny_unresolved_role` | `warn` | Role not in matrix for that resource+action cell |
+| `auth_legacy_bearer_rejected` | `debug` / `warn` | Legacy bearer path refused a credential. Carries a stable `reason` (see §3.1.1) and `path`; never the credential itself. `warn` reasons indicate a structurally valid credential whose claims were refused — treat a spike as a forgery attempt |
 | `"invalid token"` / `"Token has expired"` | `warn` | Expected on expiry; spikes indicate clock-skew or widespread expired sessions |
 | `"Invalid or expired JWT token."` | (response) | JWT rejected by `adminAuthGuard` |
 | `"API key validation error:"` | `error` (console) | `validateApiKey` threw — database error or crypto failure |
 | `isAuthorized denied:` | `info` (console) | Permission denied with structured context |
+
+#### 3.1.1 `auth_legacy_bearer_rejected` reason codes
+
+Emitted only by the legacy `src/auth/authenticate.ts` path. Grouped by severity:
+
+| Reason | Level | Meaning |
+|--------|-------|---------|
+| `missing_header` | `debug` | No `Authorization` header |
+| `malformed_header` | `debug` | Scheme not `Bearer `, extra/missing space, comma-joined duplicate credential, or a non-string header |
+| `empty_token` | `debug` | `Bearer ` with no credential |
+| `token_too_long` | `debug` | Credential exceeds `MAX_TOKEN_LENGTH` (4096) — refused on length alone, before any decode |
+| `token_not_object` | `warn` | Decoded JSON was an array, number, string, or `null` |
+| `user_id_invalid` | `warn` | `userId` empty, non-string, over `MAX_USER_ID_LENGTH` (128), or containing whitespace/control characters (CR, LF, NUL, ESC) |
+| `role_invalid` | `warn` | `role` present but outside `VALID_ROLES` |
+
+`token_not_base64` (non-alphabet characters, bad length, bad padding) and
+`token_not_json` (decoded bytes are not JSON) are `warn`-level only when the
+value was structurally sound enough to decode; otherwise `debug`.
+
+A sustained `role_invalid` or `user_id_invalid` rate from a single `path` is
+worth investigating — it means well-formed credentials carrying claims this
+service refuses.
 
 ### 3.2 HTTP response codes
 
@@ -714,6 +761,9 @@ All the following must pass before declaring the auth subsystem healthy:
 src/auth/
   authenticate.ts       — Legacy base64 bearer token middleware
   authenticate.test.ts  — Tests for legacy auth + JWT algorithm hardening
+  authenticate.validation-boundaries.test.ts
+                         — Accepted / rejected / duplicate / boundary / regression
+                           tests for the legacy bearer path (issue #1411)
   authorize.ts          — Legacy `isAllowed` function (uses ACCESS_CONTROL_MATRIX)
   roles.ts              — Legacy matrix + role/resource/action types
   jwtConfig.ts          — Algorithm pinning, frozen verify options

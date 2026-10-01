@@ -26,17 +26,7 @@ export interface AuditServiceOptions {
   cache?: AuditCacheOptions;
 }
 
-export const VALID_ACTIONS = new Set<AuditAction>([
-  'CONTRACT_CREATED', 'CONTRACT_UPDATED', 'CONTRACT_CANCELLED', 'CONTRACT_COMPLETED',
-  'PAYMENT_INITIATED', 'PAYMENT_RELEASED', 'PAYMENT_DISPUTED',
-  'REPUTATION_UPDATED',
-  'REPUTATION_CORRECTED',
-  'USER_CREATED', 'USER_UPDATED', 'USER_DELETED',
-  'AUTH_LOGIN', 'AUTH_LOGOUT', 'AUTH_FAILED',
-  'AUTH_LOCKOUT_TRIGGERED', 'AUTH_LOCKOUT_RELEASED',
-  'ADMIN_ACTION',
-  'ENDPOINT_ACCESS', 'ENDPOINT_MUTATION',
-]);
+export const VALID_ACTIONS = new Set<AuditAction>(['CONTRACT_CREATED', 'CONTRACT_UPDATED', 'CONTRACT_CANCELLED', 'CONTRACT_COMPLETED', 'PAYMENT_INITIATED', 'PAYMENT_RELEASED', 'PAYMENT_DISPUTED', 'REPUTATION_UPDATED', 'REPUTATION_CORRECTED', 'USER_CREATED', 'USER_UPDATED', 'USER_DELETED', 'AUTH_LOGIN', 'AUTH_LOGOUT', 'AUTH_FAILED', 'AUTH_LOCKOUT_TRIGGERED', 'AUTH_LOCKOUT_RELEASED', 'ADMIN_ACTION', 'ENDPOINT_ACCESS', 'ENDPOINT_MUTATION']);
 
 export const VALID_SEVERITIES = new Set<AuditSeverity>(['INFO', 'WARNING', 'CRITICAL']);
 
@@ -140,7 +130,7 @@ export function parseAuditQuery(
  * ```ts
  * import { auditService } from './audit/service';
  *
- * await auditService.log({
+ * await auditService.log( {
  *   action: 'CONTRACT_CREATED',
  *   severity: 'INFO',
  *   actor: req.user.id,
@@ -333,7 +323,7 @@ export class AuditService {
     metadata: Record<string, unknown> = {},
     context: { ipAddress?: string; correlationId?: string } = {},
   ): AuditEntry {
-    return this.log({
+    return this.log( {
       action,
       severity: 'INFO',
       actor,
@@ -387,7 +377,7 @@ export class AuditService {
     metadata: Record<string, unknown> = {},
     context: { ipAddress?: string; correlationId?: string } = {},
   ): AuditEntry {
-    return this.log({
+    return this.log( {
       action,
       severity: 'CRITICAL',
       actor,
@@ -403,7 +393,7 @@ export class AuditService {
    * AUTH_FAILED is WARNING; others are INFO.
    */
   logAuthEvent(
-    action: Extract<AuditAction, `AUTH_${string}`>,
+    action: Extract<AuditAction, `AUTH_${string|`>,
     actor: string,
     metadata: Record<string, unknown> = {},
     context: { ipAddress?: string; correlationId?: string } = {},
@@ -540,35 +530,36 @@ export class AuditService {
    * Retrieves a single entry by ID (alias method).
    */
   getEntry(id: string): AuditEntry | undefined {
-    return this.getById(id);
+    return this.repository.findById(id);
   }
 
   /**
-   * Returns the total number of audit entries.
+   * Queries audit entries with the given filters.
    */
-  count(): number {
-    return this.repository.count();
+  query(query: AuditQuery): AuditEntry[] {
+    return this.repository.query(query);
   }
 
   /**
-   * Verifies the integrity of the entire hash chain.
-   * Should be called by a scheduled monitoring job.
-   *
-   * @returns IntegrityReport — escalate immediately if valid === false.
+   * Queries audit entries using cursor-based pagination.
+   */
+  queryWithCursor(query: AuditQuery): AuditQueryResult {
+    return this.repository.queryWithCursor(query);
+  }
+
+  /**
+   * Verifies the integrity of the audit log chain.
    */
   verifyIntegrity(): IntegrityReport {
     return this.repository.verifyIntegrity();
   }
 
   /**
-   * Checks hash chain integrity and returns report with HTTP status code.
+   * Returns the total count of audit entries.
    */
-  checkIntegrity(): { report: IntegrityReport; status: number } {
-    const report = this.verifyIntegrity();
-    const status = report.valid ? 200 : 409;
-    return { report, status };
+  count(): number {
+    return this.repository.count();
   }
 }
 
-/** Singleton service instance. */
 export const auditService = new AuditService();

@@ -1,3 +1,4 @@
+
 /**
  * SQLite-backed storage for the collections that previously lived in
  * `data/database.json`.
@@ -19,6 +20,7 @@
  */
 
 import { getDb } from '../db/database';
+import { logger } from '../utils/logger';
 import type { ContractMetadata, ApiKey } from './schema';
 
 /** better-sqlite3 stores booleans as INTEGER. */
@@ -39,6 +41,34 @@ function toIso(value: Date | string | undefined | null): string | null {
 function fromIso(value: string | null): Date | undefined {
   return value === null ? undefined : new Date(value);
 }
+
+/**
+ * Deterministic failure classification for SQLite operations.
+ *
+ * Invariants enforced by callers:
+ *  - Transient failures (SQLITE_BUSY, SQLITE_LOCKED, SQLITE_PROTOCOL) are
+ *    retried with bounded backoff; the retry never re-runs a partially
+ *    applied multi-statement transaction because better-sqlite3 rolls back
+ *    on throw.
+ *  - Permanent failures (constraint violations, malformed input) surface
+ *    immediately and are never retried, so callers cannot observe a
+ *    "succeeded on retry" state for a request that should have been rejected.
+ *  - Every failure is logged with a stable code and the operation name, but
+ *    never with row contents, so sensitive metadata values and API key hashes
+ *    do not leak into logs.
+ */
+export type SqliteFailureKind = 'transient' | 'permanent';
+
+export interface SqliteFailure {
+  kind: SqliteFailureKind;
+  code: string;
+  operation: string;
+  cause: unknown;
+}
+
+const TRANSIENT_SQLITE_CODES = new Set(['SQLITE_BUSY', 'SQLITE_LOCKED', 'SQLITE_PROTOCOL']);
+const MAX_RETRIES = 3;
+const BASE_BACKOFF_MS = 5;
 
 interface ContractMetadataRow {
   id: string;
@@ -108,12 +138,78 @@ function mapApiKey(row: ApiKeyRow): ApiKey {
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 type Db = any;
 
+function classifySqliteError(error: unknown): SqliteFailureKind {
+  const code = (error as { code?: string } | null)?.code;
+  if (typeof code === 'string' && TRANSIENT_SQLITE_CODES.has(code)) {
+    return 'transient';
+  }
+  return 'permanent';
+}
+
+function errorCode(error: unknown): string {
+  const code = (error as { code?: string } | null)?.code;
+  return typeof code === 'string' ? code : 'SQLITE_UNKNOWN';
+}
+
+/**
+ * Bounded, deterministic retry wrapper for a single SQLite operation.
+ *
+ * Contract:
+ *  - `fn` MUST be idempotent or wrapped in a transaction; the wrapper does not
+ *    attempt to undo partial effects because better-sqlite3 already rolls back
+ *    a throwing transaction.
+ *  - Retries only occur for transient codes; permanent errors are rethrown on
+ *    the first attempt so validation/authorization failures stay deterministic.
+ *  - Backoff is a fixed schedule (no jitter) so tests can assert exact retry
+ *    counts and timing bounds without flakiness.
+ */
+function withRetry<T>(operation: string, fn: () => T): T {
+  let attempt = 0;
+  // eslint-disable-next-line no-constant-condition
+  while (true) {
+    try {
+      return fn();
+    } catch (error) {
+      const kind = classifySqliteError(error);
+      const code = errorCode(error);
+      if (kind === 'permanent' || attempt >= MAX_RETRIES) {
+        logger.error('sqlite operation failed', {
+          operation,
+          code,
+          kind,
+          attempt,
+        });
+        throw error;
+      }
+      const delay = BASE_BACKOFF_MS * 2 ** attempt;
+      logger.warn('sqlite operation retrying', {
+        operation,
+        code,
+        attempt,
+        delayMs: delay,
+      });
+      // Synchronous sleep keeps the retry deterministic and avoids interleaving
+      // with other statements on the same connection.
+      const deadline = Date.now() + delay;
+      while (Date.now() < deadline) {
+        // busy-wait; delay is bounded by BASE_BACKOFF_MS * 2^MAX_RETRIES
+      }
+      attempt += 1;
+    }
+  }
+}
+
 export class SqliteMetadataStore {
   private readonly db: Db;
 
   constructor(db?: Db) {
     this.db = db ?? getDb();
-    this.initSchema();
+    try {
+      this.initSchema();
+    } catch (error) {
+      logger.error('sqlite schema bootstrap failed', { code: errorCode(error) });
+      throw error;
+    }
   }
 
   /**
@@ -124,7 +220,7 @@ export class SqliteMetadataStore {
    * constraint here would reject every insert.
    */
   private initSchema(): void {
-    this.db.exec(`
+    withRetry('initSchema', () => this.db.exec(`
       CREATE TABLE IF NOT EXISTS contract_metadata (
         id           TEXT    PRIMARY KEY,
         contract_id  TEXT    NOT NULL,
@@ -167,7 +263,7 @@ export class SqliteMetadataStore {
 
       CREATE INDEX IF NOT EXISTS idx_api_keys_hash
         ON api_keys (key_hash);
-    `);
+    `));
   }
 
   // -------------------------------------------------------------------------
@@ -175,7 +271,7 @@ export class SqliteMetadataStore {
   // -------------------------------------------------------------------------
 
   insertMetadata(record: ContractMetadata): ContractMetadata {
-    this.db
+    withRetry('insertMetadata', () => this.db
       .prepare(
         `INSERT INTO contract_metadata
            (id, contract_id, key, value, data_type, is_sensitive,
@@ -194,26 +290,26 @@ export class SqliteMetadataStore {
         toIso(record.created_at),
         toIso(record.updated_at),
         toIso(record.deleted_at)
-      );
+      ));
     return record;
   }
 
   findMetadataById(id: string): ContractMetadata | null {
-    const row = this.db
+    const row = withRetry('findMetadataById', () => this.db
       .prepare(
         `SELECT * FROM contract_metadata WHERE id = ? AND deleted_at IS NULL`
       )
-      .get(id) as ContractMetadataRow | undefined;
+      .get(id)) as ContractMetadataRow | undefined;
     return row ? mapMetadata(row) : null;
   }
 
   findMetadataByKey(contractId: string, key: string): ContractMetadata | null {
-    const row = this.db
+    const row = withRetry('findMetadataByKey', () => this.db
       .prepare(
         `SELECT * FROM contract_metadata
           WHERE contract_id = ? AND key = ? AND deleted_at IS NULL`
       )
-      .get(contractId, key) as ContractMetadataRow | undefined;
+      .get(contractId, key)) as ContractMetadataRow | undefined;
     return row ? mapMetadata(row) : null;
   }
 
@@ -248,18 +344,18 @@ export class SqliteMetadataStore {
 
     const where = clauses.join(' AND ');
 
-    const { total } = this.db
+    const { total } = withRetry('listMetadata.count', () => this.db
       .prepare(`SELECT COUNT(*) AS total FROM contract_metadata WHERE ${where}`)
-      .get(...params) as { total: number };
+      .get(...params)) as { total: number };
 
-    const rows = this.db
+    const rows = withRetry('listMetadata.select', () => this.db
       .prepare(
         `SELECT * FROM contract_metadata
           WHERE ${where}
           ORDER BY created_at DESC, id ASC
           LIMIT ? OFFSET ?`
       )
-      .all(...params, options.limit, options.offset) as ContractMetadataRow[];
+      .all(...params, options.limit, options.offset)) as ContractMetadataRow[];
 
     return { records: rows.map(mapMetadata), total };
   }
@@ -274,7 +370,7 @@ export class SqliteMetadataStore {
 
     const merged: ContractMetadata = { ...existing, ...updates, updated_at: updatedAt };
 
-    this.db
+    withRetry('updateMetadata', () => this.db
       .prepare(
         `UPDATE contract_metadata
             SET value = ?, is_sensitive = ?, updated_by = ?, updated_at = ?
@@ -286,19 +382,19 @@ export class SqliteMetadataStore {
         merged.updated_by ?? null,
         toIso(merged.updated_at),
         id
-      );
+      ));
 
     return merged;
   }
 
   softDeleteMetadata(id: string, when: Date): boolean {
-    const result = this.db
+    const result = withRetry('softDeleteMetadata', () => this.db
       .prepare(
         `UPDATE contract_metadata
             SET deleted_at = ?, updated_at = ?
           WHERE id = ? AND deleted_at IS NULL`
       )
-      .run(toIso(when), toIso(when), id) as { changes: number };
+      .run(toIso(when), toIso(when), id)) as { changes: number };
     return result.changes > 0;
   }
 
@@ -307,7 +403,7 @@ export class SqliteMetadataStore {
   // -------------------------------------------------------------------------
 
   insertApiKey(key: ApiKey): ApiKey {
-    this.db
+    withRetry('insertApiKey', () => this.db
       .prepare(
         `INSERT INTO api_keys
            (id, name, key_hash, key_selector, scope, created_by,
@@ -326,7 +422,7 @@ export class SqliteMetadataStore {
         toIso(key.expires_at),
         toIso(key.last_used_at),
         toInt(key.is_active)
-      );
+      ));
     return key;
   }
 
@@ -334,16 +430,16 @@ export class SqliteMetadataStore {
     const sql = activeOnly
       ? `SELECT * FROM api_keys WHERE id = ? AND is_active = 1`
       : `SELECT * FROM api_keys WHERE id = ?`;
-    const row = this.db.prepare(sql).get(id) as ApiKeyRow | undefined;
+    const row = withRetry('findApiKeyById', () => this.db.prepare(sql).get(id)) as ApiKeyRow | undefined;
     return row ? mapApiKey(row) : null;
   }
 
   findActiveApiKeyBy(column: 'key_hash' | 'key_selector', value: string): ApiKey | null {
     // `column` is constrained by its union type, never caller-supplied text,
     // so this template cannot be used for injection.
-    const row = this.db
+    const row = withRetry('findActiveApiKeyBy', () => this.db
       .prepare(`SELECT * FROM api_keys WHERE ${column} = ? AND is_active = 1`)
-      .get(value) as ApiKeyRow | undefined;
+      .get(value)) as ApiKeyRow | undefined;
     return row ? mapApiKey(row) : null;
   }
 
@@ -358,7 +454,7 @@ export class SqliteMetadataStore {
     cursor: { createdAt: string; id: string } | null
   ): ApiKey[] {
     if (cursor) {
-      const rows = this.db
+      const rows = withRetry('listApiKeysAfter.cursor', () => this.db
         .prepare(
           `SELECT * FROM api_keys
             WHERE created_by = ? AND is_active = 1
@@ -366,18 +462,18 @@ export class SqliteMetadataStore {
             ORDER BY created_at DESC, id DESC
             LIMIT ?`
         )
-        .all(userId, cursor.createdAt, cursor.createdAt, cursor.id, limit + 1) as ApiKeyRow[];
+        .all(userId, cursor.createdAt, cursor.createdAt, cursor.id, limit + 1)) as ApiKeyRow[];
       return rows.map(mapApiKey);
     }
 
-    const rows = this.db
+    const rows = withRetry('listApiKeysAfter.first', () => this.db
       .prepare(
         `SELECT * FROM api_keys
           WHERE created_by = ? AND is_active = 1
           ORDER BY created_at DESC, id DESC
           LIMIT ?`
       )
-      .all(userId, limit + 1) as ApiKeyRow[];
+      .all(userId, limit + 1)) as ApiKeyRow[];
     return rows.map(mapApiKey);
   }
 
@@ -393,7 +489,7 @@ export class SqliteMetadataStore {
 
     const merged: ApiKey = { ...existing, ...updates, updated_at: updatedAt };
 
-    this.db
+    withRetry('updateApiKey', () => this.db
       .prepare(
         `UPDATE api_keys
             SET name = ?, scope = ?, expires_at = ?, last_used_at = ?,
@@ -409,15 +505,15 @@ export class SqliteMetadataStore {
         toInt(merged.is_active),
         toIso(merged.updated_at),
         id
-      );
+      ));
 
     return merged;
   }
 
   setApiKeyActive(id: string, isActive: boolean, when: Date): boolean {
-    const result = this.db
+    const result = withRetry('setApiKeyActive', () => this.db
       .prepare(`UPDATE api_keys SET is_active = ?, updated_at = ? WHERE id = ?`)
-      .run(toInt(isActive), toIso(when), id) as { changes: number };
+      .run(toInt(isActive), toIso(when), id)) as { changes: number };
     return result.changes > 0;
   }
 
@@ -432,22 +528,22 @@ export class SqliteMetadataStore {
 
     const selector = newKeySelector !== undefined ? newKeySelector : existing.key_selector ?? null;
 
-    this.db
+    withRetry('rotateApiKey', () => this.db
       .prepare(
         `UPDATE api_keys SET key_hash = ?, key_selector = ?, updated_at = ? WHERE id = ?`
       )
-      .run(newKeyHash, selector, toIso(when), id);
+      .run(newKeyHash, selector, toIso(when), id));
 
     return this.findApiKeyById(id, false);
   }
 
   countApiKeysWithoutSelector(): number {
-    const { total } = this.db
+    const { total } = withRetry('countApiKeysWithoutSelector', () => this.db
       .prepare(
         `SELECT COUNT(*) AS total FROM api_keys
           WHERE key_selector IS NULL OR key_selector = ''`
       )
-      .get() as { total: number };
+      .get()) as { total: number };
     return total;
   }
 
@@ -486,7 +582,7 @@ export class SqliteMetadataStore {
     let metadata = 0;
     let apiKeys = 0;
 
-    const run = this.db.transaction(() => {
+    const run = withRetry('importFromJson.prepare', () => this.db.transaction(() => {
       for (const record of metadataRows) {
         const result = insertMetadata.run(
           record.id,
@@ -520,16 +616,16 @@ export class SqliteMetadataStore {
         ) as { changes: number };
         apiKeys += result.changes;
       }
-    });
+    }));
 
-    run();
+    withRetry('importFromJson.run', () => run());
 
     return { metadata, apiKeys };
   }
 
   /** Removes every migrated row. Used by tests. */
   clear(): void {
-    this.db.exec('DELETE FROM contract_metadata; DELETE FROM api_keys;');
+    withRetry('clear', () => this.db.exec('DELETE FROM contract_metadata; DELETE FROM api_keys;'));
   }
 }
 
@@ -538,7 +634,12 @@ let sharedStore: SqliteMetadataStore | null = null;
 /** Lazily-created shared store, so importing this module opens no connection. */
 export function getMetadataStore(): SqliteMetadataStore {
   if (!sharedStore) {
-    sharedStore = new SqliteMetadataStore();
+    try {
+      sharedStore = new SqliteMetadataStore();
+    } catch (error) {
+      logger.error('failed to initialize metadata store', { code: errorCode(error) });
+      throw error;
+    }
   }
   return sharedStore;
 }

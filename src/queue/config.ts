@@ -164,7 +164,7 @@ export function getRedisConfig(): ConnectionOptions {
 }
 
 /** Default per-job attempt timeout in milliseconds (30 seconds). */
-const DEFAULT_JOB_TIMEOUT_MS = 30_000;
+const DEFAULT_JOB_TIMEOUT_MS_INTERNAL = 30_000;
 
 function parsePositiveTimeout(value: string | undefined, fallback: number): number {
   if (value === undefined) {
@@ -202,7 +202,7 @@ export function getJobTimeoutMs(jobType: JobType): number {
  */
 const defaultJobTimeoutMs = parsePositiveTimeout(
   process.env.QUEUE_JOB_TIMEOUT_MS,
-  DEFAULT_JOB_TIMEOUT_MS,
+  DEFAULT_JOB_TIMEOUT_MS_INTERNAL,
 );
 
 export const queueConfig: QueueConfig = {

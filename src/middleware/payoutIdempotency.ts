@@ -99,7 +99,7 @@ export function createPayoutIdempotencyMiddleware(
         res,
         400,
         "invalid_idempotency_key",
-        \Idempotency-Key must be a non-empty string of at most \ characters.\,
+        `Idempotency-Key must be a non-empty string of at most ${IDEMPOTENCY_KEY_MAX_LENGTH} characters.`,
       );
       return;
     }
@@ -187,4 +187,3 @@ export function createPayoutIdempotencyMiddleware(
 }
 
 export const payoutIdempotencyMiddleware = createPayoutIdempotencyMiddleware;
-

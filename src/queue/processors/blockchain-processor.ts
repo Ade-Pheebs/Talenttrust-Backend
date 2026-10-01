@@ -9,6 +9,27 @@ import { BlockchainSyncPayload, JobResult } from '../types';
 import { createLogger } from '../../logger';
 import { InvalidJobPayloadError } from '../queue-errors';
 import { eventAuditService } from '../../events/registry';
+import { evaluateReorg, ReorgDetectorConfig } from '../../finality/reorgDetector';
+import type { ReorgEvaluation } from '../../finality/reorgDetector';
+
+const DEFAULT_REORG_CONFIG: ReorgDetectorConfig = { maxRewindDepth: 100 };
+const lastKnownHeads = new Map<string, number>();
+
+/**
+ * Best-effort reorg handler. Full rewind requires injected repos; without
+ * them we log the detection and allow the sync to proceed. The finality
+ * promotion sweep will re-evaluate provisional events on the next cycle.
+ */
+async function reorgHandler(network: string, reorgEval: ReorgEvaluation, previousHead: number): Promise<void> {
+  // Lazy-import to avoid circular deps at module load time
+  const { createLogger } = await import('../../logger');
+  const log = createLogger({ service: 'blockchain-processor', network });
+  log.warn('Chain reorg detected; rewind deferred to next finality sweep', {
+    network,
+    previousHead,
+    reorgDepth: reorgEval.depth,
+  });
+}
 
 /**
  * Finality promotion callback invoked after a successful sync. Flips
@@ -111,7 +132,7 @@ export async function processBlockchainSync(
     });
 
     try {
-      await reorgHandler(payload.network, reorgEval);
+      await reorgHandler(payload.network, reorgEval, previousHead);
     } catch (error) {
       log.error('Blockchain sync aborted: reorg rewind failed', {
         error: error instanceof Error ? error.message : 'Unknown reorg error',

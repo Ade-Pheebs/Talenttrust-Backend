@@ -264,7 +264,25 @@ export class SqliteEventAuditRepository implements IEventAuditRepository {
   }
 
   /**
-   * One-way promotion: flip a provisional event to finalized. No-op when the
+   * Demote finalized events within a ledger range back to provisional.
+   * Used by the rewind service after a chain reorg is detected.
+   *
+   * @returns The number of events actually demoted.
+   */
+  async demoteProvisional(network: string, fromLedger: number, toLedger: number): Promise<number> {
+    const result = await withSerializationRetry(() =>
+      this.db
+        .prepare(
+          `UPDATE event_audit
+           SET finality_status = 'provisional', finalized_at = NULL
+           WHERE network = ? AND ledger >= ? AND ledger <= ? AND finality_status = 'finalized'`,
+        )
+        .run(network, fromLedger, toLedger),
+    );
+    return result.changes;
+  }
+
+  /** One-way promotion: flip a provisional event to finalized. No-op when the
    * event is unknown. Not transactional with any projection write because a
    * promotion does not change projection state — but it stays a single-row
    * update so retry-on-serialization applies.

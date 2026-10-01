@@ -65,7 +65,8 @@ export class EventIngestionService {
     }
 
     if (correlationId === undefined) {
-      correlationId = getContext()?.correlationId;
+      const ctx = getContext()?.correlationId;
+      correlationId = typeof ctx === 'string' ? ctx : undefined;
     }
 
     try {

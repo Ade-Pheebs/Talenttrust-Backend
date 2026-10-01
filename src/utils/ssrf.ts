@@ -196,8 +196,8 @@ export function isPrivateHost(host: string): boolean {
  * @security Unset, misspelled, production, or any other NODE_ENV value returns
  * false so the bypass cannot leak in by accident.
  */
-function isSsrfBypassEnvAllowed(): boolean {
-  const nodeEnv = getEnv('NODE_ENV');
+function isSsrfBypassEnvAllowed(env: NodeJS.ProcessEnv): boolean {
+  const nodeEnv = getEnv('NODE_ENV', env);
   if (nodeEnv === undefined) {
     return false;
   }
@@ -216,17 +216,18 @@ function isSsrfBypassEnvAllowed(): boolean {
  *   SSRF_ALLOW_PRIVATE_HOSTS=true (default false)
  *
  * @param urlString - The URL to validate
+ * @param env - Optional policy source; defaults to process.env for existing callers
  * @returns true if the URL is safe, false if it points to a private/internal resource
  */
-export function isSafeUrl(urlString: string): boolean {
+export function isSafeUrl(urlString: string, env: NodeJS.ProcessEnv = process.env): boolean {
   /**
    * Explicit, default-off allow flag. Honoured only in development|test|staging.
    * In production the flag is rejected at config load; here it is also ignored
    * so no runtime path returns true for a private host.
    */
-  const allowPrivateHosts = parseBoolEnv('SSRF_ALLOW_PRIVATE_HOSTS', false);
+  const allowPrivateHosts = parseBoolEnv('SSRF_ALLOW_PRIVATE_HOSTS', false, env);
 
-  if (allowPrivateHosts && isSsrfBypassEnvAllowed()) {
+  if (allowPrivateHosts && isSsrfBypassEnvAllowed(env)) {
     return true;
   }
 

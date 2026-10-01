@@ -60,38 +60,42 @@ export class AuditStore implements AuditLogRepository {
   /** Internal append-only log. Never mutate directly. */
   private readonly log: AuditEntry[] = [];
 
-  /**
-   * Appends a new immutable entry to the log.
-   * Automatically assigns id, timestamp, previousHash, and hash.
-   *
-   * @param input - Caller-supplied fields (must not contain raw PII).
-   * @returns The frozen, persisted AuditEntry.
-   */
+  private _appendGuard = false;
+
   append(input: CreateAuditEntryInput): AuditEntry {
-    const previousHash =
-      this.log.length === 0 ? GENESIS_HASH : this.log[this.log.length - 1].hash;
+    if (this._appendGuard) {
+      throw new Error('AuditStore append re-entrancy detected');
+    }
 
-    const partial: Omit<AuditEntry, 'hash'> = {
-      id: randomUUID(),
-      timestamp: new Date().toISOString(),
-      action: input.action,
-      severity: input.severity,
-      actor: input.actor,
-      resource: input.resource,
-      resourceId: input.resourceId,
-      metadata: Object.freeze({ ...input.metadata }),
-      ipAddress: input.ipAddress,
-      correlationId: input.correlationId,
-      previousHash,
-    };
+    this._appendGuard = true;
+    try {
+      const previousHash =
+        this.log.length === 0 ? GENESIS_HASH : this.log[this.log.length - 1].hash;
 
-    const entry: AuditEntry = Object.freeze({
-      ...partial,
-      hash: computeEntryHash(partial),
-    });
+      const partial: Omit<AuditEntry, 'hash'> = {
+        id: randomUUID(),
+        timestamp: new Date().toISOString(),
+        action: input.action,
+        severity: input.severity,
+        actor: input.actor,
+        resource: input.resource,
+        resourceId: input.resourceId,
+        metadata: Object.freeze({ ...input.metadata }),
+        ipAddress: input.ipAddress,
+        correlationId: input.correlationId,
+        previousHash,
+      };
 
-    this.log.push(entry);
-    return entry;
+      const entry: AuditEntry = Object.freeze({
+        ...partial,
+        hash: computeEntryHash(partial),
+      });
+
+      this.log.push(entry);
+      return entry;
+    } finally {
+      this._appendGuard = false;
+    }
   }
 
   /**
@@ -162,10 +166,8 @@ export class AuditStore implements AuditLogRepository {
         const cursorData: CursorData = decodeCursor(query.cursor);
         
         // Find the index of the last entry from the previous page
-        startIndex = this.log.findIndex(e => e.id === cursorData.lastId);
-        if (startIndex !== -1) {
-          startIndex += 1; // Start after the last entry
-        }
+        const found = this.log.findIndex(e => e.id === cursorData.lastId);
+        startIndex = found !== -1 ? found + 1 : 0;
         
         // Verify filters match cursor (prevent filter drift)
         if (cursorData.filters.action !== query.action ||
@@ -177,7 +179,7 @@ export class AuditStore implements AuditLogRepository {
             cursorData.filters.to !== query.to) {
           throw new Error('Cursor filters do not match query filters');
         }
-      } catch (_error) {
+      } catch {
         // If cursor is invalid, start from beginning
         startIndex = 0;
       }
@@ -285,6 +287,7 @@ export class AuditStore implements AuditLogRepository {
    */
   _reset(): void {
     this.log.length = 0;
+    this._appendGuard = false;
   }
 }
 

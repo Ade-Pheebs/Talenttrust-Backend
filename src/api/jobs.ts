@@ -25,6 +25,48 @@ import { IdempotencyLayer } from '../events/idempotency';
 import { requireAuth, requireRole } from '../middleware/authorization';
 
 // ---------------------------------------------------------------------------
+// Request context propagation
+// ---------------------------------------------------------------------------
+
+/** Context envelope propagated to asynchronous processors (e.g., webhook calls). */
+export interface RequestContextEnvelope {
+  requestId?: string;
+  tenantId?: string;
+  actorId?: string;
+}
+
+const MAX_CONTEXT_FIELD_LENGTH = 128;
+
+function sanitizeContextValue(value: unknown): string | undefined {
+  const raw = Array.isArray(value) ? value.find((v): v is string => typeof v === 'string') : value;
+  if (typeof raw !== 'string') return undefined;
+  const trimmed = raw.trim();
+  if (trimmed.length === 0 || trimmed.length > MAX_CONTEXT_FIELD_LENGTH) return undefined;
+  // Prevent header injection and other control-character issues.
+  if (/[\u0000-\u001f\u007f]/.test(trimmed)) return undefined;
+  return trimmed;
+}
+
+/**
+ * Extract a validated context envelope from the incoming request.
+ * Unknown, missing, or malformed values are omitted rather than propagated.
+ */
+export function extractRequestContext(req: Request): RequestContextEnvelope {
+  const context: RequestContextEnvelope = {};
+
+  const requestId = sanitizeContextValue(req.headers['x-request-id'] ?? (req as any).id);
+  if (requestId) context.requestId = requestId;
+
+  const tenantId = sanitizeContextValue(req.headers['x-tenant-id'] ?? (req as any).tenantId);
+  if (tenantId) context.tenantId = tenantId;
+
+  const actorId = sanitizeContextValue((req as any).user?.id ?? req.headers['x-actor-id']);
+  if (actorId) context.actorId = actorId;
+
+  return context;
+}
+
+// ---------------------------------------------------------------------------
 // Store contract
 // ---------------------------------------------------------------------------
 
@@ -52,6 +94,7 @@ export interface ReplayableDlqStore {
 
 let dlqStore: ReplayableDlqStore | null = null;
 let stopSampling: (() => void) | null = null;
+let replayInFlight: Set<string> = new Set();
 
 const router = Router();
 
@@ -64,10 +107,15 @@ async function deliverRaw(
   targetUrl: string,
   eventId: string,
   payload: Record<string, unknown>,
+  context: RequestContextEnvelope = {},
 ): Promise<boolean> {
   try {
+    const headers: Record<string, string> = { 'X-Event-Id': eventId };
+    if (context.requestId) headers['X-Request-Id'] = context.requestId;
+    if (context.tenantId) headers['X-Tenant-Id'] = context.tenantId;
+    if (context.actorId) headers['X-Actor-Id'] = context.actorId;
     const response = await axios.post(targetUrl, payload, {
-      headers: { 'X-Event-Id': eventId },
+      headers,
       validateStatus: () => true,
     });
     return response.status >= 200 && response.status < 300;
@@ -139,6 +187,7 @@ export function shutdownJobs(): void {
     stopSampling = null;
   }
 
+  replayInFlight.clear();
   dlqStore = null;
 }
 
@@ -183,8 +232,15 @@ router.post(
         return;
       }
 
+      if (replayInFlight.has(id)) {
+        res.status(409).json({ error: 'Replay already in progress for this DLQ record' });
+        return;
+      }
+      replayInFlight.add(id);
+
       const dlqItem = await dlqStore.getEntryById(id);
       if (!dlqItem) {
+        replayInFlight.delete(id);
         res.status(404).json({ error: 'DLQ item not found' });
         return;
       }
@@ -193,27 +249,32 @@ router.post(
       const isDuplicate = await IdempotencyLayer.isEventProcessed(dlqItem.eventId);
       if (isDuplicate) {
         incrementDlqReplay('idempotent_noop');
+        replayInFlight.delete(id);
         res.status(200).json({ status: 'ignored', reason: 'Idempotent no-op: Event already delivered' });
         return;
       }
 
       // Redact sensitive payload properties before delivery logic processing
       const safePayload = redactPayload(dlqItem.payload);
+      const context = extractRequestContext(req);
 
-      const deliverySuccess = await deliverRaw(dlqItem.targetUrl, dlqItem.eventId, safePayload);
+      const deliverySuccess = await deliverRaw(dlqItem.targetUrl, dlqItem.eventId, safePayload, context);
 
       if (deliverySuccess) {
         await dlqStore.removeEntry(id);
         await IdempotencyLayer.markEventProcessed(dlqItem.eventId);
         incrementDlqReplay('success');
+        replayInFlight.delete(id);
         res.status(200).json({ status: 'success', message: 'DLQ record replayed and processed', auditReason: reason });
       } else {
         await dlqStore.incrementReplayAttempts(id);
         incrementDlqReplay('failed');
+        replayInFlight.delete(id);
         res.status(500).json({ status: 'failed', error: 'Delivery transmission failed during retry execution' });
       }
     } catch (error) {
       incrementDlqReplay('error');
+      replayInFlight.delete(id);
       next(error);
     }
   },
@@ -246,10 +307,18 @@ router.post(
       }
 
       const summary = { successCount: 0, noOpCount: 0, failureCount: 0 };
+      const context = extractRequestContext(req);
 
       for (const id of ids as string[]) {
+        if (replayInFlight.has(id)) {
+          summary.failureCount++;
+          continue;
+        }
+        replayInFlight.add(id);
+
         const dlqItem = await dlqStore.getEntryById(id);
         if (!dlqItem) {
+          replayInFlight.delete(id);
           summary.failureCount++;
           continue;
         }
@@ -257,21 +326,24 @@ router.post(
         const isDuplicate = await IdempotencyLayer.isEventProcessed(dlqItem.eventId);
         if (isDuplicate) {
           incrementDlqReplay('idempotent_noop');
+          replayInFlight.delete(id);
           summary.noOpCount++;
           continue;
         }
 
         const safePayload = redactPayload(dlqItem.payload);
-        const deliverySuccess = await deliverRaw(dlqItem.targetUrl, dlqItem.eventId, safePayload);
+        const deliverySuccess = await deliverRaw(dlqItem.targetUrl, dlqItem.eventId, safePayload, context);
 
         if (deliverySuccess) {
           await dlqStore.removeEntry(id);
           await IdempotencyLayer.markEventProcessed(dlqItem.eventId);
           incrementDlqReplay('success');
+          replayInFlight.delete(id);
           summary.successCount++;
         } else {
           await dlqStore.incrementReplayAttempts(id);
           incrementDlqReplay('failed');
+          replayInFlight.delete(id);
           summary.failureCount++;
         }
       }

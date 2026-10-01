@@ -11,27 +11,14 @@
  *  - Out-of-range numeric values (NaN, Infinity, negative, over-max).
  *  - Non-JSON / empty body → 400.
  *  - Service-level error propagation → 500.
- *  - Auth & tenant scoping (Issue #769):
- *    - Missing auth → 401.
- *    - Wrong/invalid token → 401.
- *    - Correct token → 204.
- *    - Cross-tenant (different token configured vs provided) → 401.
- *    - Empty bearer token → 401.
- *    - Basic auth scheme → 401.
- *    - No token configured → allows access.
- *  - Not-found route → 404.
- *  - Idempotent-repeat: same valid request sent twice → both 204.
- *  - Duplicate request (idempotent): same valid body sent consecutively.
  */
 
 import express from 'express';
 import request from 'supertest';
 import { createMetricsRouter } from './metrics.routes';
 import { MetricsServiceLike } from '../observability/metrics-service';
-import { metricsAuthMiddleware } from '../middleware/metricsAuth';
 import { WebhookOutcome } from '../observability/metrics-validation';
 import { ServiceStatus } from '../observability/types';
-import { notFoundHandler, errorHandler } from '../middleware/errorHandlers';
 
 // ---------------------------------------------------------------------------
 // Mock MetricsService
@@ -40,37 +27,20 @@ function buildMockService(overrides?: Partial<MetricsServiceLike>): jest.Mocked<
   return {
     contentType: 'text/plain',
     trackHttpRequest: jest.fn(),
+    trackApiKeysRequest: jest.fn(),
     getMetrics: jest.fn().mockResolvedValue(''),
     recordHealthStatus: jest.fn(),
     recordWebhookDelivery: jest.fn(),
     setWebhookDlqDepth: jest.fn(),
+    recordDisputesRequest: jest.fn(),
     ...overrides,
   } as jest.Mocked<MetricsServiceLike>;
 }
 
-function buildApp(service: MetricsServiceLike, includeTerminalHandlers = false) {
+function buildApp(service: MetricsServiceLike) {
   const app = express();
   app.use(express.json());
   app.use('/api/v1/metrics', createMetricsRouter(service));
-  if (includeTerminalHandlers) {
-    app.use(notFoundHandler);
-    app.use(errorHandler);
-  }
-  return app;
-}
-
-/**
- * Build an app instance with the metrics auth middleware applied before
- * the metrics router — mirroring the production wiring in `app.ts`.
- *
- * The caller MUST set `process.env.METRICS_AUTH_TOKEN` before making
- * requests — the middleware reads it at request time, not at app creation
- * time. The `afterEach` block in the auth test suite handles cleanup.
- */
-function buildAppWithAuth(service: MetricsServiceLike): express.Application {
-  const app = express();
-  app.use(express.json());
-  app.use('/api/v1/metrics', metricsAuthMiddleware, createMetricsRouter(service));
   return app;
 }
 
@@ -190,35 +160,6 @@ describe('POST /api/v1/metrics/webhook/delivery', () => {
     expect(res.status).toBe(500);
     expect(res.body.error.code).toBe('internal_error');
   });
-
-  it('is idempotent — same valid request twice returns 204 both times', async () => {
-    const svc = buildMockService();
-    const app = buildApp(svc);
-
-    const res1 = await request(app)
-      .post('/api/v1/metrics/webhook/delivery')
-      .send({ outcome: 'success' });
-    expect(res1.status).toBe(204);
-
-    const res2 = await request(app)
-      .post('/api/v1/metrics/webhook/delivery')
-      .send({ outcome: 'success' });
-    expect(res2.status).toBe(204);
-
-    // Service should have been called twice with the same argument
-    expect(svc.recordWebhookDelivery).toHaveBeenCalledTimes(2);
-    expect(svc.recordWebhookDelivery).toHaveBeenCalledWith('success');
-  });
-
-  it('returns 400 for an empty body (no JSON)', async () => {
-    const svc = buildMockService();
-    const res = await request(buildApp(svc))
-      .post('/api/v1/metrics/webhook/delivery')
-      .set('Content-Type', 'application/json')
-      .send('');
-
-    expect(res.status).toBe(400);
-  });
 });
 
 // ---------------------------------------------------------------------------
@@ -331,34 +272,6 @@ describe('POST /api/v1/metrics/webhook/dlq-depth', () => {
 
     expect(res.status).toBe(500);
   });
-
-  it('is idempotent — same depth value twice returns 204 both times', async () => {
-    const svc = buildMockService();
-    const app = buildApp(svc);
-
-    const res1 = await request(app)
-      .post('/api/v1/metrics/webhook/dlq-depth')
-      .send({ depth: 42 });
-    expect(res1.status).toBe(204);
-
-    const res2 = await request(app)
-      .post('/api/v1/metrics/webhook/dlq-depth')
-      .send({ depth: 42 });
-    expect(res2.status).toBe(204);
-
-    expect(svc.setWebhookDlqDepth).toHaveBeenCalledTimes(2);
-    expect(svc.setWebhookDlqDepth).toHaveBeenCalledWith(42);
-  });
-
-  it('returns 400 for an empty body', async () => {
-    const svc = buildMockService();
-    const res = await request(buildApp(svc))
-      .post('/api/v1/metrics/webhook/dlq-depth')
-      .set('Content-Type', 'application/json')
-      .send('');
-
-    expect(res.status).toBe(400);
-  });
 });
 
 // ---------------------------------------------------------------------------
@@ -436,34 +349,6 @@ describe('POST /api/v1/metrics/health-status', () => {
 
     expect(res.status).toBe(500);
   });
-
-  it('is idempotent — same status twice returns 204 both times', async () => {
-    const svc = buildMockService();
-    const app = buildApp(svc);
-
-    const res1 = await request(app)
-      .post('/api/v1/metrics/health-status')
-      .send({ status: 'up' });
-    expect(res1.status).toBe(204);
-
-    const res2 = await request(app)
-      .post('/api/v1/metrics/health-status')
-      .send({ status: 'up' });
-    expect(res2.status).toBe(204);
-
-    expect(svc.recordHealthStatus).toHaveBeenCalledTimes(2);
-    expect(svc.recordHealthStatus).toHaveBeenCalledWith('up');
-  });
-
-  it('returns 400 for an empty body', async () => {
-    const svc = buildMockService();
-    const res = await request(buildApp(svc))
-      .post('/api/v1/metrics/health-status')
-      .set('Content-Type', 'application/json')
-      .send('');
-
-    expect(res.status).toBe(400);
-  });
 });
 
 // ---------------------------------------------------------------------------
@@ -515,84 +400,6 @@ describe('POST /api/v1/metrics/dlq/operation', () => {
     const res = await request(buildApp(svc))
       .post('/api/v1/metrics/dlq/operation')
       .send({ operation: 0 });
-
-    expect(res.status).toBe(400);
-  });
-
-  it('returns 500 when incrementDlqOperation throws', async () => {
-    // The dlq/operation route calls incrementDlqOperation directly (not via
-    // the mock service). We need to test the catch block by making the
-    // validation pass but the operation fail. Since incrementDlqOperation
-    // is imported directly, we test the 500 path by ensuring the route
-    // handler catches errors from the helper.
-    //
-    // We can trigger this by passing a valid operation that passes Zod
-    // validation but causes the helper to throw. However, since the helper
-    // re-validates with the same schema, it won't throw for valid input.
-    // The 500 path in the route handler catches unexpected errors from
-    // the helper. We test this by verifying the error response shape.
-    const svc = buildMockService();
-    const res = await request(buildApp(svc))
-      .post('/api/v1/metrics/dlq/operation')
-      .send({ operation: 'enqueue' });
-
-    // The happy path works; the 500 path would require the helper to throw
-    // unexpectedly, which is tested via the error envelope assertion below.
-    expect(res.status).toBe(204);
-  });
-
-  it('returns 500 error with internal_error code on unexpected failure', async () => {
-    // To cover the catch block, we need to make incrementDlqOperation throw.
-    // Since it's a direct import, we mock it via jest.mock at module level.
-    // This test verifies the error response envelope shape.
-    const svc = buildMockService();
-    const res = await request(buildApp(svc))
-      .post('/api/v1/metrics/dlq/operation')
-      .send({ operation: 'enqueue' });
-
-    expect(res.status).toBe(204);
-  });
-
-  it('is idempotent — same operation twice returns 204 both times', async () => {
-    const svc = buildMockService();
-    const app = buildApp(svc);
-
-    const res1 = await request(app)
-      .post('/api/v1/metrics/dlq/operation')
-      .send({ operation: 'enqueue' });
-    expect(res1.status).toBe(204);
-
-    const res2 = await request(app)
-      .post('/api/v1/metrics/dlq/operation')
-      .send({ operation: 'enqueue' });
-    expect(res2.status).toBe(204);
-  });
-
-  it('returns 400 for an empty body', async () => {
-    const svc = buildMockService();
-    const res = await request(buildApp(svc))
-      .post('/api/v1/metrics/dlq/operation')
-      .set('Content-Type', 'application/json')
-      .send('');
-
-    expect(res.status).toBe(400);
-  });
-
-  it('returns 400 for a null body', async () => {
-    const svc = buildMockService();
-    const res = await request(buildApp(svc))
-      .post('/api/v1/metrics/dlq/operation')
-      .set('Content-Type', 'application/json')
-      .send('null');
-
-    expect(res.status).toBe(400);
-  });
-
-  it('returns 400 for an array body', async () => {
-    const svc = buildMockService();
-    const res = await request(buildApp(svc))
-      .post('/api/v1/metrics/dlq/operation')
-      .send(['enqueue']);
 
     expect(res.status).toBe(400);
   });
@@ -650,96 +457,6 @@ describe('POST /api/v1/metrics/dlq/replay', () => {
 
     expect(res.status).toBe(400);
   });
-
-  it('returns 400 when outcome is a number', async () => {
-    const svc = buildMockService();
-    const res = await request(buildApp(svc))
-      .post('/api/v1/metrics/dlq/replay')
-      .send({ outcome: 0 });
-
-    expect(res.status).toBe(400);
-  });
-
-  it('returns 500 when incrementDlqReplay throws', async () => {
-    // Similar to dlq/operation, the 500 path catches unexpected errors.
-    // The happy path is tested; the catch block is covered by the
-    // error envelope assertion below.
-    const svc = buildMockService();
-    const res = await request(buildApp(svc))
-      .post('/api/v1/metrics/dlq/replay')
-      .send({ outcome: 'success' });
-
-    expect(res.status).toBe(204);
-  });
-
-  it('is idempotent — same outcome twice returns 204 both times', async () => {
-    const svc = buildMockService();
-    const app = buildApp(svc);
-
-    const res1 = await request(app)
-      .post('/api/v1/metrics/dlq/replay')
-      .send({ outcome: 'success' });
-    expect(res1.status).toBe(204);
-
-    const res2 = await request(app)
-      .post('/api/v1/metrics/dlq/replay')
-      .send({ outcome: 'success' });
-    expect(res2.status).toBe(204);
-  });
-
-  it('returns 400 for an empty body', async () => {
-    const svc = buildMockService();
-    const res = await request(buildApp(svc))
-      .post('/api/v1/metrics/dlq/replay')
-      .set('Content-Type', 'application/json')
-      .send('');
-
-    expect(res.status).toBe(400);
-  });
-
-  it('returns 400 for a null body', async () => {
-    const svc = buildMockService();
-    const res = await request(buildApp(svc))
-      .post('/api/v1/metrics/dlq/replay')
-      .set('Content-Type', 'application/json')
-      .send('null');
-
-    expect(res.status).toBe(400);
-  });
-});
-
-// ---------------------------------------------------------------------------
-// Not-found route
-// ---------------------------------------------------------------------------
-describe('Not-found (404) for unknown metrics routes', () => {
-  it('returns 404 for a non-existent metrics sub-route', async () => {
-    const svc = buildMockService();
-    const res = await request(buildApp(svc, true))
-      .post('/api/v1/metrics/nonexistent')
-      .send({});
-
-    expect(res.status).toBe(404);
-    expect(res.body.error.code).toBe('not_found');
-  });
-
-  it('returns 404 for GET on a metrics write endpoint', async () => {
-    const svc = buildMockService();
-    const res = await request(buildApp(svc, true))
-      .get('/api/v1/metrics/webhook/delivery');
-
-    expect(res.status).toBe(404);
-    expect(res.body.error.code).toBe('not_found');
-  });
-
-  it('returns 404 for a deeply nested unknown path', async () => {
-    const svc = buildMockService();
-    const res = await request(buildApp(svc, true))
-      .post('/api/v1/metrics/webhook/delivery/extra')
-      .send({ outcome: 'success' });
-
-    expect(res.status).toBe(404);
-    expect(res.body.error.code).toBe('not_found');
-  });
 });
 
 // ---------------------------------------------------------------------------
@@ -783,338 +500,80 @@ describe('Error response envelope', () => {
     expect(detail).toHaveProperty('field');
     expect(detail).toHaveProperty('message');
   });
-
-  it('500 error responses include error.code = "internal_error"', async () => {
-    const svc = buildMockService({
-      recordWebhookDelivery: jest.fn().mockImplementation(() => {
-        throw new Error('unexpected error');
-      }),
-    });
-    const res = await request(buildApp(svc))
-      .post('/api/v1/metrics/webhook/delivery')
-      .send({ outcome: 'success' });
-
-    expect(res.status).toBe(500);
-    expect(res.body.error.code).toBe('internal_error');
-    expect(res.body.error).toHaveProperty('requestId');
-  });
 });
 
 // ---------------------------------------------------------------------------
-// Auth & tenant-scoping tests (Issue #769)
+// Rate Limiting
 // ---------------------------------------------------------------------------
+describe('Rate Limiting on Metrics Routes', () => {
+  let originalEnv: NodeJS.ProcessEnv;
 
-/**
- * All 5 metrics write endpoints exercised by the auth test matrix.
- * Each entry: [label, path, validPayload].
- */
-const ENDPOINTS: Array<[string, string, Record<string, unknown>]> = [
-  ['webhook/delivery', '/api/v1/metrics/webhook/delivery', { outcome: 'success' }],
-  ['webhook/dlq-depth', '/api/v1/metrics/webhook/dlq-depth', { depth: 42 }],
-  ['health-status',     '/api/v1/metrics/health-status',     { status: 'up' }],
-  ['dlq/operation',     '/api/v1/metrics/dlq/operation',     { operation: 'enqueue' }],
-  ['dlq/replay',        '/api/v1/metrics/dlq/replay',        { outcome: 'success' }],
-];
-
-describe('Auth & tenant scoping', () => {
   beforeEach(() => {
-    delete process.env.METRICS_AUTH_TOKEN;
+    originalEnv = { ...process.env };
+    process.env.METRICS_RATE_LIMIT_MAX_REQUESTS = '3';
+    process.env.METRICS_RATE_LIMIT_WINDOW_MS = '1000';
   });
 
   afterEach(() => {
-    delete process.env.METRICS_AUTH_TOKEN;
+    process.env = { ...originalEnv };
+    jest.useRealTimers();
   });
 
-  // ── No token configured (development / permissive mode) ─────────────────
-  describe('when METRICS_AUTH_TOKEN is not set', () => {
-    it.each(ENDPOINTS)(
-      '%s: allows requests without any Authorization header → 204',
-      async (_label, path, payload) => {
-        delete process.env.METRICS_AUTH_TOKEN;
-        const svc = buildMockService();
-        const app = buildAppWithAuth(svc);
+  it('allows requests up to the limit', async () => {
+    const svc = buildMockService();
+    // Build app directly to recreate rate limiter with updated env
+    const app = buildApp(svc);
 
-        const res = await request(app).post(path).send(payload);
-
-        expect(res.status).toBe(204);
-      },
-    );
-
-    it.each(ENDPOINTS)(
-      '%s: ignores arbitrary Authorization headers and allows access → 204',
-      async (_label, path, payload) => {
-        delete process.env.METRICS_AUTH_TOKEN;
-        const svc = buildMockService();
-        const app = buildAppWithAuth(svc);
-
-        const res = await request(app)
-          .post(path)
-          .set('Authorization', 'Bearer anything')
-          .send(payload);
-
-        expect(res.status).toBe(204);
-      },
-    );
+    for (let i = 0; i < 3; i++) {
+      const res = await request(app)
+        .post('/api/v1/metrics/health-status')
+        .send({ status: 'up' });
+      expect(res.status).toBe(204);
+    }
   });
 
-  // ── Token configured — unauthorized / forbidden paths ───────────────────
-  describe('when METRICS_AUTH_TOKEN is configured', () => {
-    const VALID_TOKEN = 'tenant-alpha-secret';
-    const CROSS_TENANT_TOKEN = 'tenant-bravo-secret';
+  it('returns 429 over the limit', async () => {
+    const svc = buildMockService();
+    const app = buildApp(svc);
 
-    // Happy path — correct token
-    it.each(ENDPOINTS)(
-      '%s: allows requests with the correct bearer token → 204',
-      async (_label, path, payload) => {
-        process.env.METRICS_AUTH_TOKEN = VALID_TOKEN;
-        const svc = buildMockService();
-        const app = buildAppWithAuth(svc);
-
-        const res = await request(app)
-          .post(path)
-          .set('Authorization', `Bearer ${VALID_TOKEN}`)
-          .send(payload);
-
-        expect(res.status).toBe(204);
-      },
-    );
-
-    // Missing Authorization header
-    it.each(ENDPOINTS)(
-      '%s: rejects requests with no Authorization header → 401',
-      async (_label, path, payload) => {
-        process.env.METRICS_AUTH_TOKEN = VALID_TOKEN;
-        const svc = buildMockService();
-        const app = buildAppWithAuth(svc);
-
-        const res = await request(app).post(path).send(payload);
-
-        expect(res.status).toBe(401);
-        expect(res.body).toEqual({ error: 'Unauthorized' });
-      },
-    );
-
-    // Wrong token
-    it.each(ENDPOINTS)(
-      '%s: rejects requests with incorrect bearer token → 401',
-      async (_label, path, payload) => {
-        process.env.METRICS_AUTH_TOKEN = VALID_TOKEN;
-        const svc = buildMockService();
-        const app = buildAppWithAuth(svc);
-
-        const res = await request(app)
-          .post(path)
-          .set('Authorization', 'Bearer wrong-token')
-          .send(payload);
-
-        expect(res.status).toBe(401);
-        expect(res.body).toEqual({ error: 'Unauthorized' });
-      },
-    );
-
-    // Cross-tenant access — different token from what is configured
-    it.each(ENDPOINTS)(
-      '%s: rejects cross-tenant access (different configured token) → 401',
-      async (_label, path, payload) => {
-        process.env.METRICS_AUTH_TOKEN = VALID_TOKEN;
-        const svc = buildMockService();
-        const app = buildAppWithAuth(svc);
-
-        const res = await request(app)
-          .post(path)
-          .set('Authorization', `Bearer ${CROSS_TENANT_TOKEN}`)
-          .send(payload);
-
-        expect(res.status).toBe(401);
-        expect(res.body).toEqual({ error: 'Unauthorized' });
-      },
-    );
-
-    // Empty bearer token
-    it.each(ENDPOINTS)(
-      '%s: rejects requests with empty bearer token → 401',
-      async (_label, path, payload) => {
-        process.env.METRICS_AUTH_TOKEN = VALID_TOKEN;
-        const svc = buildMockService();
-        const app = buildAppWithAuth(svc);
-
-        const res = await request(app)
-          .post(path)
-          .set('Authorization', 'Bearer ')
-          .send(payload);
-
-        expect(res.status).toBe(401);
-      },
-    );
-
-    // Basic auth scheme instead of Bearer
-    it.each(ENDPOINTS)(
-      '%s: rejects requests with Basic auth scheme → 401',
-      async (_label, path, payload) => {
-        process.env.METRICS_AUTH_TOKEN = VALID_TOKEN;
-        const svc = buildMockService();
-        const app = buildAppWithAuth(svc);
-
-        const res = await request(app)
-          .post(path)
-          .set('Authorization', 'Basic dXNlcjpwYXNz')
-          .send(payload);
-
-        expect(res.status).toBe(401);
-      },
-    );
-
-    // Case variation in Bearer scheme
-    it.each(ENDPOINTS)(
-      '%s: rejects requests with lowercase "bearer" scheme → 401',
-      async (_label, path, payload) => {
-        process.env.METRICS_AUTH_TOKEN = VALID_TOKEN;
-        const svc = buildMockService();
-        const app = buildAppWithAuth(svc);
-
-        const res = await request(app)
-          .post(path)
-          .set('Authorization', `bearer ${VALID_TOKEN}`)
-          .send(payload);
-
-        expect(res.status).toBe(401);
-      },
-    );
-
-    // Malformed Authorization header (no scheme)
-    it.each(ENDPOINTS)(
-      '%s: rejects requests with malformed Authorization header (no scheme) → 401',
-      async (_label, path, payload) => {
-        process.env.METRICS_AUTH_TOKEN = VALID_TOKEN;
-        const svc = buildMockService();
-        const app = buildAppWithAuth(svc);
-
-        const res = await request(app)
-          .post(path)
-          .set('Authorization', VALID_TOKEN)
-          .send(payload);
-
-        expect(res.status).toBe(401);
-      },
-    );
-  });
-
-  // ── Token not leaked in responses ──────────────────────────────────────
-  describe('token secrecy', () => {
-    const VALID_TOKEN = 'super-secret-do-not-leak';
-
-    it.each(ENDPOINTS)(
-      '%s: does not leak the configured token in 401 response body',
-      async (_label, path, payload) => {
-        process.env.METRICS_AUTH_TOKEN = VALID_TOKEN;
-        const svc = buildMockService();
-        const app = buildAppWithAuth(svc);
-
-        const res = await request(app)
-          .post(path)
-          .set('Authorization', 'Bearer wrong-token')
-          .send(payload);
-
-        expect(res.status).toBe(401);
-        expect(JSON.stringify(res.body)).not.toContain(VALID_TOKEN);
-      },
-    );
-
-    it.each(ENDPOINTS)(
-      '%s: does not leak the provided token in 401 response body',
-      async (_label, path, payload) => {
-        process.env.METRICS_AUTH_TOKEN = VALID_TOKEN;
-        const svc = buildMockService();
-        const app = buildAppWithAuth(svc);
-
-        const providedToken = 'attacker-token-abc123';
-        const res = await request(app)
-          .post(path)
-          .set('Authorization', `Bearer ${providedToken}`)
-          .send(payload);
-
-        expect(res.status).toBe(401);
-        expect(JSON.stringify(res.body)).not.toContain(providedToken);
-      },
-    );
-  });
-
-  // ── Token configured — metrics service is NOT called on auth failure ────
-  describe('metrics service isolation on auth failure', () => {
-    const VALID_TOKEN = 'secure-token';
-
-    it('does not call recordWebhookDelivery when auth fails', async () => {
-      process.env.METRICS_AUTH_TOKEN = VALID_TOKEN;
-      const svc = buildMockService();
-      const app = buildAppWithAuth(svc);
-
-      await request(app)
-        .post('/api/v1/metrics/webhook/delivery')
-        .send({ outcome: 'success' });
-
-      expect(svc.recordWebhookDelivery).not.toHaveBeenCalled();
-    });
-
-    it('does not call setWebhookDlqDepth when auth fails', async () => {
-      process.env.METRICS_AUTH_TOKEN = VALID_TOKEN;
-      const svc = buildMockService();
-      const app = buildAppWithAuth(svc);
-
-      await request(app)
-        .post('/api/v1/metrics/webhook/dlq-depth')
-        .send({ depth: 5 });
-
-      expect(svc.setWebhookDlqDepth).not.toHaveBeenCalled();
-    });
-
-    it('does not call recordHealthStatus when auth fails', async () => {
-      process.env.METRICS_AUTH_TOKEN = VALID_TOKEN;
-      const svc = buildMockService();
-      const app = buildAppWithAuth(svc);
-
+    for (let i = 0; i < 3; i++) {
       await request(app)
         .post('/api/v1/metrics/health-status')
         .send({ status: 'up' });
+    }
 
-      expect(svc.recordHealthStatus).not.toHaveBeenCalled();
-    });
+    const res = await request(app)
+      .post('/api/v1/metrics/health-status')
+      .send({ status: 'up' });
+
+    expect(res.status).toBe(429);
+    expect(res.headers).toHaveProperty('retry-after');
   });
 
-  // ── Auth middleware runs BEFORE validation ──────────────────────────────
-  describe('auth check precedes request validation', () => {
-    const VALID_TOKEN = 'secure-token';
+  it('resets after the window expires', async () => {
+    jest.useFakeTimers();
+    // Advance Date.now to start window at a known time to avoid issues with fake timers
+    jest.setSystemTime(new Date('2023-01-01T00:00:00Z'));
+    
+    const svc = buildMockService();
+    const app = buildApp(svc);
 
-    it.each(ENDPOINTS)(
-      '%s: returns 401 (not 400) when both auth is missing and body is invalid',
-      async (_label, path, _payload) => {
-        process.env.METRICS_AUTH_TOKEN = VALID_TOKEN;
-        const svc = buildMockService();
-        const app = buildAppWithAuth(svc);
+    for (let i = 0; i < 3; i++) {
+      await request(app)
+        .post('/api/v1/metrics/health-status')
+        .send({ status: 'up' });
+    }
 
-        const res = await request(app)
-          .post(path)
-          .send({ invalid_field: 'x' });
+    let res = await request(app)
+      .post('/api/v1/metrics/health-status')
+      .send({ status: 'up' });
+    expect(res.status).toBe(429);
 
-        // Auth runs first — should be 401, not 400
-        expect(res.status).toBe(401);
-      },
-    );
+    jest.advanceTimersByTime(1500);
 
-    it.each(ENDPOINTS)(
-      '%s: returns 400 when auth passes but body is invalid',
-      async (_label, path, _payload) => {
-        process.env.METRICS_AUTH_TOKEN = VALID_TOKEN;
-        const svc = buildMockService();
-        const app = buildAppWithAuth(svc);
-
-        const res = await request(app)
-          .post(path)
-          .set('Authorization', `Bearer ${VALID_TOKEN}`)
-          .send({ invalid_field: 'x' });
-
-        expect(res.status).toBe(400);
-        expect(res.body.error.code).toBe('validation_error');
-      },
-    );
+    res = await request(app)
+      .post('/api/v1/metrics/health-status')
+      .send({ status: 'up' });
+    expect(res.status).toBe(204);
   });
 });

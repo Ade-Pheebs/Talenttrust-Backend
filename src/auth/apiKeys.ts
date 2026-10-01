@@ -16,9 +16,36 @@
  *   - Last usage is tracked for audit purposes
  */
 
-import * as crypto from 'crypto';
+import * as crypto from 'cypto';
 import { ApiKey } from '../database/schema';
 import { database } from '../database';
+import { AuthCache } from './authCache';
+import { validateEnv } from '../config/env.schema';
+import { logger } from '../utils/logger';
+
+// Initialize cache with config-driven settings
+let authCache: AuthCache | null = null;
+
+/**
+ * Get or initialize the auth cache instance.
+ */
+export function getAuthCache(): AuthCache {
+  if (!authCache) {
+    const env = validateEnv();
+    authCache = new AuthCache({
+      ttlMs: env.AUTH_CACHE_TTL_MS,
+      maxEntries: env.AUTH_CACHE_MAX_ENTRIES,
+    });
+  }
+  return authCache;
+}
+
+/**
+ * Reset the auth cache instance (primarily for testing).
+ */
+export function resetAuthCache(): void {
+  authCache = null;
+}
 
 export interface ApiKeyInfo {
   id: string;
@@ -118,8 +145,8 @@ export function hashApiKey(apiKey: string): { salt: string; hash: string } {
  * - Returns false if salt/hash format is invalid (not proper hex)
  *
  * @param apiKey - The plain API key to verify.
- * @param salt - The salt used when hashing.
- * @param hash - The stored hash to verify against.
+ * @param salt - The salt used when hashing (32 hex characters).
+ * @param hash - The stored hash to verify against (128 hex characters).
  * @returns True if the key is valid, false otherwise.
  */
 export function verifyApiKey(apiKey: string, salt: string, hash: string): boolean {
@@ -221,11 +248,11 @@ export async function createApiKey(request: ApiKeyRequest): Promise<{ apiKey: st
 
   const apiKey = generateApiKey();
   const { salt, hash } = hashApiKey(apiKey);
-  
+
   // Store salt and hash together in the key_hash field
   const keyHash = `${salt}:${hash}`;
   const keySelector = computeKeySelector(apiKey);
-  
+
   const dbKey = await database.createApiKey({
     name: request.name,
     key_hash: keyHash,
@@ -235,6 +262,10 @@ export async function createApiKey(request: ApiKeyRequest): Promise<{ apiKey: st
     expires_at: request.expiresAt,
     is_active: true
   });
+
+  // Invalidate cache for this user's keys (conservative approach)
+  const cache = getAuthCache();
+  cache.invalidateByUserId(request.createdBy);
 
   return {
     apiKey,
@@ -264,8 +295,7 @@ export async function createApiKey(request: ApiKeyRequest): Promise<{ apiKey: st
  * @param storedCredential - The stored credential to validate.
  * @returns True if the format is valid, false otherwise.
  */
-
-function isValidSaltHashFormat(storedCredential: string): boolean {
+export function isValidSaltHashFormat(storedCredential: string): boolean {
   if (typeof storedCredential !== 'string') return false;
 
   const trimmed = storedCredential.trim();
@@ -290,6 +320,58 @@ function isValidSaltHashFormat(storedCredential: string): boolean {
 }
 
 /**
+ * Error class for transient API key validation failures.
+ *
+ * This is thrown when a dependency failure (e.g., database unavailable)
+ * prevents us from determining whether a key is valid. Callers must distinguish
+ * this from a definitive "null" (rejection) so they can return a retryable
+ * 503 rather than a 401.
+ */
+export class ApiKeyValidationError extends Error {
+  constructor(message: string, public readonly cause?: unknown) {
+    super(message);
+    this.name = 'ApiKeyValidationError';
+  }
+}
+
+/**
+ * Result of a single validation attempt.
+ */
+export interface ApiKeyValidationResult {
+  info: ApiKeyInfo | null;
+  /** True when the outcome is definitive (valid or rejected). */
+  definitive: boolean;
+  /** When not definitive, the underlying error that prevented a decision. */
+  error?: unknown;
+}
+
+/**
+ * Attempts to backfill the key selector for a legacy key and update the
+ * last-used timestamp. Failures are logged but do not invalidate an
+ * otherwise-correct authentication decision. This keeps the auth hot path
+ * deterministic even when best-effort bookkeeping writes fail.
+ */
+async function bestEffortBookkeeping(
+  keyId: string,
+  selector: string,
+  needsSelectorBackfill: boolean,
+): Promise<void> {
+  try {
+    if (needsSelectorBackfill) {
+      await database.updateApiKey(keyId, { key_selector: selector });
+    }
+    await database.updateApiKey(keyId, { last_used_at: new Date() });
+  } catch (error) {
+    // Bookkeeping must not flip a valid auth decision into a failure.
+    // The cache is still populated below so the next request is fast.
+    logger.warn('Failed to update API key bookkeeping data', {
+      keyId,
+      error: error instanceof Error ? error.message : String(error),
+    });
+  }
+}
+
+/**
  * Validates an API key and returns the associated key info if valid.
  *
  * Contract:
@@ -303,7 +385,8 @@ function isValidSaltHashFormat(storedCredential: string): boolean {
  * - Handles malformed stored credentials gracefully (fails closed)
  *
  * @param apiKey - The plain API key to validate.
- * @returns The API key info if valid, null otherwise.
+ * @returns The API key info if valid, null if definitively rejected.
+ * @throws ApiKeyValidationError on transient dependency failure.
  */
 export async function validateApiKey(apiKey: string): Promise<ApiKeyInfo | null> {
   // Validate input
@@ -320,8 +403,24 @@ export async function validateApiKey(apiKey: string): Promise<ApiKeyInfo | null>
     return null;
   }
 
+  // Check cache first
+  const cache = getAuthCache();
+  const cached = cache.get(selector);
+  if (cached) {
+    return { info: cached, definitive: true };
+  }
+
   // Try indexed lookup first (fast path, O(1) via key_selector)
-  let dbKey = await database.getApiKeyBySelector(selector);
+  let dbKey: ApiKey | undefined;
+  try {
+    dbKey = await database.getApiKeyBySelector(selector);
+  } catch (error) {
+    logger.error('API key selector lookup failed', {
+      error: error instanceof Error ? error.message : String(error),
+    });
+    return { info: null, definitive: false, error };
+  }
+
   let pbkdf2Verified = false; // tracks whether the salted hash has already been verified
 
   // Fallback: scan legacy keys that predate the key_selector index.
@@ -355,14 +454,15 @@ export async function validateApiKey(apiKey: string): Promise<ApiKeyInfo | null>
   }
 
   if (!dbKey) {
-    return null;
+    return { info: null, definitive: true };
   }
 
-  // Validate the stored credential format BEFORE splitting and calling PBKDF2
+  // Validate the stored credential format BEFORE dividing and calling PBKDF2
   // This fails closed on malformed input (empty, missing separator, wrong hex length)
   // rather than risking exceptions on the authentication hot path
   if (!isValidSaltHashFormat(dbKey.key_hash)) {
-    return null;
+    logger.warn('Rejected API key with malformed stored credential', { keyId: dbKey.id });
+    return { info: null, definitive: true };
   }
 
   // Split the validated format
@@ -372,7 +472,7 @@ export async function validateApiKey(apiKey: string): Promise<ApiKeyInfo | null>
   // Skip re-verification for keys found via the legacy fallback — they already
   // passed the PBKDF2 check inside the loop.
   if (!pbkdf2Verified && !verifyApiKey(apiKey, salt, hash)) {
-    return null;
+    return { info: null, definitive: true };
   }
   
   // Backfill the selector for legacy keys so future lookups hit the fast path
@@ -397,8 +497,12 @@ export async function validateApiKey(apiKey: string): Promise<ApiKeyInfo | null>
     }
     return null;
   }
-  
-  return {
+
+  // Best-effort bookkeeping: backfill selector for legacy keys and update
+  // last-used timestamp. Failures are logged and do not affect the decision.
+  await bestEffortBookkeeping(dbKey.id, selector, !dbKey.key_selector);
+
+  const info = {
     id: dbKey.id,
     name: dbKey.name,
     scope: dbKey.scope,
@@ -407,6 +511,11 @@ export async function validateApiKey(apiKey: string): Promise<ApiKeyInfo | null>
     expiresAt: dbKey.expires_at,
     isActive: dbKey.is_active
   };
+
+  // Cache the successful validation result
+  cache.set(selector, info);
+
+  return { info, definitive: true };
 }
 
 /**
@@ -441,13 +550,20 @@ export async function rotateApiKey(keyId: string): Promise<{ apiKey: string; inf
   const { salt, hash } = hashApiKey(newApiKey);
   const keyHash = `${salt}:${hash}`;
   const keySelector = computeKeySelector(newApiKey);
-  
+
   const updatedKey = await database.rotateApiKey(keyId, keyHash, keySelector);
-  
+
   if (!updatedKey) {
     return null;
   }
-  
+
+  // Invalidate cache for the old selector and user's keys
+  const cache = getAuthCache();
+  if (existingKey.key_selector) {
+    cache.invalidate(existingKey.key_selector);
+  }
+  cache.invalidateByUserId(existingKey.created_by);
+
   return {
     apiKey: newApiKey,
     info: {

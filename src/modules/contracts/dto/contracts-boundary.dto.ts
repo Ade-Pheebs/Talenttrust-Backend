@@ -1,8 +1,9 @@
-import type { Contract, ContractStatus } from '../../../db/types';
-import type {
-  CreateContractDto,
-  UpdateContractDto,
-} from './contract.dto';
+import type { Contract, ContractStatus } from "../../../db/types";
+import type { CreateContractDto, UpdateContractDto } from "./contract.dto";
+import {
+  assertResponseSchema,
+  contractResponseSchema,
+} from "./contract-response.dto";
 
 export interface ContractMilestoneDto {
   title: string;
@@ -46,6 +47,7 @@ export interface ContractResponseDto {
   status: ContractStatus;
   createdAt: string;
   version: number;
+  deletedAt?: string | null;
 }
 
 /**
@@ -99,18 +101,37 @@ export function toUpdateContractDto(
   };
 }
 
-/** Maps a persistence model into the stable public contract representation. */
+/**
+ * Maps a persistence model into the stable public contract representation.
+ *
+ * The mapped payload is validated against `contractResponseSchema` before
+ * being returned, so a persistence-layer bug that drifts the domain shape
+ * away from the public contract fails as a structured `response_contract_error`
+ * (500) instead of silently changing the API's outgoing shape.
+ */
 export function toContractResponseDto(contract: Contract): ContractResponseDto {
-  return {
-    id: contract.id,
-    title: contract.title,
-    clientId: contract.clientId,
-    freelancerId: contract.freelancerId,
-    amount: contract.amount,
-    status: contract.status,
-    createdAt: contract.createdAt,
-    version: contract.version,
-  };
+  const createdAtStr =
+    contract.createdAt instanceof Date
+      ? contract.createdAt.toISOString()
+      : typeof contract.createdAt === "string"
+        ? contract.createdAt
+        : new Date(contract.createdAt ?? Date.now()).toISOString();
+
+  return assertResponseSchema<ContractResponseDto>(
+    contractResponseSchema,
+    {
+      id: contract.id,
+      title: contract.title,
+      clientId: contract.clientId,
+      freelancerId: contract.freelancerId,
+      amount: contract.amount,
+      status: contract.status,
+      createdAt: createdAtStr,
+      version: contract.version,
+      deletedAt: contract.deletedAt ?? null,
+    },
+    "Contract",
+  );
 }
 
 /**
@@ -127,5 +148,27 @@ export function fromContractResponseDto(dto: ContractResponseDto): Contract {
     status: dto.status,
     createdAt: dto.createdAt,
     version: dto.version,
+    deletedAt: dto.deletedAt ?? null,
+  };
+}
+
+// ─── Bulk milestones types ────────────────────────────────────────────────────
+
+export interface BulkMilestoneOperationResult {
+  index: number;
+  status: "success" | "error";
+  contractId?: string;
+  error?: {
+    code: string;
+    message: string;
+  };
+}
+
+export interface BulkMilestonesResponseDto {
+  results: BulkMilestoneOperationResult[];
+  summary: {
+    total: number;
+    succeeded: number;
+    failed: number;
   };
 }

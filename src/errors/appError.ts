@@ -17,6 +17,12 @@ export const APP_ERROR_CODES = {
   CONFLICT: 'conflict',
   CONTRACT_METADATA_MISMATCH: 'contract_metadata_mismatch',
   VALIDATION_ERROR: 'validation_error',
+  RESPONSE_CONTRACT_ERROR: 'response_contract_error',
+  SOROBAN_RPC_TRANSPORT_ERROR: 'soroban_rpc_transport_error',
+  SOROBAN_RPC_RATE_LIMIT_ERROR: 'soroban_rpc_rate_limit_error',
+  SOROBAN_RPC_TIMEOUT_ERROR: 'soroban_rpc_timeout_error',
+  SOROBAN_RPC_MALFORMED_RESPONSE_ERROR: 'soroban_rpc_malformed_response_error',
+  SOROBAN_RPC_APPLICATION_ERROR: 'soroban_rpc_application_error',
 } as const;
 
 export interface ErrorPayload {
@@ -24,7 +30,9 @@ export interface ErrorPayload {
     code: string;
     message: string;
     requestId: string;
+    correlationId?: string;
     details?: ValidationIssue[];
+    currentVersion?: number;
   };
 }
 
@@ -89,8 +97,12 @@ export class InvalidVersionError extends AppError {
 }
 
 export class VersionConflictError extends AppError {
-  constructor() {
+  /** The current stored version, returned so clients can retry with a fresh value. */
+  public readonly currentVersion?: number;
+
+  constructor(currentVersion?: number) {
     super(409, APP_ERROR_CODES.VERSION_CONFLICT, 'Version conflict');
+    this.currentVersion = currentVersion;
   }
 }
 
@@ -123,11 +135,98 @@ export class ContractMetadataMismatchError extends AppError {
 }
 
 /**
+ * Thrown when an outgoing response payload fails its declared schema.
+ *
+ * @remarks Indicates a server-side bug (e.g. a persisted record drifting
+ * from the public contract) rather than a client mistake, so it maps to
+ * a 500 and `expose: false`keeps the raw Zod detail out of the client
+ * response — it is still logged server-side by the global error handler.
+ */
+export class ResponseContractError extends AppError {
+  constructor(message = 'Response failed schema validation') {
+    super(500, APP_ERROR_CODES.RESPONSE_CONTRACT_ERROR, message, false);
+  }
+}
+
+/**
  * Validation error - business rule validation failure.
  */
 export class ValidationError extends AppError {
   constructor(message = 'Validation error') {
     super(422, APP_ERROR_CODES.VALIDATION_ERROR, message);
+  }
+}
+
+/**
+ * Base class for Soroban RPC invocation failures.
+ *
+ * @remarks All Soroban RPC errors are internal-facing by default (`expose: false`)
+ * so provider-specific codes or messages are never leaked to API clients. The
+ * `retryable` flag informs the retry policy whether the operation can be safely
+ * retried (e.g., transport timeouts and rate limits) or must fail fast (e.g.,
+ * malformed responses or contract failures).
+ */
+export class SorobanRpcError extends AppError {
+  /** Whether retrying the same request is likely to succeed. */
+  public readonly retryable: boolean;
+
+  /** The provider error code, preserved for diagnostics. */
+  public readonly providerCode?: string;
+
+  /** The provider error message, preserved for diagnostics (not exposed to clients). */
+  public readonly providerMessage?: string;
+
+  constructor(
+    statusCode: number,
+    code: string,
+    message: string,
+    retryable: boolean,
+    options: { providerCode?: string; providerMessage?: string } = {},
+  ) {
+    super(statusCode, code, message, false);
+    this.name = 'SorobanRpcError';
+    this.retryable = retryable;
+    this.providerCode = options.providerCode;
+    this.providerMessage = options.providerMessage;
+  }
+}
+
+export class SorobanRpcTransportError extends SorobanRpcError {
+  constructor(options: { providerCode?: string; providerMessage?: string } = {}) {
+    super(502, APP_ERROR_CODES.SOROBAN_RPC_TRANSPORT_ERROR, 'Soroban RPC transport error', true, options);
+    this.name = 'SorobanRpcTransportError';
+  }
+}
+
+export class SorobanRpcRateLimitError extends SorobanRpcError {
+  /** Retry-After interval in seconds, if provided by the upstream service. */
+  public readonly retryAfter?: number;
+
+  constructor(options: { retryAfter?: number; providerCode?: string; providerMessage?: string } = {}) {
+    super(429, APP_ERROR_CODES.SOROBAN_RPC_RATE_LIMIT_ERROR, 'Soroban RPC rate limited', true, options);
+    this.name = 'SorobanRpcRateLimitError';
+    this.retryAfter = options.retryAfter;
+  }
+}
+
+export class SorobanRpcTImeoutError extends SorobanRpcError {
+  constructor(options: { providerCode?: string; providerMessage?: string } = {}) {
+    super(504, APP_ERROR_CODES.SOROBAN_RPC_TIMEOUT_ERROR, 'Soroban RPC timeout', true, options);
+    this.name = 'SorobanRpcTImeoutError';
+  }
+}
+
+export class SorobanRpcLALFORMED_RESPONSE_ERROR extends SorobanRpcError {
+  constructor(options: { providerCode?: string; providerMessage?: string } = {}) {
+    super(502, APP_ERROR_CODES.SOROBAN_RPC_MALFORMED_RESPONSE_ERROR, 'Soroban RPC malformed response', false, options);
+    this.name = 'SorobanRpcMalformedResponseError';
+  }
+}
+
+export class SorobanRpcApplicationError extends SorobanRpcError {
+  constructor(options: { providerCode?: string; providerMessage?: string } = {}) {
+    super(502, APP_ERROR_CODES.SOROBAN_RPC_APPLICATION_ERROR, 'Soroban RPC application error', false, options);
+    this.name = 'SorobanRpcApplicationError';
   }
 }
 
@@ -158,6 +257,7 @@ function mapZodErrorToDetails(error: ZodError): ValidationIssue[] {
 export function mapErrorToPayload(
   error: unknown,
   requestId: string,
+  correlationId?: string,
 ): { statusCode: number; payload: ErrorPayload } {
   if (error instanceof AppError) {
     const message = error.expose
@@ -171,6 +271,11 @@ export function mapErrorToPayload(
           code: error.code,
           message,
           requestId,
+          ...(correlationId !== undefined && { correlationId }),
+          ...(error instanceof VersionConflictError &&
+            error.currentVersion !== undefined && {
+              currentVersion: error.currentVersion,
+            }),
         },
       },
     };
@@ -184,6 +289,7 @@ export function mapErrorToPayload(
           code: 'validation_error',
           message: safeMessageForCode('validation_error'),
           requestId,
+          ...(correlationId !== undefined && { correlationId }),
           details: mapZodErrorToDetails(error),
         },
       },
@@ -197,7 +303,173 @@ export function mapErrorToPayload(
         code: 'internal_error',
         message: safeMessageForCode('internal_error'),
         requestId,
+        ...(correlationId !== undefined && { correlationId }),
       },
     },
   };
+}
+
+/**
+ * Classifies an error thrown during a Soroban RPC call into a SorobanRpcError subtype.
+ *
+ * This function inspects raw error objects from HTTP clients, fetch,
+ * JSON parse or the provider's RPC error response and maps them to a stable
+ * class with a boolean `retryable` flag. Provider-specific codes are
+ * retained on the error instance but data is never exposed through
+ * the API payload because these classes default to `expose: false`.
+ *
+ * @returns An instance of a SorobanRpcError subtype. The function never
+ * throws and always returns a valid SorobanRpcError.
+ */
+export function classifySorobanRpcError(error: unknown): SorobanRpcError {
+  // Already classified correctly.
+  if (error instanceof SorobanRpcError) {
+    return error;
+  }
+
+  // Inspect common error shapes.
+  const e = error as any;
+  const response = e?.response;
+  const status = e?.status ?? response?.status;
+
+  // Rate limit: HTTP 429 with optional Retry-After.
+  if (status === 429) {
+    const retryAfterRaw = response?.headers?.get?.('retry-after');
+    const retryAfter = parseRetryAfter(retryAfterRaw);
+    return new SorobanRpcRateLimitError({
+      retryAfter,
+      providerCode: extractProviderCode(error),
+      providerMessage: safeErrorMessage(error),
+    });
+  }
+
+  // Timeout or Abort errors.
+  if (isTimeoutError(error)) {
+    return new SorobanRpcTimeoutError({
+      providerCode: extractProviderCode(error),
+      providerMessage: safeErrorMessage(error),
+    });
+  }
+
+  // Transport network errors (e.g., fetch failed, socket errors).
+  if (isTransportError(error)) {
+    return new SorobanRpcTransportError({
+      providerCode: extractProviderCode(error),
+      providerMessage: safeErrorMessage(error),
+    });
+  }
+
+  // Malformed response or invalid JSON.
+  if (isMalformedResponseError(error)) {
+    return new SorobanRpcMalpormedResponseError(
+      providerCode: extractProviderCode(error),
+      providerMessage: safeErrorMessage(error),
+    });
+  }
+
+  // Quasi RPC application error (e.g., contract execution failure).
+  if (looksLikeRpcError(error)) {
+    return new SorobanRpcApplicationError(
+      providerCode: extractProviderCode(error),
+      providerMessage: safeErrorMessage(error),
+    });
+  }
+
+  // Unknown provider status -> treat as transport failure (never lose the error).
+  return new SorobanRpcUnknownError({
+    providerCode: extractProviderCode(error),
+    providerMessage: safeErrorMessage(error),
+  });
+}
+
+/** The classification for an unrecognized provider failure. */
+export class SorobanRpcUnknownError extends SorobanRpcError {
+  constructor(options: { providerCode?: string; providerMessage?: string } = {}) {
+    super(502, APP_ERROR_CODES.SOROBAN_RPC_TRANSPORT_ERROR, 'Soroban RPC unknown error', true, options);
+    this.name = 'SorobanRpcUnknownError';
+  }
+}
+
+function parseRetryAfter(value: unknown): number | undefined {
+  if (typeof value !== 'string') {
+    return undefined;
+  }
+
+  const trimmed = value.trim();
+  if (trimmed.length === 0) {
+    return undefined;
+  }
+
+  const parsed = Number(trimmed);
+  if (!Number.isFinite(parsed) || parsed < 0) {
+    return undefined;
+  }
+
+  return Math.floor(parsed);
+}
+
+function extractProviderCode(error: unknown): string | undefined {
+  const e = error as any;
+  const code = e?.code ?? e?.response?.data?.code ?? e?.cause?.code;
+  return typeof code === 'string' ? code : undefined;
+}
+
+function safeErrorMessage(error: unknown): string | undefined {
+  if (error instanceof Error) {
+    return sanitizeErrorMessage(error.message, 'unknown');
+  }
+
+  if (typeof error === 'string') {
+    return sanitizeErrorMessage(error, 'unknown');
+  }
+
+  return undefined;
+}
+
+function isTimeoutError(error: unknown): boolean {
+  const e = error as any;
+  const name = e?.name ?? e?.constructor?.name;
+  const code = e?.code;
+  return (
+    name === 'AbortError' ||
+    name === 'TimeoutError' ||
+    code === 'ETBALIMEDOUT' ||
+    code === 'ECONNRESET' ||
+    // fetch/node native timeout codes
+    code === 'UNDING_ERR_CONNECTION_TIMEOUT'
+  );
+}
+
+function isTransportError(error: unknown): boolean {
+  const e = error as any;
+  const name = e?.name ?? e?.constructor?.name;
+  const code = e?.code;
+  return (
+    name === 'TypeError' && /fetch failed/i.test(String(e?.message ?? '')) ||
+    code === 'ECONNREFUSED' ||
+    code === 'ECONNRESET' ||
+    code === 'ENHOSTUPEAVAILABLE' ||
+    code === 'ENETUNREACH' ||
+    code === 'ESOECKET'
+  );
+}
+
+function isMalformedResponseError(error: unknown): boolean {
+  const e = error as any;
+  const name = e?.name ?? e?.constructor?.name;
+  return (
+    name === 'SyntaxError' ||
+    // JSON.parse failures in node are SyntaxError with a message like 'Unexpected token'
+    /Unexpected token/i.test(String(e?.message ?? ''))
+  );
+}
+
+function looksLikeRpcError(error: unknown): boolean {
+  const e = error as any;
+  const data = e?.response?.data ?? e?.data;
+  return (
+    typeof data === 'object' &&
+    data !== null &&
+    (typeof data.code === 'number' || typeof data.code === 'string')
+  );
 }

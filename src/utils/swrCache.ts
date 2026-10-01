@@ -153,6 +153,19 @@ export class SWRCache {
   }
 
   /**
+   * Remove a single entry from the cache by key.
+   * Active fetches for this key are NOT cancelled — they still complete and
+   * the result is stored back via `setEntry` unless eviction pressure removes
+   * it before resolution.
+   *
+   * @param key - The cache key to remove.
+   * @returns `true` if the entry existed and was removed, `false` otherwise.
+   */
+  public delete(key: string): boolean {
+    return this.cache.delete(key);
+  }
+
+  /**
    * Retrieve data from cache or upstream fetcher using SWR strategy.
    *
    * The SWR strategy follows these rules:

@@ -285,7 +285,7 @@ histogram_quantile(0.99, rate(webhook_delivery_latency_seconds_bucket[5m]))
 ## Security Notes
 
 - **SSRF Protection**: All subscription URLs are validated by `isSafeUrl()` in `src/utils/ssrf.ts`. Private/internal addresses are blocked by default. In production, `SSRF_ALLOW_PRIVATE_HOSTS` is ignored — private hosts are always blocked. In non-production, set `SSRF_ALLOW_PRIVATE_HOSTS=true` to allow private hosts for development.
-- **Secret Handling**: The webhook `secret` (signing key for outbound payloads) is never returned in API responses. It is stored in the database but redacted by `sanitizeSubscription()` in `src/routes/webhook-subscription.routes.ts`. The DLQ view (`WebhookDLQView`) also strips `webhookSecret`.
+- **Secret Handling**: The webhook `secret` (signing key for outbound payloads) is never returned in API responses. It is stored in the database but redacted by `toWebhookSubscriptionResponseDto()` in `src/modules/webhooks/dto/webhook-subscription.dto.ts`. The DLQ view (`WebhookDLQView`) also strips `webhookSecret`.
 - **Admin Authentication**: All DLQ replay and circuit-breaker endpoints require admin JWT authentication (`requireAuth` + `requireRole('admin')`).
 - **Correlation IDs**: Outbound HTTP headers use sanitized correlation IDs restricted to `[A-Za-z0-9._-]` with max length 256, preventing header injection (CRLF).
 - **HMAC Signing**: Payloads are signed with HMAC-SHA256 using the subscription's secret. Signatures include a timestamp to prevent replay attacks (max age: 5 minutes).

@@ -1,9 +1,6 @@
-import { z } from 'zod';
-import { registry } from '../../../docs/openapi-registry';
-import {
-  MAX_CONTRACT_AMOUNT_STROOPS,
-  MAX_CONTRACT_TERMS_LENGTH,
-} from '../../../contracts/bounds';
+import { z } from "zod";
+import { registry } from "../../../docs/openapi-registry";
+import { MAX_CONTRACT_AMOUNT_STROOPS } from "../../../contracts/bounds";
 
 // ─── Field-level constants ────────────────────────────────────────────────────
 
@@ -39,6 +36,9 @@ export const CONTRACT_ID_MAX_LENGTH = 128;
 /** Max allowed `limit` query param value */
 export const QUERY_LIMIT_MAX = 100;
 
+/** Maximum number of operations allowed in a single bulk milestones request */
+export const BULK_BATCH_SIZE_MAX = 25;
+
 // ─── Reusable sub-schemas ─────────────────────────────────────────────────────
 
 /**
@@ -48,8 +48,11 @@ export const QUERY_LIMIT_MAX = 100;
  */
 const datetimeField = z
   .string()
-  .max(DATETIME_MAX_LENGTH, `Datetime string must not exceed ${DATETIME_MAX_LENGTH} characters`)
-  .datetime({ message: 'Must be a valid ISO-8601 datetime string' });
+  .max(
+    DATETIME_MAX_LENGTH,
+    `Datetime string must not exceed ${DATETIME_MAX_LENGTH} characters`,
+  )
+  .datetime({ message: "Must be a valid ISO-8601 datetime string" });
 
 /**
  * Milestone sub-schema used inside createContractSchema.
@@ -61,17 +64,29 @@ const createMilestoneSchema = z
   .object({
     title: z
       .string()
-      .min(MILESTONE_TITLE_MIN_LENGTH, `Milestone title must be at least ${MILESTONE_TITLE_MIN_LENGTH} character`)
-      .max(MILESTONE_TITLE_MAX_LENGTH, `Milestone title must not exceed ${MILESTONE_TITLE_MAX_LENGTH} characters`),
+      .min(
+        MILESTONE_TITLE_MIN_LENGTH,
+        `Milestone title must be at least ${MILESTONE_TITLE_MIN_LENGTH} character`,
+      )
+      .max(
+        MILESTONE_TITLE_MAX_LENGTH,
+        `Milestone title must not exceed ${MILESTONE_TITLE_MAX_LENGTH} characters`,
+      ),
     description: z
       .string()
-      .max(MILESTONE_DESCRIPTION_MAX_LENGTH, `Milestone description must not exceed ${MILESTONE_DESCRIPTION_MAX_LENGTH} characters`)
+      .max(
+        MILESTONE_DESCRIPTION_MAX_LENGTH,
+        `Milestone description must not exceed ${MILESTONE_DESCRIPTION_MAX_LENGTH} characters`,
+      )
       .optional()
-      .default(''),
+      .default(""),
     amount: z
-      .number({ invalid_type_error: 'Milestone amount must be a number' })
-      .positive('Milestone amount must be a positive number')
-      .max(MAX_CONTRACT_AMOUNT_STROOPS, `Milestone amount must not exceed ${MAX_CONTRACT_AMOUNT_STROOPS}`),
+      .number({ invalid_type_error: "Milestone amount must be a number" })
+      .positive("Milestone amount must be a positive number")
+      .max(
+        MAX_CONTRACT_AMOUNT_STROOPS,
+        `Milestone amount must not exceed ${MAX_CONTRACT_AMOUNT_STROOPS}`,
+      ),
     deadline: datetimeField.optional(),
     completed: z.boolean().optional().default(false),
   })
@@ -80,55 +95,42 @@ const createMilestoneSchema = z
 /**
  * Milestone sub-schema used inside updateContractSchema.
  * description is required (not optional) to keep create/update consistent.
- * .strip() drops unknown keys silently.
+ * `.strict()` rejects unknown keys rather than silently dropping them —
+ * consistent with the body-level `.strict()` on updateContractBodySchema.
  */
 const updateMilestoneSchema = z
   .object({
     title: z
       .string()
-      .min(MILESTONE_TITLE_MIN_LENGTH, `Milestone title must be at least ${MILESTONE_TITLE_MIN_LENGTH} character`)
-      .max(MILESTONE_TITLE_MAX_LENGTH, `Milestone title must not exceed ${MILESTONE_TITLE_MAX_LENGTH} characters`),
+      .min(
+        MILESTONE_TITLE_MIN_LENGTH,
+        `Milestone title must be at least ${MILESTONE_TITLE_MIN_LENGTH} character`,
+      )
+      .max(
+        MILESTONE_TITLE_MAX_LENGTH,
+        `Milestone title must not exceed ${MILESTONE_TITLE_MAX_LENGTH} characters`,
+      ),
     description: z
       .string()
-      .min(MILESTONE_DESCRIPTION_MIN_LENGTH, `Milestone description must be at least ${MILESTONE_DESCRIPTION_MIN_LENGTH} character`)
-      .max(MILESTONE_DESCRIPTION_MAX_LENGTH, `Milestone description must not exceed ${MILESTONE_DESCRIPTION_MAX_LENGTH} characters`),
+      .min(
+        MILESTONE_DESCRIPTION_MIN_LENGTH,
+        `Milestone description must be at least ${MILESTONE_DESCRIPTION_MIN_LENGTH} character`,
+      )
+      .max(
+        MILESTONE_DESCRIPTION_MAX_LENGTH,
+        `Milestone description must not exceed ${MILESTONE_DESCRIPTION_MAX_LENGTH} characters`,
+      ),
     amount: z
-      .number({ invalid_type_error: 'Milestone amount must be a number' })
-      .positive('Milestone amount must be a positive number')
-      .max(MAX_CONTRACT_AMOUNT_STROOPS, `Milestone amount must not exceed ${MAX_CONTRACT_AMOUNT_STROOPS}`),
+      .number({ invalid_type_error: "Milestone amount must be a number" })
+      .positive("Milestone amount must be a positive number")
+      .max(
+        MAX_CONTRACT_AMOUNT_STROOPS,
+        `Milestone amount must not exceed ${MAX_CONTRACT_AMOUNT_STROOPS}`,
+      ),
     deadline: datetimeField.optional(),
     completed: z.boolean().default(false),
   })
-  .strip();
-
-// Update contract schema with partial fields for PATCH and OCC version.
-// `.strict()` on both the body and each milestone rejects unrecognized
-// fields (400 validation_error) instead of silently dropping them — this is
-// the write path used to initiate/resolve disputes via `status`.
-// Milestone *count* is intentionally left unbounded here: it's enforced by
-// `validateContractBounds` in the service layer, which returns a 422
-// contract_bounds_error — an established, separately-tested contract this
-// schema must not shadow with an earlier 400.
-export const updateContractSchema = z.object({
-  body: z.object({
-    version: z.number().int().min(0),
-    title: z.string().min(5).max(100).optional(),
-    description: z.string().min(10).max(1000).optional(),
-    freelancerId: z.string().uuid().nullable().optional(),
-    clientId: z.string().uuid().optional(),
-    budget: z.number().positive().max(MAX_CONTRACT_AMOUNT_STROOPS).optional(),
-    deadline: z.string().datetime().nullable().optional(),
-    status: z.enum(['draft', 'active', 'completed', 'cancelled', 'disputed']).optional(),
-    terms: z.string().max(MAX_CONTRACT_TERMS_LENGTH).nullable().optional(),
-    milestones: z.array(z.object({
-      title: z.string().min(1).max(100),
-      description: z.string().min(1).max(500),
-      amount: z.number().positive().max(MAX_CONTRACT_AMOUNT_STROOPS),
-      deadline: z.string().datetime().optional(),
-      completed: z.boolean().default(false),
-    }).strict()).optional(),
-  }).strict(),
-});
+  .strict();
 
 /**
  * Schema for the body of POST /api/v1/contracts.
@@ -139,32 +141,66 @@ export const updateContractSchema = z.object({
 const createContractBodySchema = z
   .object({
     title: z
-      .string({ required_error: 'title is required', invalid_type_error: 'title must be a string' })
-      .min(TITLE_MIN_LENGTH, `title must be at least ${TITLE_MIN_LENGTH} characters`)
-      .max(TITLE_MAX_LENGTH, `title must not exceed ${TITLE_MAX_LENGTH} characters`)
+      .string({
+        required_error: "title is required",
+        invalid_type_error: "title must be a string",
+      })
+      .min(
+        TITLE_MIN_LENGTH,
+        `title must be at least ${TITLE_MIN_LENGTH} characters`,
+      )
+      .max(
+        TITLE_MAX_LENGTH,
+        `title must not exceed ${TITLE_MAX_LENGTH} characters`,
+      )
       .trim(),
     description: z
-      .string({ required_error: 'description is required', invalid_type_error: 'description must be a string' })
-      .min(DESCRIPTION_MIN_LENGTH, `description must be at least ${DESCRIPTION_MIN_LENGTH} characters`)
-      .max(DESCRIPTION_MAX_LENGTH, `description must not exceed ${DESCRIPTION_MAX_LENGTH} characters`)
+      .string({
+        required_error: "description is required",
+        invalid_type_error: "description must be a string",
+      })
+      .min(
+        DESCRIPTION_MIN_LENGTH,
+        `description must be at least ${DESCRIPTION_MIN_LENGTH} characters`,
+      )
+      .max(
+        DESCRIPTION_MAX_LENGTH,
+        `description must not exceed ${DESCRIPTION_MAX_LENGTH} characters`,
+      )
       .trim(),
-    freelancerId: z.string({ invalid_type_error: 'freelancerId must be a string' }).uuid('freelancerId must be a valid UUID').optional(),
+    freelancerId: z
+      .string({ invalid_type_error: "freelancerId must be a string" })
+      .uuid("freelancerId must be a valid UUID")
+      .optional(),
     clientId: z
-      .string({ required_error: 'clientId is required', invalid_type_error: 'clientId must be a string' })
-      .uuid('clientId must be a valid UUID'),
+      .string({
+        required_error: "clientId is required",
+        invalid_type_error: "clientId must be a string",
+      })
+      .uuid("clientId must be a valid UUID"),
     budget: z
-      .number({ required_error: 'budget is required', invalid_type_error: 'budget must be a number' })
-      .positive('budget must be a positive number')
-      .max(MAX_CONTRACT_AMOUNT_STROOPS, `budget must not exceed ${MAX_CONTRACT_AMOUNT_STROOPS}`),
+      .number({
+        required_error: "budget is required",
+        invalid_type_error: "budget must be a number",
+      })
+      .positive("budget must be a positive number")
+      .max(
+        MAX_CONTRACT_AMOUNT_STROOPS,
+        `budget must not exceed ${MAX_CONTRACT_AMOUNT_STROOPS}`,
+      ),
     deadline: datetimeField.optional(),
     status: z
-      .enum(['draft', 'active', 'completed', 'cancelled', 'disputed'], {
-        invalid_type_error: 'status must be one of: draft, active, completed, cancelled, disputed',
+      .enum(["draft", "active", "completed", "cancelled", "disputed"], {
+        invalid_type_error:
+          "status must be one of: draft, active, completed, cancelled, disputed",
       })
       .optional(),
     terms: z
-      .string({ invalid_type_error: 'terms must be a string' })
-      .max(TERMS_MAX_LENGTH, `terms must not exceed ${TERMS_MAX_LENGTH} characters`)
+      .string({ invalid_type_error: "terms must be a string" })
+      .max(
+        TERMS_MAX_LENGTH,
+        `terms must not exceed ${TERMS_MAX_LENGTH} characters`,
+      )
       .optional(),
     milestones: z.array(createMilestoneSchema).optional(),
   })
@@ -187,60 +223,90 @@ export const createContractSchema = z
  * Schema for the body of PATCH /api/v1/contracts/:id.
  *
  * All fields are optional except `version` (OCC requirement).
- * `.strip()` silently drops undeclared keys.
+ *
+ * `.strict()` on both this body and each milestone rejects unrecognized
+ * fields (400 validation_error) instead of silently dropping them — this is
+ * the write path used to initiate/resolve disputes via `status`, so a typo'd
+ * or unexpected field should surface as an error rather than be ignored.
+ * Milestone *count* is intentionally left unbounded here: it's enforced by
+ * `validateContractBounds` in the service layer, which returns a 422
+ * contract_bounds_error — an established, separately-tested contract this
+ * schema must not shadow with an earlier 400.
  */
 const updateContractBodySchema = z
   .object({
     version: z
-      .number({ required_error: 'version is required', invalid_type_error: 'version must be a number' })
-      .int('version must be an integer')
-      .min(0, 'version must be a non-negative integer'),
+      .number({
+        required_error: "version is required",
+        invalid_type_error: "version must be a number",
+      })
+      .int("version must be an integer")
+      .min(0, "version must be a non-negative integer"),
     title: z
-      .string({ invalid_type_error: 'title must be a string' })
-      .min(TITLE_MIN_LENGTH, `title must be at least ${TITLE_MIN_LENGTH} characters`)
-      .max(TITLE_MAX_LENGTH, `title must not exceed ${TITLE_MAX_LENGTH} characters`)
+      .string({ invalid_type_error: "title must be a string" })
+      .min(
+        TITLE_MIN_LENGTH,
+        `title must be at least ${TITLE_MIN_LENGTH} characters`,
+      )
+      .max(
+        TITLE_MAX_LENGTH,
+        `title must not exceed ${TITLE_MAX_LENGTH} characters`,
+      )
       .trim()
       .optional(),
     description: z
-      .string({ invalid_type_error: 'description must be a string' })
-      .min(DESCRIPTION_MIN_LENGTH, `description must be at least ${DESCRIPTION_MIN_LENGTH} characters`)
-      .max(DESCRIPTION_MAX_LENGTH, `description must not exceed ${DESCRIPTION_MAX_LENGTH} characters`)
+      .string({ invalid_type_error: "description must be a string" })
+      .min(
+        DESCRIPTION_MIN_LENGTH,
+        `description must be at least ${DESCRIPTION_MIN_LENGTH} characters`,
+      )
+      .max(
+        DESCRIPTION_MAX_LENGTH,
+        `description must not exceed ${DESCRIPTION_MAX_LENGTH} characters`,
+      )
       .trim()
       .optional(),
     freelancerId: z
-      .string({ invalid_type_error: 'freelancerId must be a string' })
-      .uuid('freelancerId must be a valid UUID')
+      .string({ invalid_type_error: "freelancerId must be a string" })
+      .uuid("freelancerId must be a valid UUID")
       .nullable()
       .optional(),
     clientId: z
-      .string({ invalid_type_error: 'clientId must be a string' })
-      .uuid('clientId must be a valid UUID')
+      .string({ invalid_type_error: "clientId must be a string" })
+      .uuid("clientId must be a valid UUID")
       .optional(),
     budget: z
-      .number({ invalid_type_error: 'budget must be a number' })
-      .positive('budget must be a positive number')
-      .max(MAX_CONTRACT_AMOUNT_STROOPS, `budget must not exceed ${MAX_CONTRACT_AMOUNT_STROOPS}`)
+      .number({ invalid_type_error: "budget must be a number" })
+      .positive("budget must be a positive number")
+      .max(
+        MAX_CONTRACT_AMOUNT_STROOPS,
+        `budget must not exceed ${MAX_CONTRACT_AMOUNT_STROOPS}`,
+      )
       .optional(),
     deadline: datetimeField.nullable().optional(),
     status: z
-      .enum(['draft', 'active', 'completed', 'cancelled', 'disputed'], {
-        invalid_type_error: 'status must be one of: draft, active, completed, cancelled, disputed',
+      .enum(["draft", "active", "completed", "cancelled", "disputed"], {
+        invalid_type_error:
+          "status must be one of: draft, active, completed, cancelled, disputed",
       })
       .optional(),
     terms: z
-      .string({ invalid_type_error: 'terms must be a string' })
-      .max(TERMS_MAX_LENGTH, `terms must not exceed ${TERMS_MAX_LENGTH} characters`)
+      .string({ invalid_type_error: "terms must be a string" })
+      .max(
+        TERMS_MAX_LENGTH,
+        `terms must not exceed ${TERMS_MAX_LENGTH} characters`,
+      )
       .nullable()
       .optional(),
     milestones: z.array(updateMilestoneSchema).optional(),
   })
-  .strip();
+  .strict();
 
 export const updateContractSchema = z
   .object({
     body: updateContractBodySchema,
   })
-  .strip();
+  .strict();
 
 // ─── Route param schema ───────────────────────────────────────────────────────
 
@@ -258,9 +324,15 @@ export const updateContractSchema = z
 export const contractIdParamSchema = z
   .object({
     id: z
-      .string({ required_error: 'Contract id is required', invalid_type_error: 'Contract id must be a string' })
-      .min(1, 'Contract id must not be empty')
-      .max(CONTRACT_ID_MAX_LENGTH, `Contract id must not exceed ${CONTRACT_ID_MAX_LENGTH} characters`),
+      .string({
+        required_error: "Contract id is required",
+        invalid_type_error: "Contract id must be a string",
+      })
+      .min(1, "Contract id must not be empty")
+      .max(
+        CONTRACT_ID_MAX_LENGTH,
+        `Contract id must not exceed ${CONTRACT_ID_MAX_LENGTH} characters`,
+      ),
   })
   .strip();
 
@@ -277,39 +349,168 @@ export const contractIdParamSchema = z
  */
 export const contractQuerySchema = z
   .object({
-    page: z.coerce
-      .number({ invalid_type_error: 'page must be a number' })
-      .int('page must be an integer')
-      .positive('page must be a positive integer')
-      .optional()
-      .default(1),
     limit: z.coerce
-      .number({ invalid_type_error: 'limit must be a number' })
-      .int('limit must be an integer')
-      .positive('limit must be a positive integer')
+      .number({ invalid_type_error: "limit must be a number" })
+      .int("limit must be an integer")
+      .positive("limit must be a positive integer")
       .max(QUERY_LIMIT_MAX, `limit must not exceed ${QUERY_LIMIT_MAX}`)
       .optional()
       .default(10),
     status: z
-      .enum(['draft', 'active', 'completed', 'cancelled', 'disputed'], {
-        invalid_type_error: 'status must be one of: draft, active, completed, cancelled, disputed',
+      .enum(["draft", "active", "completed", "cancelled", "disputed"], {
+        invalid_type_error:
+          "status must be one of: draft, active, completed, cancelled, disputed",
       })
       .optional(),
-    clientId: z.string({ invalid_type_error: 'clientId must be a string' }).uuid('clientId must be a valid UUID').optional(),
-    freelancerId: z.string({ invalid_type_error: 'freelancerId must be a string' }).uuid('freelancerId must be a valid UUID').optional(),
-    cursor: z.string({ invalid_type_error: 'cursor must be a string' }).max(512, 'cursor must not exceed 512 characters').optional(),
-    sortBy: z.enum(['createdAt', 'title', 'budget', 'status'], {
-      invalid_type_error: 'sortBy must be one of: createdAt, title, budget, status',
-    }).optional(),
-    sortOrder: z.enum(['asc', 'desc'], {
-      invalid_type_error: 'sortOrder must be one of: asc, desc',
-    }).optional(),
+    clientId: z
+      .string({ invalid_type_error: "clientId must be a string" })
+      .uuid("clientId must be a valid UUID")
+      .optional(),
+    freelancerId: z
+      .string({ invalid_type_error: "freelancerId must be a string" })
+      .uuid("freelancerId must be a valid UUID")
+      .optional(),
+    cursor: z
+      .string({ invalid_type_error: "cursor must be a string" })
+      .max(512, "cursor must not exceed 512 characters")
+      .optional(),
+    sortBy: z
+      .enum(["createdAt", "title", "budget", "status"], {
+        invalid_type_error:
+          "sortBy must be one of: createdAt, title, budget, status",
+      })
+      .optional(),
+    sortOrder: z
+      .enum(["asc", "desc"], {
+        invalid_type_error: "sortOrder must be one of: asc, desc",
+      })
+      .optional(),
+    includeDeleted: z.enum(["true", "false"]).optional(),
+  })
+  .strip();
+
+// ─── Bulk milestones schemas ──────────────────────────────────────────────────
+
+/**
+ * Schema for a single bulk milestone operation.
+ *
+ * Supports three actions:
+ *  - `create`: creates a new contract with milestones (requires title, description,
+ *    clientId, budget; milestones is required and must be non-empty)
+ *  - `update`: replaces milestones on an existing contract (requires contractId,
+ *    version, and milestones)
+ *  - `delete`: removes all milestones from an existing contract (requires contractId
+ *    and version; milestones is optional and ignored)
+ *
+ * `.passthrough()` preserves the `action` discriminator field so it appears in the
+ * parsed output. `.strip()` is not applied here; unknown-key rejection is handled
+ * at the array level by the wrapping schema.
+ */
+const bulkMilestoneOperationSchema = z
+  .object({
+    action: z.enum(["create", "update", "delete"]),
+    contractId: z.string().optional(),
+    version: z.number().int().min(0).optional(),
+    title: z
+      .string()
+      .min(
+        TITLE_MIN_LENGTH,
+        `title must be at least ${TITLE_MIN_LENGTH} characters`,
+      )
+      .max(
+        TITLE_MAX_LENGTH,
+        `title must not exceed ${TITLE_MAX_LENGTH} characters`,
+      )
+      .trim()
+      .optional(),
+    description: z
+      .string()
+      .min(
+        DESCRIPTION_MIN_LENGTH,
+        `description must be at least ${DESCRIPTION_MIN_LENGTH} characters`,
+      )
+      .max(
+        DESCRIPTION_MAX_LENGTH,
+        `description must not exceed ${DESCRIPTION_MAX_LENGTH} characters`,
+      )
+      .trim()
+      .optional(),
+    freelancerId: z
+      .string()
+      .uuid("freelancerId must be a valid UUID")
+      .optional(),
+    clientId: z.string().uuid("clientId must be a valid UUID").optional(),
+    budget: z
+      .number()
+      .positive("budget must be a positive number")
+      .max(
+        MAX_CONTRACT_AMOUNT_STROOPS,
+        `budget must not exceed ${MAX_CONTRACT_AMOUNT_STROOPS}`,
+      )
+      .optional(),
+    milestones: z.array(createMilestoneSchema).optional(),
+  })
+  .passthrough()
+  .refine(
+    (op) => {
+      if (op.action === "create") {
+        return Array.isArray(op.milestones) && op.milestones.length > 0;
+      }
+      return true;
+    },
+    {
+      message:
+        "milestones array is required and must be non-empty for create action",
+    },
+  )
+  .refine(
+    (op) => {
+      if (op.action === "update" || op.action === "delete") {
+        return op.contractId !== undefined && op.contractId.length > 0;
+      }
+      return true;
+    },
+    { message: "contractId is required for update and delete actions" },
+  )
+  .refine(
+    (op) => {
+      if (op.action === "update" || op.action === "delete") {
+        return op.version !== undefined;
+      }
+      return true;
+    },
+    { message: "version is required for update and delete actions" },
+  );
+
+/**
+ * Full request schema for POST /api/v1/contracts/milestones/bulk.
+ *
+ * Wraps the operations array in the standard `{ body }` envelope expected
+ * by the `validateSchema` middleware. The array is bounded by
+ * {@link BULK_BATCH_SIZE_MAX}.
+ */
+export const bulkMilestonesSchema = z
+  .object({
+    body: z
+      .object({
+        operations: z
+          .array(bulkMilestoneOperationSchema, {
+            invalid_type_error: "operations must be an array",
+          })
+          .min(1, "operations must contain at least one item")
+          .max(
+            BULK_BATCH_SIZE_MAX,
+            `operations must not exceed ${BULK_BATCH_SIZE_MAX} items`,
+          ),
+      })
+      .strict(),
   })
   .strip();
 
 // ─── OpenAPI registry ─────────────────────────────────────────────────────────
 
-registry.register('CreateContract', createContractSchema.shape.body);
+registry.register("CreateContract", createContractSchema.shape.body);
+registry.register("BulkMilestones", bulkMilestonesSchema.shape.body);
 
 // ─── Exported types ───────────────────────────────────────────────────────────
 
@@ -317,3 +518,9 @@ export type CreateContractDto = z.infer<typeof createContractBodySchema>;
 export type UpdateContractDto = z.infer<typeof updateContractBodySchema>;
 export type ContractQueryParams = z.infer<typeof contractQuerySchema>;
 export type ContractIdParam = z.infer<typeof contractIdParamSchema>;
+export type BulkMilestoneOperationDto = z.infer<
+  typeof bulkMilestoneOperationSchema
+>;
+export type BulkMilestonesRequestDto = z.infer<
+  typeof bulkMilestonesSchema
+>["body"];

@@ -818,3 +818,43 @@ MIGRATIONS.push({
     }
   },
 });
+
+// Version 18: audit_download_tokens table for signed, expiring, one-time-use
+// download tokens bound to a specific export artifact and requester (issue #1222).
+//
+// NOTE: This table was originally introduced as migration version 16 by PR #1259,
+// but a subsequent change re-used version 16 for the audit event/projection
+// tables and dropped this definition. Because a version number can only be
+// applied once, the table is re-introduced here under a fresh, unused version
+// so existing databases (which already recorded version 16) still converge on
+// the correct schema. `IF NOT EXISTS` keeps it idempotent for databases where
+// the table somehow already exists.
+MIGRATIONS.push({
+  version: 18,
+  name: "create_audit_download_tokens_table",
+  checksumSource: [
+    "CREATE TABLE IF NOT EXISTS audit_download_tokens (",
+    "CREATE INDEX IF NOT EXISTS idx_audit_download_tokens_tenant",
+    "CREATE INDEX IF NOT EXISTS idx_audit_download_tokens_expires_at",
+  ].join("\n"),
+  up: (db) => {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS audit_download_tokens (
+        jti           TEXT    PRIMARY KEY,
+        tenant_id     TEXT    NOT NULL,
+        requester_id  TEXT    NOT NULL,
+        artifact_id   TEXT    NOT NULL,
+        issued_at     TEXT    NOT NULL,
+        expires_at    TEXT    NOT NULL,
+        used_at       TEXT,
+        revoked_at    TEXT
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_audit_download_tokens_tenant
+        ON audit_download_tokens(tenant_id);
+
+      CREATE INDEX IF NOT EXISTS idx_audit_download_tokens_expires_at
+        ON audit_download_tokens(expires_at);
+    `);
+  },
+});

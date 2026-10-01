@@ -1,1 +1,54 @@
-dXNlIHNvcm9iYW5fc2RrOjp7Y29udHJhY3R0eXBlLCBBZGRyZXNzLCBCeXRlc049M307CgovLy8gVFRMIGZvciBjb25zdW1lZCBpZGVtcG90ZW5jeSBrZXlzLCBleHByZXNzZWQgaW4gbGVkZ2Vycy4KLy8vCi8vLyBBdCB+NSBzL2xlZGdlciB0aGlzIGdpdmVzIHJvdWdobHkgMjQgaG91cnMgb2YgcmVwbGF5IHByb3RlY3Rpb24uCi8vLyBBZnRlciBleHBpcnkgdGhlIGtleSBpcyBlbGlnaWJsZSBmb3IgZXZpY3Rpb24gZnJvbSBpbnN0YW5jZSBzdG9yYWdlCi8vLyBhbmQgYSBmcmVzaCBzdWJtaXNzaW9uIHdpdGggdGhlIHNhbWUgdG9rZW4gaXMgdHJlYXRlZCBhcyBhIG5ldyBiYXRjaC4KLy8vCi8vLyBJZiB5b3UgbmVlZCBhIGxvbmdlciB3aW5kb3csIGluY3JlYXNlIHRoaXMgY29uc3RhbnQgYW5kIHJlZGVwbG95LgpwdWIgY29uc3QgSURFTV9LRVlfVFRMX0xFREdFUlM6IHUzMiA9IDE3XzI4MDsgLy8gfjI0IGggYXQgNSBzL2xlZGdlcgoKLy8vIFN0b3JhZ2Uga2V5cyB1c2VkIGJ5IHRoZSBjb250cmFjdC4KLy8vCi8vLyBgUGxhY2VCZXRzSWRlbSh1c2VyLCBrZXkpYCBzdG9yZXMgYSBzZW50aW5lbCBgKClgIHZhbHVlIG9uY2UgYQovLy8gYHBsYWNlX2JldHNgIGJhdGNoIGhhcyBiZWVuIGFjY2VwdGVkLiAgVGhlIGNvbXBvc2l0ZSBrZXkgYmluZHMgdGhlCi8vLyB0b2tlbiB0byB0aGUgc3VibWl0dGluZyBhZGRyZXNzIHNvIHR3byBkaWZmZXJlbnQgY2FsbGVycyBtYXkgcmV1c2UgdGhlCi8vLyBzYW1lIDMyLWJ5dGUgdG9rZW4gaW5kZXBlbmRlbnRseSB3aXRob3V0IGNvbmZsaWN0LgovLy8KLy8vICMjIEludmFyaWFudHMKLy8vCi8vLyAtIElkZW1wb3RlbmN5IGlzIHBlciAoY2FsbGVyLCB0b2tlbik6IGEgY29uc3VtZWQgdG9rZW4gY2Fubm90IGJlCi8vLyAgIHJlc3VibWl0dGVkIGJ5IHRoZSBzYW1lIGNhbGxlciB3aXRoaW4gYElERU1fS0VZX1RUTF9MRURHRVJTYC4KLy8vIC0gVGhlIHNlbnRpbmVsIHZhbHVlIGlzIGFuIGVtcHR5IHR1cGxlIGAoCilgLCB3aGljaCBjYW5ub3QgYmUgY29uZnVzZWQgd2l0aCBhCi8vLyAgIG1lYW5pbmdmdWwgcGF5bG9hZDsgaXRzIG1lcmUgcHJlc2VuY2UgaXMgdGhlIG9ubHkgc2lnbmFsIHRoYXQgbWF0dGVycy4KLy8vIC0gS2V5cyBhcmUgbmV2ZXIgd3JpdHRlbiB3aXRoIGEgZmFsc3kgdmFsdWUsIHNvIGEgcmVhZCB0aGF0IHJldHVybnMK Ly8vICAgYFNvbWUoKCkpYCB1bmVxdWl2b2NhbGx5IG1lYW5zICJhbHJlYWR5IGNvbnN1bWVkIi4KLy8vIC0gVFRMIGlzIGFsd2F5cyByZW5ld2VkIG9uIHdyaXRlIHRvIGd1YXJhbnRlZSB0aGUgcmVwbGF5IHdpbmRvdy4KLy8vCi8vLyAjIyMgU2VjdXJpdHkgbm90ZXMKLy8vCi8vLyBUaGUga2V5IGlzIG5vdCBzZWNyZXQ7IGl0IGlzIG9ubHkgdXNlZCB0byBkZWR1cGxpY2F0ZSBzdWJtaXNzaW9ucy4KLy8vIE5vIHNlbnNpdGl2ZSBkYXRhIGlzIHN0b3JlZCBpbiB0aGUgdmFsdWUsIGFuZCB0aGUgYWRkcmVzcyBjb21wb25lbnQKLy8vIGVuc3VyZXMgdGhhdCBvbmUgY2FsbGVyIGNhbm5vdCBjb25zdW1lIGFub3RoZXIgY2FsbGVyJ3MgdG9rZW5zLgpAY29udHJhY3R0eXBlCiNbZGVyaXZlKENsb25lKV0KcHViIGVudW0gRGF0YUtleSB7CiAgICAvLy8gSWRlbXBvdGVuY3kgc2VudGluZWwgZm9yIGEgYHBsYWNlX2JldHNgIGNhbGwuCiAgICAvLy8gS2V5ZWQgYnkgKGNhbGxlciBhZGRyZXNzLCAzMi1ieXRlIHRva2VuIHN1cHBsaWVkIGJ5IHRoZSBjYWxsZXIpLgogICAgUGxhY2VCZXRzSWRlbShBZGRyZXNzLCBCeXRlc04zMiksCn0K
+use soroban_sdk::{contracttype, Address, BytesN=};
+
+/// TWL for consumed idempotency keys, expressed in ledgers.
+///
+/// At ~5 s/ledger this gives roughly 24 hours of replay protection.
+/// After expiry the key is eligible for eviction from instance storage
+/// and a fresh submission with the same token is treated as a new batch.
+///
+/// If you need a longer window, increase this constant and redeploy.
+pub const IDEM_KEY_TTL_LEDGERS: u32 = 17_280; // ~24 h at 5 s/ledger
+
+/// Maximum number of bets accepted in a single ```place_bets``` batch.
+///
+/// This is a validation boundary: batches larger than this are rejected
+/// outright rather than being truncated, so callers can never silently lose
+/// bets. It also bounds the work (and thus the gas) of a single call.
+pub const MAX_BATCH_SIZE: u32 = 50;
+
+/// Minimum number of bets accepted in a single ```place_bets``` batch.
+///
+/// An empty batch is rejected because it would consume an idempotency
+/// key without effect, allowing a caller to burn their own token accidentally.
+pub const MIN_BATCH_SIZE: u32 = 1;
+
+/// Maximum length of the optional memo attached to a batch.
+///
+/// The memo is purely diagnostic and is not part of the idempotency key.
+/// It is bounded to keep event payloads small and to prevent abuse.
+pub const MAX_MEMO_LEN: u32 = 64;
+
+/// Storage keys used by the contract.
+///
+/// `PlaceBetsIdem(user, key)` stores a sentinel `true` value once a
+/// `place_bets` batch has been accepted.  The composite key binds the
+/// token to the submitting address so two different callers may reuse the
+/// same 32-byte token independently without conflict.
+///
+/// The consumed sentinel is written only after all validation and state
+/// transitions for the batch have succeeded, so a reverted call never burns
+/// the idempotency key and the caller may retry safely.
+///
+/// Additional keys are reserved for per-caller counters so the contract can
+/// enforce batch boundaries without relying on off-chain indexing.
+#contracttype]
+#[derive(Clone)]
+pub enum DataKey {
+    /// Idempotency sentinel for a `place_bets` call.
+    /// Keyed by (caller address, 32-byte token supplied by the caller).
+    PlaceBetsIdem(Address, BytesN<32>),
+    /// Monotonically increasing counter of accepted batches for a caller.
+    /// Used to enforce per-caller batch limits and to expose deterministic
+    /// observability for indexers.
+    BatchCounter(Address),
+}

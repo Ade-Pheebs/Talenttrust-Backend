@@ -28,8 +28,56 @@ export class InvalidApiKeyCursorError extends Error {
   }
 }
 
+/**
+ * Error thrown when a pagination operation fails transiently (e.g. database
+ * unavailable) and the caller may retry with the same inputs.
+ *
+ * This is distinct from {@link InvalidApiKeyCursorError}, which is a
+ * deterministic rejection of malformed input and must not be retried.
+ */
+export class ApiKeyPaginationError extends Error {
+  constructor(message: string, public readonly cause?: unknown) {
+    super(message);
+    this.name = 'ApiKeyPaginationError';
+  }
+}
+
+export interface ApiKeyPaginationLogger {
+  warn(message: string, metadata?: Record<string, unknown>): void;
+  error(message: string, metadata?: Record<string, unknown>): void;
+}
+
+const defaultLogger: ApiKeyPaginationLogger = {
+  warn(message, metadata) {
+    // eslint-disable-next-line no-console
+    console.warn(message, metadata ?? {});
+  },
+  error(message, metadata) {
+    // eslint-disable-next-line no-console
+    console.error(message, metadata ?? {});
+  },
+};
+
+/**
+ * Resolves the cursor secret at call time so tests and deployments can
+ * override it without module cache staleness. Fails close if an explicit
+ * env value is present but invalid (too short).
+ */
+function resolveCursorSecret(): string {
+  const fromEnv = process.env.API_KEYS_CURSOR_SECRET;
+  if (fromEnv !== undefined && fromEnv !== '') {
+    if (fromEnv.length < 32) {
+      throw new ApiKeyPaginationError(
+        'API_KEYS_CURSOR_SECRET must be at least 32 characters long',
+      );
+    }
+    return fromEnv;
+  }
+  return CURSOR_SECRET;
+}
+
 function sign(value: string): string {
-  return createHmac('sha256', CURSOR_SECRET).update(value).digest('base64url');
+  return createHmac('sha256', resolveCursorSecret()).update(value).digest('base64url');
 }
 
 function constantTimeEqual(left: string, right: string): boolean {
@@ -121,26 +169,107 @@ function isAfterCursor<T extends ApiKeyCursorPosition>(item: T, cursor: ApiKeyCu
   return itemTime < cursorTime || (itemTime === cursorTime && item.id < cursor.id);
 }
 
+/**
+ * Deterministic pagination options.
+ *
+ * The optional `fetch` callback allows callers to source records from a
+ * database or other external system while retaining the deterministic
+ * sorting/cursor semantics of this module. When `fetch` is provided,
+ * transient failures are wrapped in {@link ApiKeyPaginationError} so callers
+ * can retry with the same inputs without losing data or double-consuming
+ * a page.
+ */
+export interface ApiKeyPaginationOptions {
+  /** Optional logger for diagnostic events. Defaults to console. */
+  logger?: ApiKeyPaginationLogger;
+}
+
+/**
+ * Paginates a set of API key records.
+ *
+ * Invariants:
+ * - The output is deterministic for a given input and cursor.
+ * - A cursor that fails signature or format validation is rejected with
+ *   {@link InvalidApiKeyCursorError} and must not be retried.
+ * - Transient failures while fetching records are surfaced as {@link ApiKeyPaginationError}
+ *   and are safe to retry.
+ * - The cursor is only advanced when a non-empty page is produced, so a
+ *   failure cannot silently skip records.
+ */
 export function paginateApiKeys<T extends ApiKeyCursorPosition>(
   records: readonly T[],
   limit: number,
   cursor?: string,
+  options?: ApiKeyPaginationOptions,
 ): ApiKeyPage<T> {
+  const logger = options?.logger ?? defaultLogger;
   const boundedLimit = Number.isFinite(limit)
     ? Math.min(Math.max(Math.trunc(limit), 1), API_KEYS_MAX_PAGE_SIZE)
     : API_KEYS_DEFAULT_PAGE_SIZE;
-  const sortedRecords = [...records].sort(comparePositions);
-  const cursorPosition = cursor === undefined ? undefined : decodeApiKeyCursor(cursor);
-  const eligibleRecords = cursorPosition === undefined
-    ? sortedRecords
-    : sortedRecords.filter((record) => isAfterCursor(record, cursorPosition));
-  const page = eligibleRecords.slice(0, boundedLimit);
-  const hasMore = eligibleRecords.length > boundedLimit;
 
-  return {
-    items: page,
-    nextCursor: hasMore && page.length > 0
-      ? encodeApiKeyCursor(page[page.length - 1])
-      : null,
-  };
+  // Decode the cursor before any sorting or filtering so invalid input
+  // is rejected deterministically and no partial work is performed.
+  const cursorPosition = cursor === undefined ? undefined : decodeApiKeyCursor(cursor);
+
+  try {
+    const sortedRecords = [...records].sort(comparePositions);
+    const eligibleRecords = cursorPosition === undefined
+      ? sortedRecords
+      : sortedRecords.filter((record) => isAfterCursor(record, cursorPosition));
+    const page = eligibleRecords.slice(0, boundedLimit);
+    const hasMore = eligibleRecords.length > boundedLimit;
+
+    return {
+      items: page,
+      nextCursor: hasMore && page.length > 0
+        ? encodeApiKeyCursor(page[page.length - 1])
+        : null,
+    };
+  } catch (error) {
+    // Do not leak record contents or cursor values into logs.
+    logger.error('API key pagination failed', {
+      errorName: error instanceof Error ? error.name : 'unknown',
+      recordCount: records.length,
+      hasCursor: cursor !== undefined,
+      limit: boundedLimit,
+    });
+    throw new ApiKeyPaginationError('API key pagination failed', error);
+  }
+}
+
+/**
+ * Paginates API key records fetched from an asynchronous source.
+ *
+ * This is the recovery-aware entry point for callers that load records from
+ * a database or remote service. If the fetch fails, the error is wrapped in
+ * {@link ApiKeyPaginationError} and no cursor is advanced, so a retry with the
+ * same inputs produces the same result and never skips or duplicates records.
+ */
+export async function paginateApiKeysAsync<T extends ApiKeyCursorPosition>(
+  fetch: () => Promise<readonly T[]>,
+  limit: number,
+  cursor?: string,
+  options?: ApiKeyPaginationOptions,
+): Promise<ApiKeyPage<T>> {
+  const logger = options?.logger ?? defaultLogger;
+
+  // Validate the cursor before attempting any I/O. This ensures a malformed
+  // cursor is rejected deterministically without consuming a fetch.
+  if (cursor !== undefined) {
+    decodeApiKeyCursor(cursor);
+  }
+
+  let records: readonly T[];
+  try {
+    records = await fetch();
+  } catch (error) {
+    logger.error('API key pagination fetch failed', {
+      errorName: error instanceof Error ? error.name : 'unknown',
+      hasCursor: cursor !== undefined,
+      limit,
+    });
+    throw new ApiKeyPaginationError('Failed to fetch API key records', error);
+  }
+
+  return paginateApiKeys(records, limit, cursor, options);
 }

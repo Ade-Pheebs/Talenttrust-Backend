@@ -148,6 +148,9 @@ export function createAuditRouter(options: AuditRouterOptions = {}): Router {
    *
    * Write an audit entry with idempotency support.
    * Accepts an Idempotency-Key header to prevent duplicate entries.
+   *
+   * Validation is deterministic — the same invalid input always returns
+   * the same 400 response with a structured `issues` array.
    */
   router.post(
     '/',

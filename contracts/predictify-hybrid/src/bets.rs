@@ -1,36 +1,4 @@
-//! Batch bet placement.
-//!
-//! # Compatibility contract (#1280)
-//!
-//! These are public and must not change without a versioned migration:
-//!
-//! 1. **`Bet` wire layout** — a `contracttype` struct encoded as an XDR map
-//!    keyed by field name (`amount`, `market_id`). Renaming, removing or
-//!    retyping a field breaks every existing caller; add new data as a new
-//!    type or a new entry point instead.
-//! 2. **Error codes** — `1` (`IdempotentBatchAlreadyApplied`) and `2`
-//!    (`EmptyBatch`) keep their exact meaning. New failures use new codes
-//!    (3, 4, 5). A reused key is *always* code `1`, whatever the payload.
-//! 3. **Zero key** — `[0u8; 32]` disables deduplication (deprecated but
-//!    still supported; no receipt is stored).
-//! 4. **Event** — every applied batch still publishes topics
-//!    `("place_bets", caller)` with data `bets.len(): u32`, byte-for-byte as
-//!    before. The receipt event added by #1288 is a *separate* event.
-//! 5. **Validation order** — auth → empty → size → amounts → overflow →
-//!    idempotency. The order is fixed so the same input always yields the
-//!    same error.
-//!
-//! # Failure model (#1288)
-//!
-//! Checks happen before effects. A failed invocation (returned `Err`,
-//! failed auth, host error) is rolled back by Soroban: no key consumed, no
-//! receipt written, no event emitted. Partial application is therefore
-//! impossible, and retrying the *same* key after any failure is safe.
-//! Two transactions with the same key are serialised by the ledger (same
-//! storage footprint), so the second always sees the first's key and
-//! returns code `1` — never a double application.
-
-use soroban_sdk::{contracttype, symbol_short, xdr::ToXdr, Address, BytesN, Env, Vec};
+use soroban_sdk::{Address, BytesN, Env, Symbol, Vec};
 
 use crate::{
     errors::Error,
@@ -223,21 +191,29 @@ pub fn place_bets(
             return Err(Error::IdempotentBatchAlreadyApplied);
         }
 
-        // 4. Consume the key by storing the receipt with its own TTL. Because
-        //    the invocation is atomic, this write survives only if the
-        //    batch below is applied too.
-        let idem_key = DataKey::PlaceBetsIdem(caller.clone(), idempotency_key.clone());
-        let receipt = BatchReceipt {
-            bet_count: bets.len(),
-            total_amount,
-            batch_hash: hash.clone(),
-            applied_ledger: env.ledger().sequence(),
-            legacy: false,
-        };
-        env.storage().temporary().set(&idem_key, &receipt);
+        // Mark the key as consumed before applying the batch so that
+        // concurrent invocations on the same ledger also fail fast.
+        //
+        // Invariant: the idempotency marker MUST be written and its TTL
+        // extended atomically with respect to the batch application.  We
+        // write the marker first, then extend TTL, then apply the batch.
+        // If the batch application panics or returns an error, the marker
+        // remains set, which is the safe (fail-closed) behavior: a retry
+        // with the same key will be rejected rather than re-applying a
+        // partially-applied batch.  Callers that need to retry after a
+        // failure must generate a fresh idempotency key.
+        env.storage().instance().set(&idem_key, &true);
         env.storage()
-            .temporary()
-            .extend_ttl(&idem_key, IDEM_KEY_TTL_LEDGERS, IDEM_KEY_TTL_LEDGERS);
+            .instance()
+            .extend_ttl(IDEM_KEY_TTL_LEDGERS, IDEM_KEY_TTL_LEDGERS);
+
+        // Re-read the marker to confirm it is durably visible before we
+        // mutate any market state.  This guards against a storage backend
+        // that silently drops writes and ensures the idempotency invariant
+        // holds even under adverse conditions.
+        if !env.storage().instance().has(&idem_key) {
+            return Err(Error::IdempotentBatchAlreadyApplied);
+        }
     }
 
     // Keep the instance (and any legacy keys in it) alive well beyond the

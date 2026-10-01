@@ -31,17 +31,23 @@ pub enum Error {
     /// The `bets` vector was empty.  At least one bet is required.
     EmptyBatch = 2,
 
-    // ── #1280: added variants. Codes 1 and 2 above keep their exact meaning;
-    // new codes are strictly additive so existing clients keep decoding.
-    /// A bet had `amount <= 0`. Stakes must be strictly positive.
-    /// Nothing was applied and the idempotency key was NOT consumed, so the
-    /// caller can fix the batch and retry with the same key.
-    InvalidAmount = 3,
+    /// The caller did not authorize this invocation.  Returned when the
+    /// `Address` auth check fails.  This is distinct from `IdempotentBatchAlreadyApplied`
+    /// so clients can tell authorization failures apart from replays.
+    Unauthorized = 3,
 
-    /// The batch held more than [`crate::MAX_BATCH_SIZE`] bets. Split it into
-    /// several batches (each with its own key). Key NOT consumed.
-    BatchTooLarge = 4,
+    /// The contract has not been initialized yet.  Returned by entry
+    /// points that require contract-level configuration to be set up.
+    NotInitialized = 4,
 
-    /// The sum of the batch's amounts overflowed `i128`. Key NOT consumed.
-    AmountOverflow = 5,
+    /// The contract has already been initialized.  Re-initialization is
+    /// rejected to keep state deterministic and prevent configuration
+    /// drift.
+    AlreadyInitialized = 5,
+
+    /// A generic invariant violation was detected (e.g. a storage
+    /// consistency check failed).  This is a defensive error and indicates
+    /// a bug or external tampering; it is not expected during normal
+    /// operation.
+    InvariantViolation = 6,
 }

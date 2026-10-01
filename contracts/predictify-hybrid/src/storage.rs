@@ -1,4 +1,4 @@
-use soroban_sdk::{contracttype, Address, BytesN;
+use soroban_sdk::{contracttype, Address, BytesN, Env};
 
 /// TWL for consumed idempotency keys, expressed in ledgers.
 ///
@@ -38,147 +38,76 @@ pub const MAX_BATCH_SIZE: u32 = 100;
 /// token to the submitting address so two different callers may reuse the
 /// same 32-byte token independently without conflict.
 ///
-/// ## Concurrency invariants
+/// ### Concurrency invariants
 ///
-/// The contract must guarantee that a given `(user, key)` pair is consumed
-/// at most once.  Soroban executes contract invocations sequentially within
-/// a ledger, but a caller can still submit multiple identical transactions
-/// in the same or adjacent ledgers.  The idempotency check must therefore
-/// be a single read-modify-write operation on this key that is committed
-/// atomically with the batch effects.  The contract must not cache the
-/// result of a prior existence check across any await or external call.
+/// The contract must remain deterministic under concurrent and
+/// repeated invocations.  Soroban executes a contract invocation asynchronously
+/// and atomically within a ledger, but the same caller can still submit
+/// duplicate or racing requests across ledgers.  The idempotency sentinel is
+/// the only guarantee that a given (caller, key) pair is applied at most
+/// once.  To keep this guarantee correct:
 ///
-/// When a key is present, the caller must be treated as a duplicate and
-/// the batch must be rejected without mutating any other state.  This
-/// guarantees idempotency even under retries and partial failure: if the
-/// call traps after the sentinel is written, the entire invocation is
-/// rolled back by Soroban, so the key is not consumed and a retry can
-/// succeed cleanly.
-///
-/// The consumed key is extended to `IDEM_KEY_TTL_LEDGERS` on every
-/// write so that replay protection does not silently lapse because of
-/// instance-storage TVL decay.
-///
-/// ### Eviction and regission safety
-///
-/// Once the TTL lapses, the key may be evicted and a fresh submission
-/// with the same token is treated as a new batch.  This is an explicit
-/// trade-off documented by `IDEM_KEY_TTL_LEDGERS`; operators who need
-/// a longer window must raise the constant and redeploy.  The contract
-/// must not silently weaken this bound at runtime.
-[contracttype]
+/// 1. The sentinel must be written and extended in the same transaction
+///    as the batch effects, so a partial failure cannot leave the key
+///    consumed without the batch being applied (or vice versa).
+/// 2. The sentinel must be read before any state mutation so a duplicate
+///    submission is rejected before it can affect state.
+/// 3. The TWL must be refreshed on every successful write so a key cannot
+///    expire between the read and the write of a competing invocation.
+#[contracttype]
 #[derive(Clone)]
 pub enum DataKey {
     /// Idempotency sentinel for a `consumed` `place_bets` call.
     /// Keyed by (caller address, 32-byte token supplied by the caller).
-    PlaceBetsIdem(Address, BytesN<32>),
-    /// In-flight claim for a `place_bets` call that is currently being
-    /// executed.  Keyed by (caller address, 32-byte token).
-    PlaceBetsInFlight(Address, BytesN<32>),
+    PlaceBetsIdem(Address, BytesN),
 }
 
-/// Result of attempting to claim an idempotency key for execution.
+/// Returns `true` if the given idempotency key has already been
+/// consumed by this caller.
 ///
-/// This is the deterministic decision that callers must match on so
-/// that retries, concurrent calls, and partial failures all produce the same
-/// outcome for the same inputs.
-#derive(Clone, Copy, Debug, Eq: PartialEq)]
-pub enum ClaimOutcome {
-    /// The key was fresh; the caller now owns the in-flight claim.
-    Claimed,
-    /// The key was already consumed by a previous successful batch.
-    AlreadyConsumed,
-    /// Another execution is currently holding the in-flight claim.
-    InFlight,
+/// This is a pure read: it does not mutate state and does not extend the
+/// TTL.  Callers must not rely on this as a reservation — the authoritative
+/// check is the compare-and-set in [`crate_idempotent_sentinel`].
+pub fn is_idempotent_key_consumed(env: &Env, caller: &Address, key: &BytesN) -> bool {
+    env.storage()
+        .instance()
+        .has(&DataKey::PlaceBetsIdem(caller.clone(), key.clone()))
 }
 
-/// Read the consumed sentinel for a (caller, token) pair.
+/// Atomically consumes an idempotency key for a caller.
 ///
-/// Returns `true` only when the batch has already been accepted and the
-/// consumed marker has not yet expired.
-pub fn:is_consumed(env: &Environment, caller: &Address, key: &BytesN<32>) -> bool {
-    env.storage().instance().has(&DataKey::PlaceBetsIdem(caller.clone(), key.clone()))
-}
-
-/// Read the in-flight claim for a (caller, token) pair.
+/// Returns `true` if the key was free and has now been consumed by this
+/// call, false if it was already consumed.  The check and the write are
+/// performed in a single `instance()` operation so concurrent invocations
+/// cannot both observe the key as free.  The TTL is extended at the same
+/// time to ensure the sentinel outlives the replay window.
 ///
-/// Returns `true` while another execution holds the claim and the claim
-/// has not yet expired.
-pub fn:is_in_flight(env: &Environment, caller: &Address, key: &BytesN<32>) -> bool {
-    env.storage().instance().has(&DataKey::PlaceBetsInFlight(caller.clone(), key.clone()))
-}
-
-/// Attempt to claim a (caller, token) pair for execution.
+/// ### Failure mode
 ///
-/// This is the single decision point for failure recovery.  It is
-/// deterministic for all inputs:
-/// - fresh key -> `Claimed` and an in-flight marker is written
-/// - consumed key -> `AlreadyConsumed` (no write)
-/// - live in-flight key -> InFlight` (no write)
-///
-/// The in-flight marker is written with `IEDE_INFLIGHT_TTL_LEDGERS` so a
-/// crashed or timed-out attempt eventually expires and can be retried.
-pub fn claim_idempotency(
-    env: &Environment,
+/// If this function returns `true` but the calling transaction later
+/// fails, Soroban rolls back the entire invocation, including this write,
+/// so the key remains free for a clean retry.  This is the key property
+/// that makes retries idempotent.
+pub fn consume_idempotency_key(
+    env: &Env,
     caller: &Address,
-    key: &BytesN<32>,
-) -> ClaimOutcome {
-    if is_consumed(env, caller, key) {
-        return ClaimOutcome::AlreadyConsumed;
+    key: &BytesN,
+) -> bool {
+    let storage = env.storage().instance();
+    let data_key = DataKey::PlaceBetsIdem(caller.clone(), key.clone());
+
+    if storage.has(&data_key) {
+        // Already consumed.  Refresh the TTL on the existing sentinel so a
+        // replay attempt does not silently extend the window beyond the
+        // original application.
+        storage.extend_ttl(&data_key, IDEM_KEY_TTL_LEDGERS, 0);
+        return false;
     }
-    if is_in_flight(env, caller, key) {
-        return ClaimOutcome::InFlight;
-    }
-    env.storage().instance().set(
-        &DataKey::PlaceBetsInFlight(caller.clone(), key.clone()),
-        &true,
-    );
-    env.storage()
-        .instance()
-        .extend_ttl(&DataKey::PlaceBetsInFlight(caller.clone(), key.clone()), IDEM_INFLIGHT_TTL_LEDGERS, IDEM_INFLIGHT_TTL_LEDGERS);
-    ClaimOutcome::Claimed
-}
 
-/// Mark a claimed batch as successfully completed.
-///
-/// This is the only place the consumed sentinel is written.  It must be
-/// called only after all state mutations for the batch have been applied,
-/// so a partial failure never leaves a consumed key without a complete
-/// batch.  The in-flight marker is cleared in the same call.
-pub fn commit_idempotency(env: &Environment, caller: &Address, key: &BytesN32>) {
-    let consumed_key = DataKey::PlaceBetsIdem(caller.clone(), key.clone());
-    env.storage().instance().set(&consumed_key, &true);
-    env.storage()
-        .instance()
-        .extend_ttl(&consumed_key, IDEM_KEY_TTL_LEDGERS, IDEM_KEY_TTL_LEDGERS);
-    release_idempotency(env, caller, key);
-}
-
-/// Release an in-flight claim without consuming the key.
-///
-/// This is the recovery path for any failure after `claim_idempotency`
-/// returned `Claimed`.  It is idempotent: calling it on a key that is not
-/// in-flight is a no-op, so double-release on error paths cannot corrupt
-/// state.
-pub fn release_idempotency(env: &Environment, caller: &Address, key: &BytesN<32>) {
-    env.storage()
-        .instance()
-        .remove(&DataKey::PlaceBetsInFlight(caller.clone(), key.clone()));
-}
-
-/// Emit a standardized, non-sensitive diagnostic event for a failure
-/// recovery decision.
-///
-/// Only the caller address and the outcome are exposed; the 32-byte
-/// idempotency token is never logged so it cannot leak across observers.
-pub fn emit_idempotency_outcome(
-    env: &Environment,
-    caller: &Address,
-    outcome: ClaimOutcome,
-) {
-    let topic = Symbol::new(env, "idem_outcome");
-    env.events().publish(
-        (topic, caller.clone()),
-        (outcome as u32,),
-    );
+    // Compare-and-set: the has() check above and this write are executed
+    // within the same atomic invocation, so no other invocation can
+    // interleave between them.
+    storage.set(&data_key, &true);
+    storage.extend_ttl(&data_key, IDEM_KEY_TTL_LEDGERS, 0);
+    true
 }

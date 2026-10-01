@@ -23,7 +23,7 @@ describe('AuthCache', () => {
     scope: ['contracts:read'],
     createdBy: 'user-1',
     createdAt: new Date('2024-01-01'),
-    expiresAt: new Date('2024-12-31'),
+    expiresAt: new Date('2030-12-31'),
     isActive: true,
   };
 
@@ -31,6 +31,16 @@ describe('AuthCache', () => {
     cache = new AuthCache({
       ttlMs: 1000, // 1 second TTL for tests
       maxEntries: 3, // Small capacity for eviction tests
+    });
+  });
+
+  describe('configuration boundaries', () => {
+    it.each([0, -1, Number.NaN, Number.POSITIVE_INFINITY])('rejects invalid ttlMs %s', (ttlMs) => {
+      expect(() => new AuthCache({ ttlMs, maxEntries: 1 })).toThrow(RangeError);
+    });
+
+    it.each([0, -1, 1.5, Number.NaN])('rejects invalid maxEntries %s', (maxEntries) => {
+      expect(() => new AuthCache({ ttlMs: 100, maxEntries })).toThrow(RangeError);
     });
   });
 
@@ -84,6 +94,36 @@ describe('AuthCache', () => {
   });
 
   describe('TTL-based expiration', () => {
+    it('expires an entry exactly at the TTL deadline', () => {
+      jest.useFakeTimers();
+      try {
+        const deadlineCache = new AuthCache({ ttlMs: 100, maxEntries: 1 });
+        deadlineCache.set('selector-1', mockApiKeyInfo);
+
+        jest.advanceTimersByTime(100);
+
+        expect(deadlineCache.get('selector-1')).toBeNull();
+        expect(deadlineCache.cleanupExpired()).toBe(0);
+      } finally {
+        jest.useRealTimers();
+      }
+    });
+
+    it('expires an entry at the API key deadline even when cache TTL is longer', () => {
+      jest.useFakeTimers();
+      try {
+        const keyExpiresAt = new Date(Date.now() + 100);
+        const keyExpiryCache = new AuthCache({ ttlMs: 1000, maxEntries: 1 });
+        keyExpiryCache.set('selector-1', { ...mockApiKeyInfo, expiresAt: keyExpiresAt });
+
+        jest.advanceTimersByTime(100);
+
+        expect(keyExpiryCache.get('selector-1')).toBeNull();
+      } finally {
+        jest.useRealTimers();
+      }
+    });
+
     it('expires entries after TTL', () => {
       const shortTtlCache = new AuthCache({ ttlMs: 100, maxEntries: 100 });
       shortTtlCache.set('selector-1', mockApiKeyInfo);
@@ -163,6 +203,17 @@ describe('AuthCache', () => {
   });
 
   describe('LRU eviction', () => {
+    it('evicts an empty-string selector when it is the least recently used', () => {
+      const singleEntryCache = new AuthCache({ ttlMs: 1000, maxEntries: 1 });
+      singleEntryCache.set('', mockApiKeyInfo);
+
+      singleEntryCache.set('selector-2', mockApiKeyInfo);
+
+      expect(singleEntryCache.getStats().size).toBe(1);
+      expect(singleEntryCache.get('')).toBeNull();
+      expect(singleEntryCache.get('selector-2')).not.toBeNull();
+    });
+
     it('evicts least recently used entry when capacity is reached', () => {
       // Fill cache to capacity
       cache.set('selector-1', { ...mockApiKeyInfo, id: 'key-1' });
@@ -219,6 +270,15 @@ describe('AuthCache', () => {
   });
 
   describe('explicit invalidation', () => {
+    it('does not accept a delayed cache fill from before invalidation', () => {
+      const generation = cache.getGeneration();
+
+      cache.invalidateByUserId('user-1');
+      cache.set('selector-1', mockApiKeyInfo, generation);
+
+      expect(cache.get('selector-1')).toBeNull();
+    });
+
     it('invalidates entry by selector', () => {
       cache.set('selector-1', mockApiKeyInfo);
       cache.set('selector-2', mockApiKeyInfo);
@@ -326,6 +386,18 @@ describe('AuthCache', () => {
       const stats = cache.getStats();
       expect(stats.hits).toBe(3);
       expect(stats.misses).toBe(2);
+    });
+
+    it('stats are monotonic across invalidation and clear', () => {
+      cache.set('selector-1', mockApiKeyInfo);
+      cache.get('selector-1'); // hit
+      cache.get('missing'); // miss
+      const before = cache.getStats();
+      cache.invalidate('selector-1');
+      cache.clear();
+      const after = cache.getStats();
+      expect(after.hits).toBeGreaterThanOrEqual(before.hits);
+      expect(after.misses).toBeGreaterThanOrEqual(before.misses);
     });
   });
 

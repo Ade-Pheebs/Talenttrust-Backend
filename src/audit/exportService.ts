@@ -284,7 +284,7 @@ export class AuditExportService {
     }
 
     const cleanup = async (): Promise<void> => {
-      await fsp.rm(exportDir, { recursive: true, force: true });
+      await fsp.rm(exportDir, { recursive: true, force: true }).catch(() => {});
     };
 
     return {
@@ -358,7 +358,7 @@ export class AuditExportService {
     }
 
     const cleanup = async (): Promise<void> => {
-      await fsp.rm(exportDir, { recursive: true, force: true });
+      await fsp.rm(exportDir, { recursive: true, force: true }).catch(() => {});
     };
 
     return {

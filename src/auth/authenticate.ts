@@ -1,11 +1,8 @@
 /**
  * @module authenticate
- * @description Authentication middleware and helpers for TalentTrust.
+ * @description Legacy bearer-token authentication middleware for TalentTrust.
  *
- * Uses a simple Bearer-token scheme backed by a shared secret (for demo /
- * test purposes). In production this would be replaced with JWT / OAuth2.
- *
- * Tokens are expected in the `Authorization` header:
+ * Tokens are supplied in the `Authorization` header:
  *   Authorization: Bearer <token>
  *
  * The token payload is a base64-encoded JSON string:
@@ -40,6 +37,23 @@
 
 import { Request, Response, NextFunction } from 'express';
 import { Role, VALID_ROLES } from './roles';
+import { logger } from '../logger';
+
+/**
+ * Logger for authentication events.
+ * In production, replace with proper logging infrastructure.
+ */
+const authLogger = {
+  info: (message: string, meta?: Record<string, unknown>) => {
+    console.log(`[AUTH] ${message}`, meta ? JSON.stringify(meta) : '');
+  },
+  warn: (message: string, meta?: Record<string, unknown>) => {
+    console.warn(`[AUTH] ${message}`, meta ? JSON.stringify(meta) : '');
+  },
+  error: (message: string, meta?: Record<string, unknown>) => {
+    console.error(`[AUTH] ${message}`, meta ? JSON.stringify(meta) : '');
+  },
+};
 
 /** Shape of the decoded token payload. */
 export interface TokenPayload {
@@ -48,7 +62,7 @@ export interface TokenPayload {
 }
 
 /** Express request extended with authenticated user info. */
-export interface AuthenticatedRequest extends Request {
+export interface AuthenticatedRequest extends Omit<Request, 'user'> {
   user?: TokenPayload;
 }
 
@@ -153,6 +167,48 @@ export function _resetDecodeCache(): void {
 // ─── Core helpers ─────────────────────────────────────────────────────────────
 
 /**
+ * Validates that an object conforms to TokenPayload structure at runtime.
+ * This protects against tampering of req.user by downstream middleware.
+ *
+ * @param value - The value to validate.
+ * @returns True if the value is a valid TokenPayload, false otherwise.
+ */
+function isValidTokenPayload(value: unknown): value is TokenPayload {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+    return false;
+  }
+
+  const payload = value as Record<string, unknown>;
+  
+  // Validate userId
+  if (typeof payload.userId !== 'string' || payload.userId.trim().length === 0) {
+    return false;
+  }
+
+  // Validate role
+  if (typeof payload.role !== 'string') {
+    return false;
+  }
+
+  if (!VALID_ROLES.includes(payload.role as Role)) {
+    return false;
+  }
+
+  return true;
+}
+
+/**
+ * Checks if the response has already been sent.
+ * This prevents double-sending responses which would cause an error.
+ *
+ * @param res - Express response object.
+ * @returns True if response headers have been sent, false otherwise.
+ */
+function isResponseSent(res: Response): boolean {
+  return res.headersSent;
+}
+
+/**
  * Decode and validate a bearer token string.
  *
  * Results are memoized in a bounded in-process cache so that concurrent
@@ -204,12 +260,41 @@ export function decodeToken(token: string): TokenPayload | null {
 /**
  * Helper to create a valid bearer token for testing.
  *
+ * State invariants enforced:
+ *   - userId is always a non-empty string
+ *   - role is always a valid Role enum value
+ *   - Output is deterministic for same inputs
+ *
  * @param userId - User identifier.
  * @param role   - Role to encode.
  * @returns Base64-encoded token string.
+ * @throws {TypeError} If `userId` or `role` falls outside the accepted set.
  */
 export function createToken(userId: string, role: Role): string {
-  return Buffer.from(JSON.stringify({ userId, role })).toString('base64');
+  // Invariant: Validate inputs before encoding
+  if (!userId || typeof userId !== 'string' || userId.trim().length === 0) {
+    throw new Error('createToken: userId must be a non-empty string');
+  }
+  if (!VALID_ROLES.includes(role)) {
+    throw new Error(`createToken: invalid role "${role}"`);
+  }
+  
+  return Buffer.from(JSON.stringify({ userId: userId.trim(), role })).toString('base64');
+}
+
+/**
+ * Report a refusal through the structured logger.
+ *
+ * The record carries the reason and the path being protected, never the
+ * credential or any part of it. `suspicious` refusals are raised to `warn` so
+ * a forged claim is visible without turning routine 401 noise into warnings.
+ */
+function logRejection(reason: TokenRejectionReason, path: string | undefined): void {
+  const level = SUSPICIOUS_REASONS.has(reason) ? 'warn' : 'debug';
+  logger[level]('auth_legacy_bearer_rejected', {
+    reason,
+    path: path ?? 'unknown',
+  });
 }
 
 /**
@@ -232,10 +317,49 @@ export function authenticateMiddleware(
   res: Response,
   next: NextFunction,
 ): void {
+  // Invariant: Response integrity - check before attempting to send
+  if (isResponseSent(res)) {
+    authLogger.error('Response already sent, cannot authenticate');
+    return;
+  }
+
+  // Invariant: Single authentication - prevent identity changes mid-request
+  if (req.user) {
+    // Invariant: Runtime validation - ensure existing user is still valid
+    if (!isValidTokenPayload(req.user)) {
+      authLogger.error('Existing req.user is invalid or tampered, rejecting request');
+      res.status(500).json({ error: 'Internal authentication error' });
+      return;
+    }
+
+    // Identity already established - log and continue (idempotency)
+    authLogger.warn('Authentication already performed, skipping re-authentication', {
+      existingUserId: req.user.userId,
+      existingRole: req.user.role,
+    });
+    next();
+    return;
+  }
+
   const header = req.headers.authorization;
 
-  if (!header || !header.startsWith('Bearer ')) {
-    res.status(401).json({ error: 'Missing or invalid Authorization header' });
+  // Invariant: Header must exist and be a string
+  if (!header || typeof header !== 'string') {
+    authLogger.warn('Missing Authorization header');
+    if (!isResponseSent(res)) {
+      res.status(401).json({ error: 'Missing or invalid Authorization header' });
+    }
+    return;
+  }
+
+  // Invariant: Header must start with 'Bearer ' (case-sensitive as per RFC 6750)
+  if (!header.startsWith('Bearer ')) {
+    authLogger.warn('Invalid Authorization header format', {
+      prefix: header.substring(0, 10),
+    });
+    if (!isResponseSent(res)) {
+      res.status(401).json({ error: 'Missing or invalid Authorization header' });
+    }
     return;
   }
 
@@ -251,11 +375,39 @@ export function authenticateMiddleware(
 
   const payload = decodeToken(token);
 
-  if (!payload) {
-    res.status(401).json({ error: 'Invalid token' });
+  // Invariant: Token must not be empty after 'Bearer ' prefix
+  if (token.length === 0) {
+    authLogger.warn('Empty token after Bearer prefix');
+    if (!isResponseSent(res)) {
+      res.status(401).json({ error: 'Invalid token' });
+    }
     return;
   }
 
+  const payload = decodeToken(token);
+
+  // Invariant: Invalid token results in 401
+  if (!payload) {
+    authLogger.warn('Token validation failed', {
+      tokenLength: token.length,
+    });
+    if (!isResponseSent(res)) {
+      res.status(401).json({ error: 'Invalid token' });
+    }
+    return;
+  }
+
+  // Invariant: Set req.user exactly once (single authentication)
   req.user = payload;
+
+  // Invariant: Tamper-proof - freeze req.user to prevent downstream mutation
+  Object.freeze(req.user);
+
+  // Invariant: Log successful authentication for diagnostics (redact sensitive data)
+  authLogger.info('Authentication successful', {
+    userId: payload.userId.substring(0, 8) + '...', // Redact for security
+    role: payload.role,
+  });
+
   next();
 }

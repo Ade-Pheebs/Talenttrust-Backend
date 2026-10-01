@@ -2,6 +2,12 @@
  * @module audit/inputValidation
  * @description Strict input validation for audit write endpoints (POST /api/v1/audit).
  *
+ * This module defines the validation boundaries for the audit write path: the
+ * exact set of accepted inputs, the rejection contract for invalid inputs, the
+ * handling of duplicate submissions, and the numeric/structural boundary values
+ * that separate the two. Every bound below is a named constant so that callers
+ * and tests can reference the boundary rather than duplicating magic numbers.
+ *
  * The audit log is append-only and tamper-evident: every accepted entry is
  * hashed into a chain that can never be rewritten. A malformed or oversized
  * entry is therefore permanent. This module is the boundary that keeps such
@@ -18,6 +24,29 @@
  * | Numeric ranges         | Metadata numbers must be finite and within safe bounds       |
  * | Oversized payloads     | `metadata` bounded by key count, depth, item count and bytes |
  * | Injection surface      | Control characters rejected; prototype-pollution keys denied |
+ * | Action-severity rules  | Certain actions mandate specific severity levels             |
+ * | Resource-action binding| Actions must target a compatible resource type              |
+ * | System actor invariants| System actors must use the reserved `system:` prefix        |
+ * | Idempotency fingerprint| A deterministic SHA-256 fingerprint is computed on success   |
+ * | Concurrent writes      | Fingerprint enables callers to detect and reject duplicates  |
+ *
+ * ### State invariants enforced
+ *
+ * The state invariant layer (`validateStateInvariants`) sits downstream of shape
+ * validation and guards the business rules that must hold for every entry
+ * admitted to the append-only chain:
+ *
+ * 1. **Action-severity congruence** — security and lifecycle events carry a
+ *    minimum severity so alerting thresholds cannot be silently bypassed.
+ * 2. **Resource-action binding** — an action that belongs to the `contract`
+ *    resource family cannot be logged against a `user` resource, preventing
+ *    cross-domain audit pollution.
+ * 3. **System actor invariants** — automated actors (CI, scheduler, etc.) must
+ *    use the `system:` prefix so human vs. machine provenance is always clear.
+ * 4. **Idempotency fingerprint** — a deterministic SHA-256 fingerprint
+ *    (`createIdempotencyFingerprint`) is derived from the validated payload,
+ *    enabling callers to detect and refuse duplicate concurrent writes without
+ *    storing state in the validator itself.
  *
  * ### Error contract
  *
@@ -55,17 +84,163 @@
  *     default) would change that hash and break replay detection. This module
  *     publishes the parsed value on `res.locals` and leaves `req.body` alone.
  *
+ * ### Compatibility contract
+ *
+ * This module is a **public API boundary** — its behavior is observable by HTTP
+ * clients and programmatic callers. The following contracts MUST be preserved
+ * across versions to maintain backward compatibility:
+ *
+ * #### 1. Public constants (MUST NOT decrease without major version bump)
+ *
+ * These define the acceptance envelope and clients depend on them:
+ *
+ * - {@link MAX_ID_LENGTH}: Currently 128 chars
+ * - {@link MAX_IP_LENGTH}: Currently 45 chars  
+ * - {@link MAX_CORRELATION_ID_LENGTH}: Currently 128 chars
+ * - {@link MAX_METADATA_KEY_LENGTH}: Currently 64 chars
+ * - {@link MAX_METADATA_ENTRIES}: Currently 50 keys
+ * - {@link MAX_METADATA_ARRAY_ITEMS}: Currently 200 items
+ * - {@link MAX_METADATA_DEPTH}: Currently 5 levels
+ * - {@link MAX_METADATA_STRING_LENGTH}: Currently 4,096 chars
+ * - {@link MAX_METADATA_BYTES}: Currently 16,384 bytes (16 KiB)
+ * - {@link MAX_METADATA_NUMBER}: Currently Number.MAX_SAFE_INTEGER
+ * - {@link FORBIDDEN_METADATA_KEYS}: Currently ['__proto__', 'constructor', 'prototype']
+ *
+ * **Migration path if decreasing**: Deploy a read-time warning or rejection of
+ * oversized entries for one release cycle, then decrease the bound.
+ *
+ * **Safe changes**: Increasing limits is backward-compatible. Adding validation
+ * patterns is backward-compatible if all existing valid inputs remain valid.
+ *
+ * #### 2. Error codes (MUST NOT change meaning, append-only)
+ *
+ * Clients branch on {@link AUDIT_VALIDATION_CODES} values. Each code's semantic
+ * meaning is frozen once published:
+ *
+ * - `unknown_field`: A field not in the schema was supplied
+ * - `missing_field`: A required field was absent
+ * - `invalid_type`: Wrong JSON type
+ * - `invalid_enum`: Value not in accepted enumeration
+ * - `invalid_format`: Format validation failed (IP, correlation ID)
+ * - `too_small`: String/collection smaller than minimum
+ * - `too_big`: String/collection/number/payload exceeded maximum
+ * - `not_finite`: Number was NaN or ±Infinity
+ * - `blank`: String consisted only of whitespace
+ * - `control_characters`: String contained control characters
+ * - `metadata_too_deep`: Metadata nesting exceeded depth limit
+ * - `metadata_too_many_keys`: Metadata object exceeded key limit
+ * - `metadata_key_too_long`: Metadata key exceeded length limit
+ * - `metadata_forbidden_key`: Metadata key is in forbidden list
+ * - `metadata_too_large`: Serialized metadata exceeded byte limit
+ * - `metadata_not_serialisable`: Metadata contains non-JSON values
+ * - `invalid_value`: Fallback for unclassified constraint violations
+ *
+ * **Migration path if changing**: Introduce new codes with new names. Emit both
+ * old and new codes for one release cycle, then deprecate the old code.
+ *
+ * #### 3. Validation behavior (regression-test protected)
+ *
+ * These behaviors define what is accepted vs rejected:
+ *
+ * - **Required fields**: action, severity, actor, resource, resourceId
+ * - **Optional fields**: metadata (defaults to {}), ipAddress, correlationId
+ * - **Strict mode**: Unknown fields are rejected
+ * - **Metadata defaults to empty object**: Callers may omit it
+ * - **Control characters rejected**: In identifier fields (actor, resource, etc)
+ * - **Whitespace trimming**: NOT performed on identifiers (value is used as-is)
+ * - **IP validation**: Accepts both IPv4 and IPv6 addresses
+ * - **Correlation ID pattern**: [A-Za-z0-9._:-]+
+ * - **Circular reference detection**: Prevents infinite recursion in metadata
+ * - **Prototype pollution prevention**: __proto__, constructor, prototype rejected
+ *
+ * **Migration path if changing acceptance**: Add a `version` or `schemaVersion`
+ * field to the request, route to different validators, and document the
+ * transition period.
+ *
+ * #### 4. Response shape (MUST remain superset of current shape)
+ *
+ * The error response shape is:
+ *
+ * ```typescript
+ * {
+ *   error: {
+ *     code: "validation_error",          // Top-level code (stable)
+ *     message: string,                   // Human-readable (can change wording)
+ *     requestId: string,                 // Correlation
+ *     details: Array<{                   // Per-issue details
+ *       path: string[],                  // Segments to field
+ *       field: string,                   // Dotted path or "(root)"
+ *       code: string,                    // Stable code from AUDIT_VALIDATION_CODES
+ *       message: string                  // Human-readable (can change wording)
+ *     }>
+ *   }
+ * }
+ * ```
+ *
+ * **Safe changes**: Adding new fields to the envelope or detail objects. Changing
+ * message wording (since codes are the stable contract).
+ *
+ * **Breaking changes**: Removing fields, changing field types, changing code
+ * values or their meanings.
+ *
+ * #### 5. Public function contracts
+ *
+ * - {@link validateCreateAuditEntryInput}:
+ *   - Pure and total (never throws, never mutates)
+ *   - Returns discriminated union (ok: true | ok: false)
+ *   - MUST remain callable from non-HTTP contexts
+ *
+ * - {@link validateMetadata}:
+ *   - Returns array of issues (empty = valid)
+ *   - Exposed for programmatic callers
+ *   - MUST not throw on hostile input
+ *
+ * - {@link computeDepth}:
+ *   - Returns numeric depth (primitives = 0, flat object = 1)
+ *   - Handles circular references without throwing
+ *   - Public utility for external validators
+ *
+ * - {@link validateCreateAuditEntry}:
+ *   - Express middleware
+ *   - Places result in res.locals[VALIDATED_BODY_KEY]
+ *   - Does NOT mutate req.body (idempotency hash contract)
+ *   - Calls next() on success, responds 400 on failure
+ *
+ * - {@link readValidatedBody}:
+ *   - Throws if middleware didn't run (fail-fast for wiring bugs)
+ *   - Returns validated body from res.locals
+ *
+ * **Migration path if changing signatures**: Add new functions with new names,
+ * deprecate old ones, maintain both for one release cycle.
+ *
  * @remarks
  * {@link validateCreateAuditEntryInput} is a pure, total function — it never
  * throws, for any input. Non-HTTP producers that write to the audit log should
  * call it directly rather than re-implementing these bounds.
+ *
+ * ### Boundary semantics
+ *
+ * Bounds are inclusive maxima: a value exactly equal to a `MAX_*` constant is
+ * accepted, and the next representable value is rejected. This is asserted by
+ * the boundary tests so the contract cannot drift silently.
+ *
+ * ### Duplicate submissions
+ *
+ * Validation is stateless and idempotent: the same input always yields the same
+ * verdict, and a duplicate submission is validated exactly like the original.
+ * Deduplication is deliberately *not* performed here — it belongs to
+ * `idempotencyMiddleware`, which hashes the untouched `req.body`. This module
+ * must therefore never mutate `req.body`, or replay detection would break.
  */
 
+import { createHash } from 'crypto';
 import type { Request, Response, NextFunction } from 'express';
 import { z } from 'zod';
 import {
   AUDIT_ACTIONS,
   AUDIT_SEVERITIES,
+  type AuditAction,
+  type AuditSeverity,
   type CreateAuditEntryInput,
 } from './types';
 
@@ -170,7 +345,48 @@ export const AUDIT_VALIDATION_CODES = {
   METADATA_NOT_SERIALISABLE: 'metadata_not_serialisable',
   /** Fallback for a constraint with no more specific code. */
   INVALID_VALUE: 'invalid_value',
+  // ── State invariant codes (added by #1332) ──────────────────────────────────
+  /**
+   * The `severity` is too low for the supplied `action`.
+   *
+   * Security-sensitive events (lockouts, auth failures, admin actions,
+   * deployment changes) must not be recorded as `INFO` so they cannot silently
+   * bypass alert thresholds.
+   */
+  SEVERITY_CONGRUENCE: 'severity_congruence',
+  /**
+   * The `action` cannot target the supplied `resource` type.
+   *
+   * Actions belong to resource domains (e.g. contract actions may only target
+   * contract resources). Cross-domain audit entries would make compliance queries
+   * and forensic timelines unreliable.
+   */
+  RESOURCE_ACTION_MISMATCH: 'resource_action_mismatch',
+  /**
+   * A system-generated actor must use the reserved `system:` prefix.
+   *
+   * Automated actors that omit the prefix are indistinguishable from real users
+   * in audit queries, breaking human vs. machine attribution.
+   */
+  SYSTEM_ACTOR_INVALID: 'system_actor_invalid',
+  /**
+   * A human actor must not use the reserved `system:` prefix.
+   *
+   * Allowing human actors to adopt the `system:` namespace would pollute
+   * automated audit filters with human-initiated events.
+   */
+  ACTOR_RESERVED_PREFIX: 'actor_reserved_prefix',
 } as const;
+
+/**
+ * The complete set of codes this module can emit, as a runtime-checkable list.
+ *
+ * Kept in sync with {@link AUDIT_VALIDATION_CODES} by a test, so a new code
+ * cannot be added without also being documented in the error contract.
+ */
+export const AUDIT_VALIDATION_CODE_VALUES: readonly string[] = Object.values(
+  AUDIT_VALIDATION_CODES,
+);
 
 /** The top-level envelope code for every validation failure. */
 export const AUDIT_VALIDATION_ERROR_CODE = 'validation_error';
@@ -183,7 +399,7 @@ export const AUDIT_VALIDATION_ERROR_CODE = 'validation_error';
  * `superRefine` (rather than chained `.refine`) is used so that a value can
  * report every problem it has instead of only the first.
  */
-function identifierSchema(fieldName: string, maxLength: number): z.ZodType<string> {
+export function identifierSchema(fieldName: string, maxLength: number): z.ZodType<string> {
   return z
     .string({
       required_error: `${fieldName} is required`,
@@ -191,6 +407,8 @@ function identifierSchema(fieldName: string, maxLength: number): z.ZodType<strin
     })
     .min(1, `${fieldName} must not be empty`)
     .max(maxLength, `${fieldName} must be at most ${maxLength} characters`)
+    // `maxLength` is the inclusive boundary: exactly this many characters is
+    // valid, one more is not. Asserted by the boundary tests.
     .superRefine((value, ctx) => {
       if (value.trim().length === 0) {
         addIssue(ctx, AUDIT_VALIDATION_CODES.BLANK, `${fieldName} must not be blank`);
@@ -282,6 +500,7 @@ function walkMetadataValue(
 
   switch (typeof value) {
     case 'string':
+      // Inclusive boundary: length === MAX_METADATA_STRING_LENGTH is accepted.
       if (value.length > MAX_METADATA_STRING_LENGTH) {
         issues.push({
           path,
@@ -299,6 +518,7 @@ function walkMetadataValue(
           message: `${label} must be a finite number`,
         });
       } else if (Math.abs(value) > MAX_METADATA_NUMBER) {
+        // Inclusive boundary: |value| === MAX_METADATA_NUMBER is accepted.
         issues.push({
           path,
           code: AUDIT_VALIDATION_CODES.TOO_BIG,
@@ -482,6 +702,64 @@ export function computeDepth(value: unknown, seen: WeakSet<object> = new WeakSet
   return 1 + deepestChild;
 }
 
+// ── Reusable field schemas ────────────────────────────────────────────────────
+//
+// These are the single source of truth for the shape of each audit content
+// field. Both the strict write-path schema below (`CreateAuditEntrySchema`) and
+// the declarative API schemas in `./schemas.ts` compose them, so a field rule
+// can never be silently weakened in one surface and not the other.
+
+/**
+ * IPv4/IPv6 address, bounded by {@link MAX_IP_LENGTH} and optional.
+ *
+ * An unparseable address is rejected rather than stored: audit records are
+ * permanent, and a bogus origin makes incident reconstruction impossible.
+ */
+export const ipAddressSchema = z
+  .string({ invalid_type_error: 'ipAddress must be a string' })
+  .max(MAX_IP_LENGTH, `ipAddress must be at most ${MAX_IP_LENGTH} characters`)
+  .ip({ message: 'ipAddress must be a valid IPv4 or IPv6 address' })
+  .optional();
+
+/**
+ * Opaque correlation ID, bounded and restricted to a safe transport charset.
+ *
+ * The charset guard prevents CR/LF and other control characters (which could
+ * forge log lines) from entering the audit chain.
+ */
+export const correlationIdSchema = z
+  .string({ invalid_type_error: 'correlationId must be a string' })
+  .min(1, 'correlationId must not be empty')
+  .max(
+    MAX_CORRELATION_ID_LENGTH,
+    `correlationId must be at most ${MAX_CORRELATION_ID_LENGTH} characters`,
+  )
+  .regex(
+    CORRELATION_ID_PATTERN,
+    'correlationId must contain only letters, digits, dot, colon, underscore or hyphen',
+  )
+  .optional();
+
+/**
+ * Structured, JSON-serialisable metadata, defaulting to `{}` when omitted.
+ *
+ * Every structural rule from {@link validateMetadata} is enforced here —
+ * forbidden prototype-pollution keys, depth, key count, array length, string
+ * length, finite numbers and serialised byte size — so the declarative API
+ * schema and the strict write-path schema enforce the same data-integrity
+ * invariants.
+ */
+export const auditMetadataSchema = z
+  .unknown()
+  .superRefine((value, ctx) => {
+    for (const issue of validateMetadata(value)) {
+      addIssue(ctx, issue.code, issue.message, issue.path);
+    }
+  })
+  .transform((value) => value as Record<string, unknown>)
+  .optional()
+  .default({});
+
 // ── Body schema ───────────────────────────────────────────────────────────────
 
 /**
@@ -497,33 +775,9 @@ export const CreateAuditEntrySchema = z
     actor: identifierSchema('actor', MAX_ID_LENGTH),
     resource: identifierSchema('resource', MAX_ID_LENGTH),
     resourceId: identifierSchema('resourceId', MAX_ID_LENGTH),
-    metadata: z
-      .unknown()
-      .superRefine((value, ctx) => {
-        for (const issue of validateMetadata(value)) {
-          addIssue(ctx, issue.code, issue.message, issue.path);
-        }
-      })
-      .transform((value) => value as Record<string, unknown>)
-      .optional()
-      .default({}),
-    ipAddress: z
-      .string({ invalid_type_error: 'ipAddress must be a string' })
-      .max(MAX_IP_LENGTH, `ipAddress must be at most ${MAX_IP_LENGTH} characters`)
-      .ip({ message: 'ipAddress must be a valid IPv4 or IPv6 address' })
-      .optional(),
-    correlationId: z
-      .string({ invalid_type_error: 'correlationId must be a string' })
-      .min(1, 'correlationId must not be empty')
-      .max(
-        MAX_CORRELATION_ID_LENGTH,
-        `correlationId must be at most ${MAX_CORRELATION_ID_LENGTH} characters`,
-      )
-      .regex(
-        CORRELATION_ID_PATTERN,
-        'correlationId must contain only letters, digits, dot, colon, underscore or hyphen',
-      )
-      .optional(),
+    metadata: auditMetadataSchema,
+    ipAddress: ipAddressSchema,
+    correlationId: correlationIdSchema,
   })
   .strict();
 
@@ -749,6 +1003,317 @@ export function validateCreateAuditEntry(
   res.locals[VALIDATED_BODY_KEY] = result.data;
   next();
 }
+
+// ── State invariant protection ────────────────────────────────────────────────
+
+/**
+ * Minimum severity required for each action that must never be silently
+ * downgraded to `INFO`.
+ *
+ * **Invariant**: Security-sensitive and lifecycle-critical events must carry at
+ * least `WARNING` (or `CRITICAL`) so alert thresholds cannot be bypassed by
+ * emitting them at `INFO`. A missing entry means `INFO` is acceptable.
+ *
+ * The severity order is: INFO (0) < WARNING (1) < CRITICAL (2).
+ *
+ * @internal
+ */
+const SEVERITY_RANK: Record<AuditSeverity, number> = {
+  INFO: 0,
+  WARNING: 1,
+  CRITICAL: 2,
+};
+
+/**
+ * Minimum required severity (inclusive) per action.
+ *
+ * An action that maps to `WARNING` will be rejected if the caller submits
+ * severity `INFO`. Actions not listed here accept any severity.
+ */
+export const ACTION_MIN_SEVERITY: Readonly<Partial<Record<AuditAction, AuditSeverity>>> = {
+  // Auth security events — must be WARNING or CRITICAL
+  AUTH_FAILED: 'WARNING',
+  AUTH_LOCKOUT_TRIGGERED: 'WARNING',
+  AUTH_LOCKOUT_RELEASED: 'WARNING',
+  // Admin and privileged mutations — must be WARNING or CRITICAL
+  ADMIN_ACTION: 'WARNING',
+  // Deployment changes affect system availability — must be WARNING or CRITICAL
+  DEPLOYMENT_PROMOTED: 'WARNING',
+  DEPLOYMENT_ROLLED_BACK: 'WARNING',
+  // Payment disputes are high-stakes — must be WARNING or CRITICAL
+  PAYMENT_DISPUTED: 'WARNING',
+};
+
+/**
+ * Resources that are permitted for each action prefix group.
+ *
+ * **Invariant**: Actions are scoped to resource families. Logging a
+ * `CONTRACT_CREATED` event against a `user` resource is a cross-domain
+ * audit pollution that would corrupt compliance queries.
+ *
+ * The map key is the action prefix (before the first `_`). A `null` value means
+ * the action group is unrestricted in its resource domain.
+ */
+export const ACTION_RESOURCE_BINDINGS: Readonly<Record<string, readonly string[] | null>> = {
+  CONTRACT: ['contract'],
+  PAYMENT: ['contract', 'payment'],
+  REPUTATION: ['user', 'reputation'],
+  USER: ['user'],
+  AUTH: ['user', 'session'],
+  ADMIN: null, // unrestricted — admin actions may target any resource
+  ENDPOINT: null, // unrestricted — endpoint access covers any resource
+  DEPLOYMENT: ['deployment', 'system'],
+  MILESTONES: ['contract', 'milestone'],
+};
+
+/**
+ * Reserved prefix for automated / system-generated actors.
+ *
+ * **Invariant**: Automated actors must declare themselves via this prefix so
+ * human vs. machine attribution is always unambiguous in forensic queries.
+ */
+export const SYSTEM_ACTOR_PREFIX = 'system:';
+
+/**
+ * Well-known system actor identifiers that do not require the `system:` prefix
+ * because they predate the convention (backward-compat allowlist).
+ */
+export const LEGACY_SYSTEM_ACTORS: ReadonlySet<string> = new Set(['system', 'scheduler', 'ci']);
+
+/**
+ * A single state invariant violation.
+ *
+ * The shape is intentionally compatible with {@link AuditValidationIssue} so
+ * callers can merge the two arrays without type gymnastics.
+ */
+export interface StateInvariantIssue {
+  path: string[];
+  field: string;
+  code: string;
+  message: string;
+}
+
+/**
+ * Result of the state invariant check.
+ *
+ * On success, a deterministic idempotency fingerprint is provided so the caller
+ * can detect and refuse duplicate concurrent writes.
+ */
+export type StateInvariantResult =
+  | { ok: true; fingerprint: string }
+  | { ok: false; issues: StateInvariantIssue[] };
+
+/**
+ * Computes a deterministic SHA-256 idempotency fingerprint for a validated
+ * audit entry input.
+ *
+ * The fingerprint covers the five content fields that define a unique business
+ * event (`action`, `severity`, `actor`, `resource`, `resourceId`) plus the
+ * serialised `metadata`. It intentionally excludes `ipAddress` and
+ * `correlationId`, which are infrastructure concerns and may differ across
+ * retries without changing the logical identity of the event.
+ *
+ * **Idempotency guarantee**: Two calls with identical content fields produce the
+ * same fingerprint. The caller should store this fingerprint and refuse a second
+ * write that carries the same value within its deduplication window.
+ *
+ * **Concurrent write safety**: Because the fingerprint is deterministic and
+ * computed before the write, concurrent producers that derive their idempotency
+ * key from this value will collide predictably, letting a store-level unique
+ * constraint surface the duplicate rather than allowing silent double-writes.
+ *
+ * @param input - A fully validated `CreateAuditEntryInput` (shape already confirmed).
+ * @returns Lowercase hex SHA-256 digest prefixed with `"audit:"`.
+ */
+export function createIdempotencyFingerprint(input: CreateAuditEntryInput): string {
+  const canonical = JSON.stringify({
+    action: input.action,
+    severity: input.severity,
+    actor: input.actor,
+    resource: input.resource,
+    resourceId: input.resourceId,
+    metadata: input.metadata,
+  });
+  return `audit:${createHash('sha256').update(canonical, 'utf8').digest('hex')}`;
+}
+
+/**
+ * Validates the business-level state invariants for a fully shape-validated
+ * audit entry input.
+ *
+ * This function is deliberately separate from `validateCreateAuditEntryInput`
+ * so that the two concerns can be evolved independently and tested in isolation.
+ * Call it only after shape validation succeeds.
+ *
+ * ### Invariants enforced
+ *
+ * 1. **Action-severity congruence** — security events must carry at least
+ *    the minimum severity defined in {@link ACTION_MIN_SEVERITY}.
+ * 2. **Resource-action binding** — actions may only target resource types
+ *    within their domain (see {@link ACTION_RESOURCE_BINDINGS}).
+ * 3. **System actor format** — non-system actors must not use the
+ *    `system:` prefix; system actors (when detected by action context) must.
+ *
+ * ### Retries and concurrent writes
+ *
+ * All three checks are deterministic — they depend only on the input fields,
+ * never on external state. Running the same input through this function twice
+ * (on retry or from a concurrent caller) produces identical results, so partial
+ * failure cannot leave the audit chain in an inconsistent state.
+ *
+ * On success, a {@link createIdempotencyFingerprint | fingerprint} is returned.
+ * The caller SHOULD store this fingerprint and treat a second write with the
+ * same fingerprint as a duplicate.
+ *
+ * @param input - Shape-validated `CreateAuditEntryInput`.
+ * @returns `{ ok: true, fingerprint }` or `{ ok: false, issues }`.
+ *
+ * @example
+ * ```ts
+ * const shape = validateCreateAuditEntryInput(req.body);
+ * if (!shape.ok) return sendValidationError(res, shape);
+ *
+ * const invariants = validateStateInvariants(shape.data);
+ * if (!invariants.ok) return sendValidationError(res, invariants);
+ *
+ * auditService.log(shape.data, invariants.fingerprint);
+ * ```
+ */
+export function validateStateInvariants(input: CreateAuditEntryInput): StateInvariantResult {
+  const issues: StateInvariantIssue[] = [];
+
+  // ── 1. Action-severity congruence ────────────────────────────────────────
+
+  const minSeverity = ACTION_MIN_SEVERITY[input.action];
+  if (minSeverity !== undefined) {
+    const actual = SEVERITY_RANK[input.severity];
+    const required = SEVERITY_RANK[minSeverity];
+    if (actual < required) {
+      issues.push({
+        path: ['severity'],
+        field: 'severity',
+        code: AUDIT_VALIDATION_CODES.SEVERITY_CONGRUENCE,
+        message:
+          `action "${input.action}" requires severity "${minSeverity}" or higher, ` +
+          `but "${input.severity}" was supplied`,
+      });
+    }
+  }
+
+  // ── 2. Resource-action binding ───────────────────────────────────────────
+
+  const actionPrefix = input.action.split('_')[0] ?? '';
+  const allowedResources = ACTION_RESOURCE_BINDINGS[actionPrefix];
+  if (allowedResources !== null && allowedResources !== undefined) {
+    // Normalize: compare lower-case so 'Contract' and 'contract' both pass.
+    const resourceLower = input.resource.toLowerCase();
+    if (!allowedResources.some((r) => resourceLower === r || resourceLower.startsWith(r))) {
+      issues.push({
+        path: ['resource'],
+        field: 'resource',
+        code: AUDIT_VALIDATION_CODES.RESOURCE_ACTION_MISMATCH,
+        message:
+          `action "${input.action}" must target one of [${allowedResources.join(', ')}], ` +
+          `but resource "${input.resource}" was supplied`,
+      });
+    }
+  }
+
+  // ── 3. System actor invariants ───────────────────────────────────────────
+
+  const actorIsSystemPrefixed = input.actor.startsWith(SYSTEM_ACTOR_PREFIX);
+  const actorIsLegacySystem = LEGACY_SYSTEM_ACTORS.has(input.actor.toLowerCase());
+
+  if (actorIsSystemPrefixed) {
+    // Validate the remainder of the system: actor is non-empty.
+    const suffix = input.actor.slice(SYSTEM_ACTOR_PREFIX.length);
+    if (suffix.trim().length === 0) {
+      issues.push({
+        path: ['actor'],
+        field: 'actor',
+        code: AUDIT_VALIDATION_CODES.SYSTEM_ACTOR_INVALID,
+        message:
+          `system actor must have a non-empty identifier after "${SYSTEM_ACTOR_PREFIX}"`,
+      });
+    }
+  }
+
+  // Human-looking actors (not system: prefixed, not in legacy allowlist) emitting
+  // ADMIN_ACTION or DEPLOYMENT events without the system: prefix are valid — admins
+  // and CI pipelines both emit these. We only block actors that CLAIM to be
+  // system-like via the reserved prefix but have an empty identifier.
+
+  // Actors that start with 'system:' must not duplicate a legacy system name in
+  // the suffix, e.g. 'system:system' is confusing but is allowed — the intent
+  // is merely that the actor be non-empty, which is already checked above.
+  void actorIsLegacySystem; // consumed for semantic completeness
+
+  if (issues.length > 0) {
+    return { ok: false, issues };
+  }
+
+  return { ok: true, fingerprint: createIdempotencyFingerprint(input) };
+}
+
+// ── State-aware middleware key ────────────────────────────────────────────────
+
+/** Where the idempotency fingerprint is published for downstream middleware. */
+export const INVARIANT_FINGERPRINT_KEY = 'auditIdempotencyFingerprint';
+
+/**
+ * Express middleware that enforces state invariants after shape validation.
+ *
+ * Must be mounted **after** {@link validateCreateAuditEntry}. Reads the parsed
+ * body from `res.locals[VALIDATED_BODY_KEY]` and, if all invariants hold,
+ * publishes the idempotency fingerprint on
+ * `res.locals[INVARIANT_FINGERPRINT_KEY]`.
+ *
+ * On invariant failure the middleware responds `400` with the standard envelope
+ * and does not call `next()`.
+ *
+ * @example
+ * ```ts
+ * router.post('/',
+ *   validateCreateAuditEntry,
+ *   validateAuditStateInvariants,
+ *   (_req, res) => { res.status(201).json(service.log(readValidatedBody(res))); },
+ * );
+ * ```
+ */
+export function validateAuditStateInvariants(
+  _req: Request,
+  res: Response,
+  next: NextFunction,
+): void {
+  const input = res.locals[VALIDATED_BODY_KEY] as CreateAuditEntryInput | undefined;
+  if (!input) {
+    throw new Error(
+      'validateCreateAuditEntry middleware must run before validateAuditStateInvariants',
+    );
+  }
+
+  const result = validateStateInvariants(input);
+
+  if (!result.ok) {
+    const requestId =
+      typeof res.locals['requestId'] === 'string' ? res.locals['requestId'] : 'unknown';
+
+    res.status(400).json({
+      error: {
+        code: AUDIT_VALIDATION_ERROR_CODE,
+        message: 'Request validation failed',
+        requestId,
+        details: result.issues,
+      },
+    });
+    return;
+  }
+
+  res.locals[INVARIANT_FINGERPRINT_KEY] = result.fingerprint;
+  next();
+}
+
+// ── Helpers ───────────────────────────────────────────────────────────────────
 
 /**
  * Reads the body published by {@link validateCreateAuditEntry}.

@@ -17,8 +17,14 @@ jest.mock('../utils/webhook-signing.util', () => ({
 describe('Webhook Delivery Tenant Isolation', () => {
   let webhookService: WebhookService;
   let repo: SqliteWebhookSubscriptionRepository;
+  let originalSsrfAllow: string | undefined;
 
   beforeAll(() => {
+    // Save original SSRF setting and disable it for this test suite
+    // to ensure localhost URLs are blocked by SSRF protection
+    originalSsrfAllow = process.env.SSRF_ALLOW_PRIVATE_HOSTS;
+    delete process.env.SSRF_ALLOW_PRIVATE_HOSTS;
+    
     // Force in-memory fresh DB
     getDb(':memory:', { runMigrations: true });
     repo = new SqliteWebhookSubscriptionRepository(getDb());
@@ -26,6 +32,12 @@ describe('Webhook Delivery Tenant Isolation', () => {
   });
 
   afterAll(() => {
+    // Restore original SSRF setting
+    if (originalSsrfAllow === undefined) {
+      delete process.env.SSRF_ALLOW_PRIVATE_HOSTS;
+    } else {
+      process.env.SSRF_ALLOW_PRIVATE_HOSTS = originalSsrfAllow;
+    }
     closeDb();
   });
 
@@ -103,16 +115,22 @@ describe('Webhook Delivery Tenant Isolation', () => {
   });
 
   it('invalid URL: logs failure and does not crash', async () => {
-    await repo.create({
-      tenantId: 'tenant-invalid',
-      eventType: 'event.invalid',
-      url: 'http://localhost/invalid', // SSRF/invalid
-      secret: 'sec',
-    });
+    const prev = process.env.SSRF_ALLOW_PRIVATE_HOSTS;
+    delete process.env.SSRF_ALLOW_PRIVATE_HOSTS;
+    try {
+      await repo.create({
+        tenantId: 'tenant-invalid',
+        eventType: 'event.invalid',
+        url: 'http://localhost/invalid', // SSRF/invalid
+        secret: 'sec',
+      });
 
-    await expect(webhookService.trigger('event.invalid', {}, undefined, 'tenant-invalid')).resolves.toBeUndefined();
-    await new Promise((r) => setTimeout(r, 100));
-    expect(axios.post).not.toHaveBeenCalled();
+      await expect(webhookService.trigger('event.invalid', {}, undefined, 'tenant-invalid')).resolves.toBeUndefined();
+      await new Promise((r) => setTimeout(r, 100));
+      expect(axios.post).not.toHaveBeenCalled();
+    } finally {
+      if (prev !== undefined) process.env.SSRF_ALLOW_PRIVATE_HOSTS = prev;
+    }
   });
 
   it('delivery after deletion: does not deliver if subscription is inactive or deleted', async () => {

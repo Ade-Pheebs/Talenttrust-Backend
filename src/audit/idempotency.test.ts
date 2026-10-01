@@ -1,1 +1,311 @@
-aW1wb3J0IHsgSWRlbXBvdGVuY3lTdG9yZSwgaGFzaElkZW1wb3RlbmN5SW5wdXQgfSBmcm9tICcuL2lkZW1wb3RlbmN5JzsKaW1wb3J0IHR5cGUgeyBDcmVhdGVBdWRpdEVudHJ5SW5wdXQsIEF1ZGl0RW50cnkgfSBmcm9tICcuL3R5cGVzJzsKCmZ1bmN0aW9uIG1ha2VJbnB1dChvdmVycmlkZXM6IFBhcnRpYWw8Q3JlYXRlQXVkaXRFbnRyeUlucHV0PiA9IHt9KTogQ3JlYXRlQXVkaXRFbnRyeUlucHV0IHsKICByZXR1cm4gewogICAgYWN0aW9uOiAnQ09OVFJBQ1RfQ1JFQVRFRCcsCiAgICBzZXZlcml0eTogJ0lORk8nLAogICAgYWN0b3I6ICd1c2VyLWFiYycsCiAgICByZXNvdXJjZTogJ2NvbnRyYWN0JywKICAgIHJlc291cmNlSWQ6ICdjb250cmFjdC0xJywKICAgIG1ldGFkYXRhOiB7IG5vdGU6ICd0ZXN0JyB9LAogICAgLi4ub3ZlcnJpZGVzLAogIH07Cn0KCmZ1bmN0aW9uIG1ha2VFbnRyeShpZDogc3RyaW5nLCBpbnB1dDogQ3JlYXRlQXVkaXRFbnRyeUlucHV0KTogQXVkaXRFbnRyeSB7CiAgcmV0dXJuIE9iamVjdC5mcmVlemUoewogICAgaWQsCiAgICB0aW1lc3RhbXA6IG5ldyBEYXRlKCkudG9JU09TdHJpbmcoKSwKICAgIGFjdGlvbjogaW5wdXQuYWN0aW9uLAogICAgc2V2ZXJpdHk6IGlucHV0LnNldmVyaXR5LAogICAgYWN0b3I6IGlucHV0LmFjdG9yLAogICAgcmVzb3VyY2U6IGlucHV0LnJlc291cmNlLAogICAgcmVzb3VyY2VJZDogaW5wdXQucmVzb3VyY2VJZCwKICAgIG1ldGFkYXRhOiBPYmplY3QuZnJlZXplKHsgLi4uaW5wdXQubWV0YWRhdGEgfSksCiAgICBpcEFkZHJlc3M6IGlucHV0LmlwQWRkcmVzcywKICAgIGNvcnJlbGF0aW9uSWQ6IGlucHV0LmNvcnJlbGF0aW9uSWQsCiAgICBwcmV2aW91c0hhc2g6ICdHRU5FU0lTJywKICAgIGhhc2g6ICdhJy5yZXBlYXQoNjQpLAogIH0pOwp9CgpkZXNjcmliZSgnSWRlbXBvdGVuY3lTdG9yZScsICgpID0+IHsKICBsZXQgc3RvcmU6IElkZW1wb3RlbmN5U3RvcmU7CgogIGJlZm9yZUVhY2goKCkgPT4gewogICAgc3RvcmUgPSBuZXcgSWRlbXBvdGVuY3lTdG9yZSgpOwogIH0pOwoKICBkZXNjcmliZSgnc2V0IC8gZ2V0JywgKCkgPT4gewogICAgaXQoJ3N0b3JlcyBhbmQgcmV0cmlldmVzIGEgcmVjb3JkIGJ5IGtleScsICgpID0+IHsKICAgICAgY29uc3QgaW5wdXQgPSBtYWtlSW5wdXQoKTsKICAgICAgY29uc3QgZW50cnkgPSBtYWtlRW50cnkoJ2VudHJ5LTEnLCBpbnB1dCk7CiAgICAgIHN0b3JlLnNldCgna2V5LTEnLCBpbnB1dCwgZW50cnkpOwoKICAgICAgY29uc3QgcmVjb3JkID0gc3RvcmUuZ2V0KCdrZXktMScpOwogICAgICBleHBlY3QocmVjb3JkKS50b0JlRGVmaW5lZCgpOwogICAgICBleHBlY3QocmVjb3JkIS5yZXNwb25zZS5pZCkudG9CZSgnZW50cnktMScpOwogICAgfSk7CgogICAgaXQoJ3JldHVybnMgdW5kZWZpbmVkIGZvciBhIG5vbi1leGlzdGVudCBrZXknLCAoKSA9PiB7CiAgICAgIGV4cGVjdChzdG9yZS5nZXQoJ25vbi1leGlzdGVudCcpKS50b0JlVW5kZWZpbmVkKCk7CiAgICB9KTsKCiAgICBpdCgncmV0dXJucyB1bmRlZmluZWQgYWZ0ZXIgYSBrZXkgaXMgZGVsZXRlZCcsICgpID0+IHsKICAgICAgY29uc3QgaW5wdXQgPSBtYWtlSW5wdXQoKTsKICAgICAgY29uc3QgZW50cnkgPSBtYWtlRW50cnkoJ2VudHJ5LTEnLCBpbnB1dCk7CiAgICAgIHN0b3JlLnNldCgna2V5LTEnLCBpbnB1dCwgZW50cnkpOwogICAgICBzdG9yZS5kZWxldGUoJ2tleS0xJyk7CgogICAgICBleHBlY3Qoc3RvcmUuZ2V0KCdrZXktMScpKS50b0JlVW5kZWZpbmVkKCk7CiAgICB9KTsKCiAgICBpdCgnc3RvcmVzIG11bHRpcGxlIGtleXMgaW5kZXBlbmRlbnRseScsICgpID0+IHsKICAgICAgY29uc3QgaW5wdXQxID0gbWFrZUlucHV0KHsgYWN0b3I6ICdhbGljZScgfSk7CiAgICAgIGNvbnN0IGlucHV0MiA9IG1ha2VJbnB1dCh7IGFjdG9yOiAnYm9iJyB9KTsKICAgICAgY29uc3QgZW50cnkxID0gbWFrZUVudHJ5KCdlbnRyeS0xJywgaW5wdXQxKTsKICAgICAgY29uc3QgZW50cnkyID0gbWFrZUVudHJ5KCdlbnRyeS0yJywgaW5wdXQyKTsKCiAgICAgIHN0b3JlLnNldCgna2V5LTEnLCBpbnB1dDEsIGVudHJ5MSk7CiAgICAgIHN0b3JlLnNldCgna2V5LTInLCBpbnB1dDIsIGVudHJ5Mik7CgogICAgICBleHBlY3Qoc3RvcmUuZ2V0KCdrZXktMScpIS5yZXNwb25zZS5hY3RvcikudG9CZSgnYWxpY2UnKTsKICAgICAgZXhwZWN0KHN0b3JlLmdldCgna2V5LTInKSEucmVzcG9uc2UuYWN0b3IpLnRvQmUoJ2JvYicpOwogICAgfSk7CgogICAgaXQoJ292ZXJ3cml0ZXMgYW4gZXhpc3Rpbmcga2V5IG9uIHJlLXNldCcsICgpID0+IHsKICAgICAgY29uc3QgaW5wdXQxID0gbWFrZUlucHV0KHsgYWN0b3I6ICdhbGljZScgfSk7CiAgICAgIGNvbnN0IGlucHV0MiA9IG1ha2VJbnB1dCh7IGFjdG9yOiAnYm9iJyB9KTsKICAgICAgY29uc3QgZW50cnkxID0gbWFrZUVudHJ5KCdlbnRyeS0xJywgaW5wdXQxKTsKICAgICAgY29uc3QgZW50cnkyID0gbWFrZUVudHJ5KCdlbnRyeS0yJywgaW5wdXQyKTsKCiAgICAgIHN0b3JlLnNldCgna2V5LTEnLCBpbnB1dDEsIGVudHJ5MSk7CiAgICAgIHN0b3JlLnNldCgna2V5LTEnLCBpbnB1dDIsIGVudHJ5Mik7CgogICAgICBleHBlY3Qoc3RvcmUuZ2V0KCdrZXktMScpIS5yZXNwb25zZS5hY3RvcikudG9CZSgnYm9iJyk7CiAgICB9KTsKICB9KTsKCiAgZGVzY3JpYmUoJ2JvZHkgaGFzaCcsICgpID0+IHsKICAgIGl0KCdzYW1lIGlucHV0IHByb2R1Y2VzIHNhbWUgaGFzaCcsICgpID0+IHsKICAgICAgY29uc3QgaW5wdXQxID0gbWFrZUlucHV0KCk7CiAgICAgIGNvbnN0IGlucHV0MiA9IG1ha2VJbnB1dCgpOwogICAgICBleHBlY3QoaGFzaElkZW1wb3RlbmN5SW5wdXQoaW5wdXQxKSkudG9CZShoYXNoSWRlbXBvdGVuY3lJbnB1dChpbnB1dDIpKTsKICAgIH0pOwoKICAgIGl0KCdkaWZmZXJlbnQgaW5wdXQgcHJvZHVjZXMgZGlmZmVyZW50IGhhc2gnLCAoKSA9PiB7CiAgICAgIGNvbnN0IGlucHV0MSA9IG1ha2VJbnB1dCh7IGFjdG9yOiAnYWxpY2UnIH0pOwogICAgICBjb25zdCBpbnB1dDIgPSBtYWtlSW5wdXQoeyBhY3RvcjogJ2JvYicgfSk7CiAgICAgIGV4cGVjdChoYXNoSWRlbXBvdGVuY3lJbnB1dChpbnB1dDEpKS5ub3QudG9CZShoYXNoSWRlbXBvdGVuY3lJbnB1dChpbnB1dDIpKTsKICAgIH0pOwoKICAgIGl0KCdoYXNoIGlzIGRldGVybWluaXN0aWMgcmVnYXJkbGVzcyBvZiBpcEFkZHJlc3MvY29ycmVsYXRpb25JZCcsICgpID0+IHsKICAgICAgY29uc3QgaW5wdXQxID0gbWFrZUlucHV0KHsgaXBBZGRyZXNzOiAnMS4yLjMuNCcsIGNvcnJlbGF0aW9uSWQ6ICdjb3JyLTEnIH0pOwogICAgICBjb25zdCBpbnB1dDIgPSBtYWtlSW5wdXQoeyBpcEFkZHJlc3M6ICc1LjYuNy44JywgY29ycmVsYXRpb25JZDogJ2NvcnItMicgfSk7CiAgICAgIGV4cGVjdChoYXNoSWRlbXBvdGVuY3lJbnB1dChpbnB1dDEpKS50b0JlKGhhc2hJZGVtcG90ZW5jeUlucHV0KGlucHV0MikpOwogICAgfSk7CiAgfSk7CgogIGRlc2NyaWJlKCdUVEwgZXhwaXJ5JywgKCkgPT4gewogICAgaXQoJ2V4cGlyZXMgZW50cmllcyBhZnRlciBUVEwnLCBhc3luYyAoKSA9PiB7CiAgICAgIGNvbnN0IHN0b3JlID0gbmV3IElkZW1wb3RlbmN5U3RvcmUoeyB0dGxNczogMTAsIG1heFNpemU6IDEwMCB9KTsKICAgICAgY29uc3QgaW5wdXQgPSBtYWtlSW5wdXQoKTsKICAgICAgY29uc3QgZW50cnkgPSBtYWtlRW50cnkoJ2VudHJ5LTEnLCBpbnB1dCk7CiAgICAgIHN0b3JlLnNldCgna2V5LTEnLCBpbnB1dCwgZW50cnkpOwoKICAgICAgZXhwZWN0KHN0b3JlLmdldCgna2V5LTEnKSkudG9CZU RlZmluZWQoKTsKCiAgICAgIGF3YWl0IG5ldyBQcm9taXNlKChyZXNvbHZlKSA9PiBzZXRUaW1lb3V0KHJlc29sdmUsIDIwKSk7CgogICAgICBleHBlY3Qoc3RvcmUuZ2V0KCdrZXktMScpKS50b0JlVW5kZWZpbmVkKCk7CiAgICB9KTsKCiAgICBpdCgnc2l6ZSgpIGV4Y2x1ZGVzIGV4cGlyZWQgZW50cmllcycsIGFzeW5jICgpID0+IHsKICAgICAgY29uc3Qgc3RvcmUgPSBuZXcgSWRlbXBvdGVuY3lTdG9yZSh7IHR0bE1zOiAxMCwgbWF4U2l6ZTogMTAwIH0pOwogICAgICBzdG9yZS5zZXQoJ2tleS0xJywgbWFrZUlucHV0KCksIG1ha2VFbnRyeSgnZTEnLCBtYWtlSW5wdXQoKSkpOwoKICAgICAgYXdhaXQgbmV3IFByb21pc2UoKHJlc29sdmUpID0+IHNldFRpbWVvdXQocmVzb2x2ZSwgMjApKTsKCiAgICAgIGV4cGVjdChzdG9yZS5zaXplKCkpLnRvQmUoMCk7CiAgICB9KTsKCiAgICBpdCgncmV0YWlucyBlbnRyaWVzIHdpdGhpbiBUVEwnLCAoKSA9PiB7CiAgICAgIGNvbnN0IHN0b3JlID0gbmV3IElkZW1wb3RlbmN5U3RvcmUoeyB0dGxNczogNjBfMDAwLCBtYXhTaXplOiAxMDAgfSk7CiAgICAgIHN0b3JlLnNldCgna2V5LTEnLCBtYWtlSW5wdXQoKSwgbWFrZUVudHJ5KCdlMScsIG1ha2VJbnB1dCgpKSk7CiAgICAgIGV4cGVjdChzdG9yZS5zaXplKCkpLnRvQmUoMSk7CiAgICB9KTsKICB9KTsKCiAgZGVzY3JpYmUoJ2JvdW5kZWQgc2l6ZScsICgpID0+IHsKICAgIGl0KCdldmljdHMgb2xkZXN0IGVudHJ5IHdoZW4gYXQgbWF4IGNhcGFjaXR5JywgKCkgPT4gewogICAgICBjb25zdCBzdG9yZSA9IG5ldyBJZGVtcG90ZW5jeVN0b3JlKHsgbWF4U2l6ZTogMiwgdHRsTXM6IDYwXzAwMCB9KTsKICAgICAgY29uc3QgaW5wdXQgPSBtYWtlSW5wdXQoKTsKCiAgICAgIHN0b3JlLnNldCgna2V5LTEnLCBpbnB1dCwgbWFrZUVudHJ5KCdlMScsIGlucHV0KSk7CiAgICAgIHN0b3JlLnNldCgna2V5LTInLCBpbnB1dCwgbWFrZUVudHJ5KCdlMicsIGlucHV0KSk7CiAgICAgIHN0b3JlLnNldCgna2V5LTMnLCBpbnB1dCwgbWFrZUVudHJ5KCdlMycsIGlucHV0KSk7CgogICAgICBleHBlY3Qoc3RvcmUuZ2V0KCdrZXktMScpKS50b0JlVW5kZWZpbmVkKCk7CiAgICAgIGV4cGVjdChzdG9yZS5nZXQoJ2tleS0yJykpLnRvQmVEZWZpbmVkKCk7CiAgICAgIGV4cGVjdChzdG9yZS5nZXQoJ2tleS0zJykpLnRvQmVEZWZpbmVkKCk7CiAgICAgIGV4cGVjdChzdG9yZS5zaXplKCkpLnRvQmUoMik7CiAgICB9KTsKICB9KTsKCiAgZGVzY3JpYmUoJ2NsZWFyJywgKCkgPT4gewogICAgaXQoJ3JlbW92ZXMgYWxsIGtleXMnLCAoKSA9PiB7CiAgICAgIHN0b3JlLnNldCgna2V5LTEnLCBtYWtlSW5wdXQoKSwgbWFrZUVudHJ5KCdlMScsIG1ha2VJbnB1dCgpKSk7CiAgICAgIHN0b3JlLnNldCgna2V5LTInLCBtYWtlSW5wdXQoKSwgbWFrZUVudHJ5KCdlMicsIG1ha2VJbnB1dCgpKSk7CgogICAgICBzdG9yZS5jbGVhcigpOwoKICAgICAgZXhwZWN0KHN0b3JlLnNpemUoKSkudG9CZSgwKTsKICAgICAgZXhwZWN0KHN0b3JlLmdldCgna2V5LTEnKSkudG9CZVVuZGVmaW5lZCgpOwogICAgICBleHBlY3Qoc3RvcmUuZ2V0KCdrZXktMicpKS50b0JlVW5kZWZpbmVkKCk7CiAgICB9KTsKICB9KTsKCiAgZGVzY3JpYmUoJ2NsYWltIC8gY29tbWl0IC8gcmVsZWFzZScsICgpID0+IHsKICAgIGl0KCdjbGFpbXMgYSBmcmVzaCBrZXkgYXMgaW4tZmxpZ2h0JywgKCkgPT4gewogICAgICBjb25zdCByZXN1bHQgPSBzdG9yZS5jbGFpbSgna2V5LTEnLCBtYWtlSW5wdXQoKSk7CiAgICAgIGV4cGVjdChyZXN1bHQuc3RhdHVzKS50b0JlKCdpbi1mbGlnaHQnKTsKICAgICAgZXhwZWN0KHN0b3JlLmlzSW5GbGlnaHQoJ2tleS0xJykpLnRvQmUodHJ1ZSk7CiAgICB9KTsKCiAgICBpdCgncmV0dXJucyBoaXQgd2hlbiB0aGUgc2FtZSBib2R5IGlzIGNvbW1pdHRlZCcsICgpID0+IHsKICAgICAgY29uc3QgaW5wdXQgPSBtYWtlSW5wdXQoKTsKICAgICAgc3RvcmUuY2xhaW0oJ2tleS0xJywgaW5wdXQpOwogICAgICBzdG9yZS5jb21taXQoJ2tleS0xJywgaW5wdXQsIG1ha2VFbnRyeSgnZW50cnktMScsIGlucHV0KSk7CgogICAgICBjb25zdCByZXN1bHQgPSBzdG9yZS5jbGFpbSgna2V5LTEnLCBtYWtlSW5wdXQoKSk7CiAgICAgIGV4cGVjdChyZXN1bHQuc3RhdHVzKS50b0JlKCdoaXQnKTsKICAgICAgaWYgKHJlc3VsdC5zdGF0dXMgPT09ICdoaXQnKSB7CiAgICAgICAgZXhwZWN0KHJlc3VsdC5yZWNvcmQucmVzcG9uc2UuaWQpLnRvQmUoJ2VudHJ5LTEnKTsKICAgICAgfQogICAgfSk7CgogICAgaXQoJ3JldHVybnMgY29uZmxpY3Qgd2hlbiB0aGUgc2FtZSBrZXkgaXMgY29tbWl0dGVkIHdpdGggYSBkaWZmZXJlbnQgYm9keScsICgpID0+IHsKICAgICAgY29uc3QgaW5wdXQgPSBtYWtlSW5wdXQoKTsKICAgICAgc3RvcmUuY2xhaW0oJ2tleS0xJywgaW5wdXQpOwogICAgICBzdG9yZS5jb21taXQoJ2tleS0xJywgaW5wdXQsIG1ha2VFbnRyeSgnZW50cnktMScsIGlucHV0KSk7CgogICAgICBjb25zdCByZXN1bHQgPSBzdG9yZS5jbGFpbSgna2V5LTEnLCBtYWtlSW5wdXQoeyBhY3RvcjogJ2RpZmZlcmVudCcgfSkpOwogICAgICBleHBlY3QocmVzdWx0LnN0YXR1cykudG9CZSgnY29uZmxpY3QnKTsKICAgIH0pOwoKICAgIGl0KCdyZXR1cm5zIGluLWZsaWdodCBmb3IgYSBjb25jdXJyZW50IGR1cGxpY2F0ZSBvZiB0aGUgc2FtZSBib2R5JywgKCkgPT4gewogICAgICBjb25zdCBpbnB1dCA9IG1ha2VJbnB1dCgpOwogICAgICBjb25zdCBmaXJzdCA9IHN0b3JlLmNsYWltKCdrZXktMScsIGlucHV0KTsKICAgICAgZXhwZWN0KGZpcnN0LnN0YXR1cykudG9CZSgnaW4tZmxpZ2h0Jyk7CgogICAgICBjb25zdCBzZWNvbmQgPSBzdG9yZS5jbGFpbSgna2V5LTEnLCBtYWtlSW5wdXQoKSk7CiAgICAgIGV4cGVjdChzZWNvbmQuc3RhdHVzKS50b0JlKCdpbi1mbGlnaHQnKTsKICAgIH0pOwoKICAgIGl0KCdyZXR1cm5zIGNvbmZsaWN0IGZvciBhIGNvbmN1cnJlbnQgZGlmZmVyZW50IGJvZHknLCAoKSA9PiB7CiAgICAgIGNvbnN0IGlucHV0ID0gbWFrZUlucHV0KCk7CiAgICAgIHN0b3JlLmNsYWltKCdrZXktMScsIGlucHV0KTsKCiAgICAgIGNvbnN0IHNlY29uZCA9IHN0b3JlLmNsYWltKCdrZXktMScsIG1ha2VJbnB1dCh7IGFjdG9yOiAnZGlmZmVyZW50JyB9KSk7CiAgICAgIGV4cGVjdChzZWNvbmQuc3RhdHVzKS50b0JlKCdjb25mbGljdCcpOwogICAgfSk7CgogICAgaXQoJ3JlbGVhc2UgYWxsb3dzIGEgZmFpbGVkIGNsYWltIHRvIGJlIHJldHJpZWQnLCAoKSA9PiB7CiAgICAgIGNvbnN0IGlucHV0ID0gbWFrZUlucHV0KCk7CiAgICAgIHN0b3JlLmNsYWltKCdrZXktMScsIGlucHV0KTsKICAgICAgc3RvcmUucmVsZWFzZSgna2V5LTEnKTsKCiAgICAgIGV4cGVjdChzdG9yZS5pc0luRmxpZ2h0KCdrZXktMScpKS50b0JlKGZhbHNlKTsKICAgICAgY29uc3QgcmV0cnkgPSBzdG9yZS5jbGFpbSgna2V5LTEnLCBpbnB1dCk7CiAgICAgIGV4cGVjdChyZXRyeS5zdGF0dXMpLnRvQmUoJ2luLWZsaWdodCcpOwogICAgfSk7CgogICAgaXQoJ2NvbW1pdCBjbGVhcnMgdGhlIGluLWZsaWdodCBtYXJrZXInLCAoKSA9PiB7CiAgICAgIGNvbnN0IGlucHV0ID0gbWFrZUlucHV0KCk7CiAgICAgIHN0b3JlLmNsYWltKCdrZXktMScsIGlucHV0KTsKICAgICAgc3RvcmUuY29tbWl0KCdrZXktMScsIGlucHV0LCBtYWtlRW50cnkoJ2VudHJ5LTEnLCBpbnB1dCkpOwoKICAgICAgZXhwZWN0KHN0b3JlLmlzSW5GbGlnaHQoJ2tleS0xJykpLnRvQmUoZmFsc2UpOwogICAgfSk7CgogICAgaXQoJ2RlbGV0ZSByZW1vdmVzIGJvdGggY29tbWl0dGVkIGFuZCBpbi1mbGlnaHQgc3RhdGUnLCAoKSA9PiB7CiAgICAgIGNvbnN0IGlucHV0ID0gbWFrZUlucHV0KCk7CiAgICAgIHN0b3JlLmNsYWltKCdrZXktMScsIGlucHV0KTsKICAgICAgc3RvcmUuZGVsZXRlKCdrZXktMScpOwoKICAgICAgZXhwZWN0KHN0b3JlLmlzSW5GbGlnaHQoJ2tleS0xJykpLnRvQmUoZmFsc2UpOwogICAgICBleHBlY3Qoc3RvcmUuZ2V0KCdrZXktMScpKS50b0JlVW5kZWZpbmVkKCk7CiAgICB9KTsKCiAgICBpdCgnY2xlYXIgcmVzZXRzIGluLWZsaWdodCBjbGFpbXMnLCAoKSA9PiB7CiAgICAgIHN0b3JlLmNsYWltKCdrZXktMScsIG1ha2VJbnB1dCgpKTsKICAgICAgc3RvcmUuY2xlYXIoKTsKICAgICAgZXhwZWN0KHN0b3JlLmlzSW5GbGlnaHQoJ2tleS0xJykpLnRvQmUoZmFsc2UpOwogICAgfSk7CiAgfSk7CgogIGRlc2NyaWJlKCdjb25jdXJyZW5jeScsICgpID0+IHsKICAgIGl0KCd0d28gaW50ZXJsZWF2ZWQgY2xhaW1zIGZvciB0aGUgc2FtZSBrZXkgb25seSBsZXQgb25lIG93bmVyIHRocm91Z2gnLCAoKSA9PiB7CiAgICAgIGNvbnN0IGlucHV0ID0gbWFrZUlucHV0KCk7CiAgICAgIGNvbnN0IGEgPSBzdG9yZS5jbGFpbSgna2V5LTEnLCBpbnB1dCk7CiAgICAgIGNvbnN0IGIgPSBzdG9yZS5jbGFpbSgna2V5LTEnLCBpbnB1dCk7CgogICAgICBleHBlY3QoYS5zdGF0dXMpLnRvQmUoJ2luLWZsaWdodCcpOwogICAgICBleHBlY3QoYi5zdGF0dXMpLnRvQmUoJ2luLWZsaWdodCcpOwogICAgICAvLyBPbmx5IG9uZSBjb21taXQgd2lsbCBzdWNjZWVkIGluIHByb2R1Y3Rpb247IHRoZSBzdG9yZSBpdHNlbGYgZG9lcwogICAgICAvLyBub3QgYXR0ZW1wdCB0byBjb21taXQgZm9yIHRoZSBzZWNvbmQgY2xhaW1lci4KICAgICAgZXhwZWN0KHN0b3JlLmlzSW5GbGlnaHQoJ2tleS0xJykpLnRvQmUodHJ1ZSk7CiAgICB9KTsKCiAgICBpdCgnY29tbWl0IGFmdGVyIGEgY29uY3VycmVudCBjbGFpbSBpcyBvYnNlcnZhYmxlIGFzIGEgaGl0JywgKCkgPT4gewogICAgICBjb25zdCBpbnB1dCA9IG1ha2VJbnB1dCgpOwogICAgICBzdG9yZS5jbGFpbSgna2V5LTEnLCBpbnB1dCk7CiAgICAgIHN0b3JlLmNsYWltKCdrZXktMScsIGlucHV0KTsKICAgICAgc3RvcmUuY29tbWl0KCdrZXktMScsIGlucHV0LCBtYWtlRW50cnkoJ2VudHJ5LTEnLCBpbnB1dCkpOwoKICAgICAgY29uc3QgcmVzdWx0ID0gc3RvcmUuY2xhaW0oJ2tleS0xJywgaW5wdXQpOwogICAgICBleHBlY3QocmVzdWx0LnN0YXR1cykudG9CZSgnaGl0Jyk7CiAgICB9KTsKCiAgICBpdCgncmVsZWFzZSBhZnRlciBhIGNvbmN1cnJlbnQgY2xhaW0gYWxsb3dzIGEgbGF0ZXIgcmV0cnknLCAoKSA9PiB7CiAgICAgIGNvbnN0IGlucHV0ID0gbWFrZUlucHV0KCk7CiAgICAgIHN0b3JlLmNsYWltKCdrZXktMScsIGlucHV0KTsKICAgICAgc3RvcmUuY2xhaW0oJ2tleS0xJywgaW5wdXQpOwogICAgICBzdG9yZS5yZWxlYXNlKCdrZXktMScpOwoKICAgICAgZXhwZWN0KHN0b3JlLmlzSW5GbGlnaHQoJ2tleS0xJykpLnRvQmUoZmFsc2UpOwogICAgICBjb25zdCByZXRyeSA9IHN0b3JlLmNsYWltKCdrZXktMScsIGlucHV0KTsKICAgICAgZXhwZWN0KHJldHJ5LnN0YXR1cykudG9CZSgnaW4tZmxpZ2h0Jyk7CiAgICB9KTsKICB9KTsKfSk7Cg==
+import { IdempotencyStore, hashIdempotencyInput } from './idempotency';
+import type { CreateAuditEntryInput, AuditEntry } from './types';
+
+function makeInput(overrides: Partial<CreateAuditEntryInput> = {}): CreateAuditEntryInput {
+  return {
+    action: 'CONTRACT_CREATED',
+    severity: 'INFO',
+    actor: 'user-abc',
+    resource: 'contract',
+    resourceId: 'contract-1',
+    metadata: { note: 'test' },
+    ...overrides,
+  };
+}
+
+function makeEntry(id: string, input: CreateAuditEntryInput): AuditEntry {
+  return Object.freeze({
+    id,
+    timestamp: new Date().toISOString(),
+    action: input.action,
+    severity: input.severity,
+    actor: input.actor,
+    resource: input.resource,
+    resourceId: input.resourceId,
+    metadata: Object.freeze({ ...input.metadata }),
+    ipAddress: input.ipAddress,
+    correlationId: input.correlationId,
+    previousHash: 'GENESIS',
+    hash: 'a'.repeat(64),
+  });
+}
+
+describe('IdempotencyStore', () => {
+  let store: IdempotencyStore;
+
+  beforeEach(() => {
+    store = new IdempotencyStore();
+  });
+
+  describe('set / get', () => {
+    it('stores and retrieves a record by key', () => {
+      const input = makeInput();
+      const entry = makeEntry('entry-1', input);
+      store.set('key-1', input, entry);
+
+      const record = store.get('key-1');
+      expect(record).toBeDefined();
+      expect(record!.response.id).toBe('entry-1');
+    });
+
+    it('returns undefined for a non-existent key', () => {
+      expect(store.get('non-existent')).toBeUndefined();
+    });
+
+    it('returns undefined after a key is deleted', () => {
+      const input = makeInput();
+      const entry = makeEntry('entry-1', input);
+      store.set('key-1', input, entry);
+      store.delete('key-1');
+
+      expect(store.get('key-1')).toBeUndefined();
+    });
+
+    it('stores multiple keys independently', () => {
+      const input1 = makeInput({ actor: 'alice' });
+      const input2 = makeInput({ actor: 'bob' });
+      const entry1 = makeEntry('entry-1', input1);
+      const entry2 = makeEntry('entry-2', input2);
+
+      store.set('key-1', input1, entry1);
+      store.set('key-2', input2, entry2);
+
+      expect(store.get('key-1')!.response.actor).toBe('alice');
+      expect(store.get('key-2')!.response.actor).toBe('bob');
+    });
+
+    it('overwrites an existing key on re-set', () => {
+      const input1 = makeInput({ actor: 'alice' });
+      const input2 = makeInput({ actor: 'bob' });
+      const entry1 = makeEntry('entry-1', input1);
+      const entry2 = makeEntry('entry-2', input2);
+
+      store.set('key-1', input1, entry1);
+      store.set('key-1', input2, entry2);
+
+      expect(store.get('key-1')!.response.actor).toBe('bob');
+    });
+
+    it('throws on an empty key', () => {
+      expect(() => store.get('')).toThrow(TypeError);
+      expect(() => store.set('', makeInput(), makeEntry('e1', makeInput()))).toThrow(TypeError);
+    });
+  });
+
+  describe('body hash', () => {
+    it('same input produces same hash', () => {
+      const input1 = makeInput();
+      const input2 = makeInput();
+      expect(hashIdempotencyInput(input1)).toBe(hashIdempotencyInput(input2));
+    });
+
+    it('different input produces different hash', () => {
+      const input1 = makeInput({ actor: 'alice' });
+      const input2 = makeInput({ actor: 'bob' });
+      expect(hashIdempotencyInput(input1)).not.toBe(hashIdempotencyInput(input2));
+    });
+
+    it('hash is deterministic regardless of ipAddress/correlationId', () => {
+      const input1 = makeInput({ ipAddress: '1.2.3.4', correlationId: 'corr-1' });
+      const input2 = makeInput({ ipAddress: '5.6.7.8', correlationId: 'corr-2' });
+      expect(hashIdempotencyInput(input1)).toBe(hashIdempotencyInput(input2));
+    });
+
+    it('hash is independent of metadata key insertion order', () => {
+      const input1 = makeInput({\n        metadata: { b: 2, a: 1, c: { y: true, x: false } },
+      });
+      const input2 = makeInput({
+        metadata: { c: { x: false, y: true }, a: 1, b: 2 },
+      });
+      expect(hashIdempotencyInput(input1)).toBe(hashIdempotencyInput(input2));
+    });
+
+    it('distinguishes array order in metadata', () => {
+      const input1 = makeInput({ metadata: { items: [1, 2, 3] } });
+      const input2 = makeInput({ metadata: { items: [3, 2, 1] } });
+      expect(hashIdempotencyInput(input1)).not.toBe(hashIdempotencyInput(input2));
+    });
+
+    it('handles empty metadata deterministically', () => {
+      const input1 = makeInput({ metadata: {} });
+      const input2 = makeInput();
+      expect(hashIdempotencyInput(input1)).toBe(hashIdempotencyInput(input2));
+    });
+  });
+
+  describe('resolve', () => {
+    it('returns miss when the key is absent', () => {
+      expect(store.resolve('key-1', makeInput())).toEqual({ kind: 'miss' });
+    });
+
+    it('returns replay for a matching body hash', () => {
+      const input = makeInput();
+      store.set('key-1', input, makeEntry('e1', input));
+
+      const outcome = store.resolve('key-1', makeInput());
+      expect(outcome.kind).toBe('replay');
+      if (outcome.kind === 'replay') {
+        expect(outcome.record.response.id).toBe('e1');
+      }
+    });
+
+    it('returns conflict for a different body hash', () => {
+      const input = makeInput();
+      store.set('key-1', input, makeEntry('e1', input));
+
+      const outcome = store.resolve('key-1', makeInput({ actor: 'other' }));
+      expect(outcome.kind).toBe('conflict');
+      if (outcome.kind === 'conflict') {
+        expect(outcome.existingBodyHash).toBe(outcome.incomingBodyHash);
+        expect(outcome.existingBodyHash).not.toBe(hashIdempotencyInput(makeInput()));
+      }
+    });
+
+    it('returns miss after the existing record expires', async () => {
+      const ttlStore = new IdempotencyStore({ ttlMs: 10, maxSize: 100 });
+      const input = makeInput();
+      ttlStore.set('key-1', input, makeEntry('e1', input));
+
+      await new Promise((resolve) => setTimeout(resolve, 20));
+
+      expect(ttlStore.resolve('key-1', input)).toEqual({ kind: 'miss' });
+    });
+  });
+
+  describe('setIfAbsent', () => {
+    it('writes when the key is free', () => {
+      const input = makeInput();
+      const result = store.setIfAbsent('key-1', input, makeEntry('e1', input));
+
+      expect(result.written).toBe((true));
+      expect(result.existing).toBe(false);
+      expect(result.record.response.id).toBe('e1');
+    });
+
+    it('does not overwrite an existing live record', () => {
+      const input = makeInput();
+      store.set('key-1', input, makeEntry('e1', input));
+
+      const result = store.setIfAbsent(
+        'key-1',
+        makeInput({ actor: 'other' }),
+        makeEntry('e2', makeInput({ actor: 'other' })),
+      );
+
+      expect(result.written).toBe(false);
+      expect(result.existing).toBe((true));
+      expect(result.record.response.id).toBe('e1');
+      expect(store.get('key-1')!.response.id).toBe('e1');
+    });
+
+    it('replaces an expired record', async () => {
+      const ttlStore = new IdempotencyStore({ ttlMs: 10, maxSize: 100 });
+      const input = makeInput();
+      ttlStore.set('key-1', input, makeEntry('e1', input));
+
+      await new Promise((resolve) => setTimeout(resolve, 20));
+
+      const result = ttlStore.setIfAbsent('key-1', input, makeEntry('e2', input));
+      expect(result.written).toBe((true));
+      expect(result.record.response.id).toBe('e2');
+    });
+
+    it('preserves the first write under concurrent setIfAbsent calls', () => {
+      const input = makeInput();
+      const first = store.setIfAbsent('key-1', input, makeEntry('e1', input));
+      const second = store.setIfAbsent('key-1', input, makeEntry('e2', input));
+
+      expect(first.written).toBe((true));
+      expect(second.written).toBe(false);
+      expect(store.get('key-1')!.response.id).toBe('e1');
+    });
+  });
+
+  describe('TTL expiry', () => {
+    it('expires entries after TTL', async () => {
+      const ttlStore = new IdempotencyStore({ ttlMs: 10, maxSize: 100 });
+      const input = makeInput();
+      const entry = makeEntry('entry-1', input);
+      ttlStore.set('key-1', input, entry);
+
+      expect(ttlStore.get('key-1')).toBeDefined();
+
+      await new Promise((resolve) => setTimeout(resolve, 20));
+
+      expect(ttlStore.get('key-1')).toBeUndefined();
+    });
+
+    it('size() excludes expired entries', async () => {
+      const ttlStore = new IdempotencyStore({ ttlMs: 10, maxSize: 100 });
+      ttlStore.set('key-1', makeInput(), makeEntry('e1', makeInput()));
+
+      await new Promise((resolve) => setTimeout(resolve, 20));
+
+      expect(ttlStore.size()).toBe(0);
+    });
+
+    it('retains entries within TTL', () => {
+      const ttlStore = new IdempotencyStore({ ttlMs: 60_000, maxSize: 100 });
+      ttlStore.set('key-1', makeInput(), makeEntry('e1', makeInput()));
+      expect(ttlStore.size()).toBe(1);
+    });
+  });
+
+  describe('bounded size', () => {
+    it('evicts oldest entry when at max capacity', () => {
+      const bounded = new IdempotencyStore({ maxSize: 2, ttlMs: 60_000 });
+      const input = makeInput();
+
+      bounded.set('key-1', input, makeEntry('e1', input));
+      bounded.set('key-2', input, makeEntry('e2', input));
+      bounded.set('key-3', input, makeEntry('e3', input));
+
+      expect(bounded.get('key-1')).toBeUndefined();
+      expect(bounded.get('key-2')).toBeDefined();
+      expect(bounded.get('key-3')).toBeDefined();
+      expect(bounded.size()).toBe(2);
+    });
+
+    it('replacing an existing key does not evict another entry', () => {
+      const bounded = new IdempotencyStore({ maxSize: 2, ttlMs: 60_000 });
+      const input = makeInput();
+
+      bounded.set('key-1', input, makeEntry('e1', input));
+      bounded.set('key-2', input, makeEntry('e2', input));
+      bounded.set('key-2', input, makeEntry('e2-updated', input));
+
+      expect(bounded.get('key-1')).toBeDefined();
+      expect(bounded.get('key-2')!.response.id).toBe('e2-updated');
+      expect(bounded.size()).toBe(2);
+    });
+  });
+
+  describe('constructor validation', () => {
+    it('rejects a non-positive maxSize', () => {
+      expect(() => new IdempotencyStore({ maxSize: 0 })).toThrow(RangeError);
+      expect(() => new IdempotencyStore({ maxSize: -1 })).toThrow(RangeError);
+    });
+
+    it('rejects a negative ttlMs', () => {
+      expect(() => new IdempotencyStore({ ttlMs: -1 })).toThrow(RangeError);
+    });
+
+    it('accepts a zero TTL store', () => {
+      const zeroTtl = new IdempotencyStore({ ttlMs: 0 });
+      expect(zeroTtl.get('key-1')).toBeUndefined();
+    });
+  });
+
+  describe('clear', () => {
+    it('removes all keys', () => {
+      store.set('key-1', makeInput(), makeEntry('e1', makeInput()));
+      store.set('key-2', makeInput(), makeEntry('e2', makeInput()));
+
+      store.clear();
+
+      expect(store.size()).toBe(0);
+      expect(store.get('key-1')).toBeUndefined();
+      expect(store.get('key-2')).toBeUndefined();
+    });
+  });
+});

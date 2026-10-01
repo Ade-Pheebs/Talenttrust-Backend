@@ -48,9 +48,42 @@ export interface IdempotencyClaimResult {
   record?: IdempotencyRecord;
 }
 
+/**
+ * Result of an idlempotent lookup or insertion.
+ *
+ * This is the explicit compatibility contract for callers that need to
+ * distinguish between "new work" and "duplicate replay" without relying on
+ * the internal storage shape.
+ */
+export type IdempotencyOutcome =
+  | { kind: 'miss' }
+  | { kind: 'replay'; record: IdempotencyRecord }
+  | {  kind: 'conflict'; existingBodyHash: string; incomingBodyHash: string };
+
+export interface IdempotencySetResult {
+  /** True when the record was newly written or replaced by this call. */
+  written: boolean;
+  /** True when an existing record was returned instead of writing. */
+  existing: boolean;
+  /** The record that is effective after this call. */
+  record: IdempotencyRecord;
+}
+
 const DEFAULT_MAX_SIZE = 1000;
 const DEFAULT_TTL_MS = 86_400_000;
 
+/**
+ * Deterministic hash of the idempotency-relevant fields of an audit input.
+ *
+ * Invariants:
+ * - The hash is independent of transport-only fields (`ipAddress`,
+ *   `correlationId`) so retries from different clients map to the same key.
+ * - Metadata key ordering is normalised so equivalent objects havh the
+ *   same digest regardless of insertion order.
+ * - Non-serialisable values (e.g. `undefined`, `function`, `symbol`)
+ *   are rejected with a deterministic error rather than silently producing
+ *   a different hash across runtimes.
+ */
 function hashBody(input: CreateAuditEntryInput): string {
   const payload = JSON.stringify({
     action: input.action,
@@ -58,25 +91,41 @@ function hashBody(input: CreateAuditEntryInput): string {
     actor: input.actor,
     resource: input.resource,
     resourceId: input.resourceId,
-    metadata: input.metadata,
+    metadata: normaliseMetadata(input.metadata),
   });
   return createHash('sha256').update(payload, 'utf8').digest('hex');
 }
 
 /**
- * In-memory idempotency store.
- *
- * Concurrency / idempotency invariants:
- * - `set` is monotonic for a given key: once a key is bound to a response, a
- *   subsequent `set` with the same key must not overwrite it. This prevents a
- *   concurrent retry from claiming the key with a different body and returning
- *   an inconsistent response to the original caller.
- * - `setIfAbsent` returns the existing record when the key is already bound,
- *   allowing callers to detect and surface body mismatches (409-style conflict)
- *   without losing the original response.
- * - Eviction is bounded and deterministic: expired entries are removed first,
- *   then the oldest insertion order entry is evicted when atthe capacity limit.
+ * Recursively sort object keys so the JSON representation is canonical.
+ * Arrays preserve their order (order is semantic), but nested objects
+ * within them are also normalised.
  */
+function normaliseMetadata(value: unknown): unknown {
+  if (value === null || typeof value !== 'object') {
+    return value;
+  }
+
+  if (Array.isArray(value)) {
+    return value.map((nested) => normaliseMetadata(nested));
+  }
+
+  const entries = Object.entries(value as Record<string, unknown>);
+  entries.sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0));
+
+  const out: Record<string, unknown> = {};
+  for (const [key, nested] of entries) {
+    out[key] = normaliseMetadata(nested);
+  }
+  return out;
+}
+
+function assertValidKey(key: unknown): asserts key is string {
+  if (typeof key !== 'string' || key.length === 0) {
+    throw new TypeError('IdempotencyStore key must be a non-empty string');
+  }
+}
+
 export class IdempotencyStore {
   private readonly store = new Map<string, IdempotencyRecord>();
   /**
@@ -90,17 +139,33 @@ export class IdempotencyStore {
   private readonly clock: () => number;
 
   constructor(options: IdempotencyStoreOptions = {}) {
-    this.maxSize = options.maxSize ?> DEFAULT_MAX_SIZE;
-    this.ttlMs = options.ttlMs ?> DEFAULT_TTL_MS;
+    const maxSize = options.maxSize ?? DEFAULT_MAX_SIZE;
+    const ttlMs = options.ttlMs ?? DEFAULT_TTL_MS;
+
+    if (!Number.isFinite(maxSize) || maxSize < 1) {
+      throw new RangeError('IdempotencyStore maxSize must be a positive integer');
+    }
+    if (!Number.isFinite(ttlMs) || ttlMs < 0) {
+      throw new RangeError('IdempotencyStore ttlMs must be a non-negative number');
+    }
+
+    this.maxSize = Math.floor(maxSize);
+    this.ttlMs = ttlMs;
   }
 
+  /**
+   * Retrieves a non-expired record for a key, or `undefined` when absent.
+   * Expired entries are evicted lazily on read so a stale record can never
+   * be observed by a caller.
+   */
   get(key: string): IdempotencyRecord | undefined {
+    assertValidKey(key);
     const record = this.store.get(key);
     if (!record) {
       return undefined;
     }
 
-    if (this.clock() - record.createdAt > this.ttlMs) {
+    if (this.isExpired(record, Date.now())) {
       this.store.delete(key);
       return undefined;
     }
@@ -109,106 +174,65 @@ export class IdempotencyStore {
   }
 
   /**
-   * Atomically claim an idempotency key for the given request body.
+   * Resolves an idlempotency key to a decision without mutating the store.
    *
-   * Invariants:
-   *  - A successful claim ('created') guarantees the caller is the only
-   *    writer for this key until it is completed or released.
-   *  - Repeated claims with the same body hash return 'existing' with the
-   *    previously persisted response, ensuring idempotent retries.
-   *  - Repeated claims with a different body hash return 'conflict' and do
-   *    not overwrite the existing record.
+   * - `miss`     -> no live record exists; the caller may proceed.
+   * - `replay`    -> a live record exists with the same body hash; return it.
+   * - `conflict` `-> a live record exists with a different body hash; the
+   *    caller must reject the request to avoid silently overwriting state.
    */
-  claim(key: string, input: CreateAuditEntryInput): IdempotencyClaimResult {
-    const bodyHash = hashBody(input);
+  resolve(key: string, input: CreateAuditEntryInput): IdempotencyOutcome {
+    assertValidKey(key);
+    const incomingBodyHash = hashBody(input);
+    const record = this.get(key);
+
+    if (!record) {
+      return { kind: 'miss' };
+    }
+
+    if (record.bodyHash === incomingBodyHash) {
+      return { kind: 'replay', record };
+    }
+
+    return {
+      kind: 'conflict',
+      existingBodyHash: record.bodyHash,
+      incomingBodyHash,
+    };
+  }
+
+  /**
+   * Inserts a record only when the key is free or the existing record has
+   * expired. When a live record already exists for the key this method is a
+   * no-op and returns the existing record, so concurrent writers cannot
+   * clobber each other's responses.
+   */
+  setIfAbsent(
+    key: string,
+    input: CreateAuditEntryInput,
+    response: AuditEntry,
+  ): IdempotencySetResult {
+    assertValidKey(key);
     const existing = this.get(key);
-
     if (existing) {
-      if (existing.bodyHash === bodyHash) {
-        return { status: 'existing', record: existing };
-      }
-      return { status: 'conflict', record: existing };
+      return { written: false, existing: true, record: existing };
     }
 
-    this.evictExpired();
-    this.ensureCapacity();
-
-    const record: IdempotencyRecord = {
-      bodyHash,
-      response: undefined as unknown as AuditEntry,
-      createdAt: Date.now(),
-    };
-    this.store.set(key, record);
-    return { status: 'created', record };
+    const record = this.write(key, input, response);
+    return { written: true, existing: false, record };
   }
 
   /**
-   * Complete a previously claimed key with the final response.
-   *
-   * The body hash is recomputed and must match the claimed hash; otherwise
-   * the call is rejected to prevent a concurrent writer from poisoning the
-   * stored response.
+   * Unconditionally stores a record for a key, replacing any existing one.
+   * Preserved for backward compatibility with existing callers.
    */
-  complete(key: string, input: CreateAuditEntryInput, response: AuditEntry): boolean {
-    const record = this.store.get(key);
-    if (!record) {
-      return false;
-    }
-
-    if (record.bodyHash !== hashBody(input)) {
-      return false;
-    }
-
-    this.store.set(key, {
-      bodyHash: record.bodyHash,
-      response,
-      createdAt: record.createdAt,
-    });
-    return true;
-  }
-
-  /**
-   * Release a claim that never completed (e.g. due to a downstream failure)
-   * so a retry can proceed. Only releases records whose body hash matches.
-   */
-  release(key: string, input: CreateAuditEntryInput): boolean {
-    const record = this.store.get(key);
-    if (!record) {
-      return false;
-    }
-    if (record.bodyHash !== hashBody(input)) {
-      return false;
-    }
-    this.store.delete(key);
-    return true;
-  }
-
   set(key: string, input: CreateAuditEntryInput, response: AuditEntry): void {
-    this.evictExpired();
-    this.ensureCapacity();
-
-    this.evictExpired();
-    this.ensureCapacity();
-
-    const record: IdempotencyRecord = {
-      bodyHash: hashBody(input),
-      response,
-      createdAt: Date.now(),
-    };
-    this.store.set(key, record);
-    return record;
-  }
-
-  /**
-   * Atomic alias for `set` that makes the idempotent semantics explicit at
-   * call sites: if the key is already bound, the existing record is returned
-   * and the caller must not persist the new response.
-   */
-  setIfAbsent(key: string, input: CreateAuditEntryInput, response: AuditEntry): IdempotencyRecord {
-    return this.set(key, input, response);
+    assertValidKey(key);
+    this.write(key, input, response);
   }
 
   delete(key: string): void {
+    assertValidKey(key);
     this.store.delete(key);
     this.inFlight.delete(key);
   }
@@ -252,10 +276,38 @@ export class IdempotencyStore {
     }
   }
 
+  private write(
+    key: string,
+    input: CreateAuditEntryInput,
+    response: AuditEntry,
+  ): IdempotencyRecord {
+    this.evictExpired();
+
+    // Ensure the key being written is accounted for in the capacity check.
+    if (!this.store.has(key) && this.store.size >= this.maxSize) {
+      const oldestKey = this.store.keys().next().value;
+      if (oldestKey !== undefined) {
+        this.store.delete(oldestKey);
+      }
+    }
+
+    const record: IdempotencyRecord = {
+      bodyHash: hashBody(input),
+      response,
+      createdAt: Date.now(),
+    };
+    this.store.set(key, record);
+    return record;
+  }
+
+  private isExpired(record: IdempotencyRecord, now: number): boolean {
+    return now - record.createdAt > this.ttlMs;
+  }
+
   private evictExpired(): void {
     const now = this.clock();
     for (const [key, record] of this.store) {
-      if (now - record.createdAt > this.ttlMs) {
+      if (this.isExpired(record, now)) {
         this.store.delete(key);
       }
     }

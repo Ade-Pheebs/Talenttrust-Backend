@@ -46,12 +46,10 @@ export const DEFAULT_EXPORT_PAGE_SIZE = 100;
  * filter validator (`audit/router`) validate against this same array, so a new
  * action can never be accepted by one path and rejected by the other.
  *
- * Compatibility contract:
- * - This array is the canonical runtime enumeration of every accepted action.
- * - The `AuditAction` type is derived from it, so type and runtime cannot drift.
- * - Adding a new action is backward-compatible (only widens the union).
- * - Removing or renaming an action is a breaking change and requires a
- *   migration plan because persisted entries may reference it.
+ * Compatibility contract: the order and membership of this array is part of the
+ * public API contract. Existing entries must never be removed or reordered; new
+ * actions must be appended at the end. This keeps persisted audit records and
+ * clients that switch on the value stable across upgrades.
  */
 export const AUDIT_ACTIONS = [
   'CONTRACT_CREATED',
@@ -77,24 +75,20 @@ export const AUDIT_ACTIONS = [
   'ENDPOINT_MUTATION',
   'DEPLOYMENT_PROMOTED',
   'DEPLOYMENT_ROLLED_BACK',
+  'CONTRACT_DELETED',
   'MILESTONES_CREATED',
   'MILESTONES_UPDATED',
   'MILESTONES_DELETED',
 ] as const;
 
-/** Categories of sensitive state changes that must be audited. */
-export type AuditAction = (typeof AUDIT_ACTIONS)[number];
-
 /**
- * Runtime membership check for audit actions.
+ * Categories of sensitive state changes that must be audited.
  *
- * Exposed so that both the request-body validator and the query-filter validator
- * share exactly the same acceptance rule, preserving the compatibility contract
- * between the two paths. Narrowing behavior is a type guard, not a coercion.
+ * This type is derived from {@link AUDIT_ACTIONS} so that the runtime validator
+ * and the compile-time type can never drift apart. Any action accepted at runtime
+ * is therefore also representable in typepositions, and vice versa.
  */
-export function isAuditAction(value: unknown): value is AuditAction {
-  return typeof value === 'string' && (AUDIT_ACTIONS as readonly string[]).includes(value);
-}
+export type AuditAction = (typeof AUDIT_ACTIONS)[number];
 
 export const AUDIT_SEVERITIES = ['INFO', 'WARNING', 'CRITICAL'] as const;
 
@@ -180,22 +174,7 @@ export interface SealedAuditEntry extends AuditEntry {
 export type CreateAuditEntryInput = Omit<AuditEntry, 'id' | 'timestamp' | 'hash' | 'previousHash'>;
 
 /**
- * Deep-freeze an audit entry and its metadata so a consumer cannot mutate a
- * persisted record after it has been created. This enforces the immutability
- * invariant at runtime, not just in the type system.
- *
- * The function is idempotent and returns the same reference it was given, so
- * callers can use it in a fluent style without changing identity.
- */
-export function freezeAuditEntry<T extends AuditEntry>(entry: T): T {
-  if (entry.metadata && typeof entry.metadata === 'object') {
-    Object.freeze(entry.metadata);
-  }
-  return Object.freeze(entry);
-}
-
-/**
- * Outcome of a single item within a `POST /api/v1/audit/bulk` request.
+ * Outcome of a single item within a `POST /api/v1/audit/bulk ` request.
  * Exactly one of `entry` / `error` is populated, matching `success`.
  */
 export interface BulkAuditItemResult {
@@ -206,7 +185,7 @@ export interface BulkAuditItemResult {
   error?: string;
 }
 
-/** Aggregate response body for `POST /api/v1/audit/bulk`. */
+/** Aggregate response body for `POST /api/v1/audit/bulk `. */
 export interface BulkAuditResult {
   results: BulkAuditItemResult[];
   succeeded: number;

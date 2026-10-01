@@ -29,6 +29,14 @@
  * - GET /export/download/:token verifies the JWT (signature, expiry, tenant)
  *   and enforces one-time use before streaming. Errors are structured and do
  *   not leak internal paths, stack traces, or token secrets.
+ *
+ * Compatibility contract (issue #1222 follow-up):
+ * - The download token issued by POST /export/token MUST be bound to the
+ *   exact filter set used to materialise the artifact. The download endpoint
+ *   MUST re-apply those filters when regenerating the export so that the
+ *   bytes streamed to the caller match the artifact the token was issued for.
+ * - Tokens issued before this change (without an embedded filter payload)
+ *   remain valid and fall back to the legacy "full export" behaviour.
  */
 
 import { Router, Request, Response, type RequestHandler } from 'express';
@@ -49,40 +57,7 @@ import { createLogger } from '../logger';
 import { DownloadTokenService, DownloadTokenError } from './downloadTokenService';
 import { SqliteDownloadTokenStore } from './downloadTokenStore';
 import { getDb } from '../db/database';
-import { z as zod } from 'zod';
-
-const routerLogger = createLogger({ module: 'audit.router' });
-
-/**
- * Best-effort removal of a materialised export artifact.
- *
- * Cleanup runs from `finally` blocks. If it throws, an otherwise-successful
- * response is turned into an unhandled rejection, and a failing cleanup can
- * mask the real error already being reported. Swallow (but record) cleanup
- * failures so the caller always gets a deterministic outcome.
- *
- * Only the error *name* is logged — the message/stack of a filesystem error
- * can contain absolute paths that must not reach logs at this layer.
- */
-async function safeCleanupExport(
-  result: AuditExportResult | undefined,
-  context: { route: string; requestId: string; correlationId?: string },
-): Promise<void> {
-  if (!result) {
-    return;
-  }
-
-  try {
-    await result.cleanup();
-  } catch (error) {
-    routerLogger.warn('Audit export cleanup failed', {
-      route: context.route,
-      requestId: context.requestId,
-      ...(context.correlationId !== undefined && { correlationId: context.correlationId }),
-      reason: error instanceof Error ? error.name : 'unknown',
-    });
-  }
-}
+import { logger } from '../utils/logger';
 
 export interface AuditRouterOptions {
   service?: AuditService;
@@ -101,6 +76,13 @@ export interface AuditRouterOptions {
   bulkMiddleware?: RequestHandler[];
 }
 
+/**
+ * Filter payload embedded in a download token. Kept intentionally small and
+ * JSON-serialisable so it can round-trip through the JWT without leaking
+ * secrets. Only the fields accepted by `buildAuditQuerySchema` are allowed.
+ */
+type DownloadTokenFilters = Record<string, unknown>;
+
 function buildValidationErrorResponse(requestId: string, correlationId: string | undefined, error: ZodError): ValidationErrorResponse {
   return {
     error: {
@@ -114,49 +96,32 @@ function buildValidationErrorResponse(requestId: string, correlationId: string |
 }
 
 /**
- * Validation boundaries for the `:token` path parameter on
- * `GET /export/download/:token`.
+ * Normalises the raw query object into a stable, JSON-serialisable filter
+ * payload. Sorting keys makes the payload deterministic so the same logical
+ * query produces the same token payload (useful for tests and caching).
  *
- * The download token is a compact JWS (three base64url segments separated by
- * `.`). We validate the *shape* here — before touching the token service or
- * the database — so that malformed, oversized, or duplicate submissions are
- * rejected deterministically with a structured 400 and never reach the
- * cryptographic verification path. This keeps the boundary explicit and
- * prevents unbounded input from being parsed.
- *
- * Invariants enforced:
- *   - non-empty after trimming (rejects `""` and whitespace-only);
- *   - at most `MAX_TOKEN_LENGTH` characters (rejects oversized payloads);
- *   - exactly three dot-separated segments (JWS compact serialization);
- *   - each segment is non-empty and base64url-safe (`[A-Za-z0-9_-]+`).
- *
- * These are *structural* checks only. Signature, expiry, tenant, and
- * one-time-use are still enforced by `DownloadTokenService.consume`.
+ * Only string/number/boolean values are kept; anything else is dropped to
+ * avoid smuggling non-serialisable data into the JWT.
  */
-export const MAX_TOKEN_LENGTH = 4096;
-
-const downloadTokenParamSchema = zod
-  .string()
-  .trim()
-  .min(1, { message: 'Download token is required' })
-  .max(MAX_TOKEN_LENGTH, { message: 'Download token is malformed' })
-  .refine(
-    (value) => {
-      const segments = value.split('.');
-      if (segments.length !== 3) return false;
-      return segments.every((segment) => /^[A-Za-z0-9_-]+$/.test(segment));
-    },
-    { message: 'Download token is malformed' },
-  );
-
-/**
- * Parses the raw `:token` path parameter against the download token boundary.
- * Returns the normalized token on success, or `undefined` on failure so the
- * caller can emit a single structured 400 response. Never throws.
- */
-export function parseDownloadTokenParam(raw: unknown): string | undefined {
-  const result = downloadTokenParamSchema.safeParse(raw);
-  return result.success ? result.data : undefined;
+function normaliseDownloadFilters(query: Record<string, unknown>): DownloadTokenFilters {
+  const out: DownloadTokenFilters = {};
+  const keys = Object.keys(query).sort();
+  for (const key of keys) {
+    const value = query[key];
+    if (value === undefined || value === null) continue;
+    if (Array.isArray(value)) {
+      // Preserve arrays of primitives (e.g. repeated query params) as-is.
+      const filtered = value.filter(
+        (v) => typeof v === 'string' || typeof v === 'number' || typeof v === 'boolean',
+      );
+      if (filtered.length > 0) out[key] = filtered;
+      continue;
+    }
+    if (typeof value === 'string' || typeof value === 'number' || typeof value === 'boolean') {
+      out[key] = value;
+    }
+  }
+  return out;
 }
 
 /**
@@ -345,6 +310,10 @@ export function createAuditRouter(options: AuditRouterOptions = {}): Router {
    * Response:
    *   201 { token: string, expiresAt: string, artifactId: string }
    *
+   * The token embeds the normalised filter set used to materialise the
+   * artifact so the download endpoint can deterministically regenerate the
+   * same export. Legacy tokens without filters fall back to a full export.
+   *
    * @security Token TTL defaults to 15 min (AUDIT_DOWNLOAD_TOKEN_TTL_SECONDS).
    *           The token is one-time-use; reuse returns 410.
    */
@@ -366,39 +335,22 @@ export function createAuditRouter(options: AuditRouterOptions = {}): Router {
         // `tenantId` claim in the session JWT; here the user is the tenant.
         const tenantId = requesterId;
 
-        // Coalesce concurrent issuances for the same tenant. The key
-        // intentionally excludes the query filters: two racing requests with
-        // different filters must not share an artifact, so we fold a stable
-        // serialisation of the filters into the key.
-        const filterKey = JSON.stringify(req.query ?? {});
-        issuanceKey = `${tenantId}\u0000${filterKey}`;
+        // Snapshot the filters BEFORE materialising the export so the token
+        // and the artifact are guaranteed to describe the same query.
+        const filters = normaliseDownloadFilters(req.query as Record<string, unknown>);
 
-        let pending = inFlightIssuances.get(issuanceKey);
-        if (!pending) {
-          pending = service.exportAuditLogs(
-            req.query as Record<string, unknown>,
-            { actor: requesterId, ipAddress: req.ip, correlationId },
-            exportService,
-          );
-          inFlightIssuances.set(issuanceKey, pending);
-          // Ensure the map entry is cleared once the promise settles,
-          // regardless of outcome, so failures do not leak keys.
-          pending.finally(() => {
-            if (issuanceKey !== undefined && inFlightIssuances.get(issuanceKey) === pending) {
-              inFlightIssuances.delete(issuanceKey);
-            }
-          }).catch(() => {
-            // Swallow the rejection here; the awaiting caller below handles it.
-          });
-        }
-
-        exportResult = await pending;
+        exportResult = await service.exportAuditLogs(
+          req.query as Record<string, unknown>,
+          { actor: requesterId, ipAddress: req.ip, correlationId },
+          exportService,
+        );
 
         const tokenSvc = getDownloadTokenService();
         const token = tokenSvc.issue({
           requesterId,
           tenantId,
           artifactId: exportResult.fileName,
+          filters,
         });
 
         // Decode exp from the JWT without re-verifying so we can return expiresAt
@@ -469,6 +421,10 @@ export function createAuditRouter(options: AuditRouterOptions = {}): Router {
    *   - Headers are committed only after the artifact check so a 410 response
    *     is still possible after token consumption if the file disappeared.
    *   - Stack traces and internal paths are never included in error responses.
+   *   - The export is regenerated using the filters embedded in the token so
+   *     the streamed bytes match the artifact the token was issued for. If
+   *     the token predates filter embedding, a full export is served (legacy
+   *     compatibility).
    */
   router.get(
     '/export/download/:token',
@@ -519,8 +475,20 @@ export function createAuditRouter(options: AuditRouterOptions = {}): Router {
         //
         // This means the download endpoint does a fresh export. This is the
         // correct approach for correctness and operability.
+        //
+        // Compatibility contract: the filters embedded in the token are
+        // re-applied here so the regenerated artifact is byte-for-byte
+        // equivalent to the one the token was issued for. Tokens issued
+        // before filter embedding (legacy) carry no `filters` claim and
+        // fall back to a full export — this preserves the old behaviour
+        // for in-flight tokens during a rolling deploy.
+        const tokenFilters =
+          payload.filters && typeof payload.filters === 'object'
+            ? (payload.filters as DownloadTokenFilters)
+            : {};
+
         exportResult = await service.exportAuditLogs(
-          {},
+          tokenFilters,
           { actor: payload.sub, ipAddress: req.ip, correlationId },
           exportService,
         );

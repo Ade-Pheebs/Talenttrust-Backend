@@ -180,6 +180,8 @@ export class SqliteAuditRepository implements AuditLogRepository {
 
   append(input: CreateAuditEntryInput): AuditEntry {
     const insert = this.db.transaction((payload: CreateAuditEntryInput): AuditEntry => {
+      // Acquire the writer lock before reading the tail so another connection
+      // cannot make this transaction hash against a stale chain head.
       const previousHashRow = this.db
         .prepare<[], { hash: string }>(
           'SELECT hash FROM audit_log_entries ORDER BY seq DESC LIMIT 1'
@@ -231,10 +233,10 @@ export class SqliteAuditRepository implements AuditLogRepository {
       return entry;
     });
 
-    // The retried unit is the *whole transaction*, not the bare INSERT: each
-    // attempt re-reads the chain tail inside the transaction, so a retry links
-    // the new entry to the true predecessor instead of a stale cached hash.
-    return this.runWriteWithRecovery('append', () => insert(input));
+    const immediate = (insert as typeof insert & {
+      immediate?: (payload: CreateAuditEntryInput) => AuditEntry;
+    }).immediate;
+    return immediate ? immediate(input) : insert(input);
   }
 
   getById(id: string): AuditEntry | undefined {

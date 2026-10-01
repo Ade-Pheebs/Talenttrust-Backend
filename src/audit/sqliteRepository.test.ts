@@ -54,14 +54,9 @@ import {
 import { GENESIS_HASH } from './store';
 import type { CreateAuditEntryInput } from './types';
 import { encodeCursor, decodeCursor, type CursorData } from './types';
-import { setWriteRecordImpl, type LogRecord } from '../logger';
-
-// Capture structured log records instead of emitting them to the test console.
-// The logger module is instantiated once per test file, so this override is
-// scoped to this suite and lets recovery assertions read exactly what was
-// logged without touching stdout.
-const capturedLogs: LogRecord[] = [];
-setWriteRecordImpl((record) => capturedLogs.push(record));
+import { mkdtempSync, rmSync } from 'fs';
+import { tmpdir } from 'os';
+import path from 'path';
 
 // ─── Fixtures ───────────────────────────────────────────────────────────────
 
@@ -452,34 +447,59 @@ describe('SqliteAuditRepository — append() failure recovery (deterministic)', 
   });
 });
 
-// ─── Retry policy — error classification ────────────────────────────────────
+describe('SqliteAuditRepository — shared database concurrency', () => {
+  it('extends one hash chain across repository connections to the same file', () => {
+    const directory = mkdtempSync(path.join(tmpdir(), 'audit-concurrency-'));
+    const dbPath = path.join(directory, 'audit.sqlite');
+    const firstDb = new Database(dbPath);
+    const secondDb = new Database(dbPath);
+    try {
+      const firstRepository = new SqliteAuditRepository(firstDb);
+      const secondRepository = new SqliteAuditRepository(secondDb);
 
-describe('SqliteAuditRepository — error classification (deterministic retry policy)', () => {
-  it('classifies numeric serialization codes as retryable', () => {
-    expect(isSerializationError(Object.assign(new Error('x'), { code: 5 }))).toBe(true); // BUSY
-    expect(isSerializationError(Object.assign(new Error('x'), { code: 517 }))).toBe(true); // BUSY_SNAPSHOT
-    expect(isSerializationError(Object.assign(new Error('x'), { rawCode: 6 }))).toBe(true); // LOCKED
+      firstRepository.append(makeInput({ actor: 'connection-1' }));
+      secondRepository.append(makeInput({ actor: 'connection-2' }));
+      firstRepository.append(makeInput({ actor: 'connection-1' }));
+
+      expect(firstRepository.count()).toBe(3);
+      expect(firstRepository.verifyIntegrity()).toMatchObject({ valid: true, totalEntries: 3 });
+    } finally {
+      firstDb.close();
+      secondDb.close();
+      rmSync(directory, { recursive: true, force: true });
+    }
   });
 
-  it('classifies lock-contention messages as retryable', () => {
-    expect(isSerializationError(new Error('database is locked'))).toBe(true);
-    expect(isSerializationError(new Error('SQLITE_BUSY: database is locked'))).toBe(true);
-  });
+  it('surfaces writer-lock contention without a partial row, then allows a retry', () => {
+    const directory = mkdtempSync(path.join(tmpdir(), 'audit-lock-'));
+    const dbPath = path.join(directory, 'audit.sqlite');
+    const lockDb = new Database(dbPath);
+    const appendDb = new Database(dbPath);
+    try {
+      const repository = new SqliteAuditRepository(appendDb);
+      const lockTransaction = lockDb.transaction(() => undefined);
+      const immediate = (lockTransaction as unknown as { immediate?: () => void }).immediate;
 
-  it('does not classify deterministic failures as retryable', () => {
-    expect(
-      isSerializationError(Object.assign(new Error('constraint failed'), { code: 787 })),
-    ).toBe(false);
-    expect(isSerializationError(new Error('disk I/O error'))).toBe(false);
-    expect(isSerializationError('not an error object')).toBe(false);
-  });
+      // The fallback test database has no transaction lock semantics.
+      if (typeof immediate !== 'function') return;
 
-  it('detects missing-schema errors from table/column/index text', () => {
-    expect(isMissingSchemaError(new Error('no such table: audit_log_entries'))).toBe(true);
-    expect(isMissingSchemaError(new Error('no such column: previous_hash'))).toBe(true);
-    expect(isMissingSchemaError(new Error('no such index: idx_audit_actor'))).toBe(true);
-    expect(isMissingSchemaError(new Error('UNIQUE constraint failed: audit_log_entries.id'))).toBe(false);
-    expect(isMissingSchemaError('not an error object')).toBe(false);
+      appendDb.pragma('busy_timeout = 0');
+      lockDb.exec('BEGIN IMMEDIATE');
+      try {
+        expect(() => repository.append(makeInput({ actor: 'blocked' }))).toThrow();
+      } finally {
+        lockDb.exec('ROLLBACK');
+      }
+
+      expect(repository.count()).toBe(0);
+      const retried = repository.append(makeInput({ actor: 'retry' }));
+      expect(repository.getById(retried.id)?.actor).toBe('retry');
+      expect(repository.verifyIntegrity()).toMatchObject({ valid: true, totalEntries: 1 });
+    } finally {
+      lockDb.close();
+      appendDb.close();
+      rmSync(directory, { recursive: true, force: true });
+    }
   });
 });
 

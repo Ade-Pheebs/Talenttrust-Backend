@@ -63,6 +63,112 @@ function extractApiKeyHeader(value: unknown): string | null {
 }
 
 /**
+ * Default number of attempts for transient validation failures.
+ * Total attempts = 1 initial + (API_KEY_MAX_RETRIES) retries.
+ */
+const API_KEY_MAX_RETRIES = 2;
+
+/** Base delay in milliseconds between retries (exponential backoff). */
+const API_KEY_RETRY_BASE_DELAY_MS = 25;
+
+/** Maximum delay in milliseconds between retries. */
+const API_KEY_RETRY_MAX_DELAY_MS = 200;
+
+/**
+ * Error class for non-retryable API key validation failures.
+ *
+ * Thrown by the validator when the failure is deterministic (e.g.
+ * malformed key format, invalid hash encoding) and retrying would not help.
+ */
+export class ApiKeyValidationError extends Error {
+  constructor(message: string, public readonly code: string = 'API_KEY_VALIDATION_FAILED') {
+    super(message);
+    this.name = 'ApiKeyValidationError';
+  }
+}
+
+/**
+ * Resolves the validator to use for a request.
+ *
+ * This indirection exists so that tests can inject a deterministic
+ * validator (including failure/retry behavior) without mock module
+ * registry globals. It is intentionally not exported from the module's
+ * public surface.
+ */
+interface ApiKeyValidatorContext {
+  validator?: (key: string) => Promise<ApiKeyInfo | null>;
+}
+
+function resolveValidator(ctx?: ApiKeyValidatorContext): (key: string) => Promise<ApiKeyInfo | null> {
+  return ctx?.validator ?? validateApiKey;
+}
+
+/**
+ * Returns true when an error is transient and the validation call
+ * may be safely retried.
+ *
+ * The classification is deterministic and conservative:
+ *   - ApiKeyValidationError is always non-retryable.
+ *   - Errors with a code indicating a client/programming fault
+ *     (e.g. ERROR_INVALID_ARG) are non-retryable.
+ *   - Everything else (DB, network, timeout) is treated as transient.
+ */
+function isRetryableError(err: unknown): boolean {
+  if (err instanceof ApiKeyValidationError) return false;
+  if (err && typeof err === 'object') {
+    const code = (err as { code?: unknown }).code;
+    if (code === 'ERROR_INVALID_ARG' || code === 'API_KEY_VALIDATION_FAILED') {
+      return false;
+    }
+  }
+  return true;
+}
+
+/** Delay helper used for backoff between retries. */
+function delay(ms: number): Promise<void> {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+/**
+ * Validates an API key with bounded retries for transient failures.
+ *
+ * Invariants:
+ *   - A successful validation returns the resolved ApiKeyInfo exactly once.
+ *   - A definitive null result (key not found/expired/deactivated) is
+ *     returned immediately and is never retried.
+ *   - Non-retryable errors propagate immediately.
+ *   - Retryable errors are retried up to API_KEY_MAX_RETRIES times with
+ *     exponential backoff, then the last error is rethrown.
+ */
+async function validateWithRetry(
+  key: string,
+  validator: (key: string) => Promise<ApiKeyInfo | null>,
+): Promise<ApiKeyInfo | null> {
+  let lastError: unknown;
+
+  for (let attempt = 0; attempt <= API_KEY_MAX_RETRIES; attempt++) {
+    try {
+      return await validator(key);
+    } catch (err) {
+      lastError = err;
+      if (!isRetryableError(err) || attempt === API_KEY_MAX_RETRIES) {
+        throw err;
+      }
+      const backoff = Math.min(
+        API_KEY_RETRY_BASE_DELAY_MS * 2 ** attempt,
+        API_KEY_RETRY_MAX_DELAY_MS,
+      );
+      await delay(backoff);
+    }
+  }
+
+  // Unreachable: the loop either returns or throws on the last attempt.
+  throw lastError instanceof Error
+    ? lastError
+    : new Error('API key validation failed');
+}
+
+/**
  * Express middleware that extracts and validates the API key from the
  * `X-API-Key` request header.
  *
@@ -74,9 +180,9 @@ function extractApiKeyHeader(value: unknown): string | null {
  *   long.
  * - **401** — Header is present but `validateApiKey` returns `null`
  *   (unknown key, wrong hash, expired, or deactivated).
- * - **500** — `validateApiKey` rejects unexpectedly (e.g. database error).
- *   The raw error is written to `console.error` only; the response body
- *   contains only `{ error: 'Internal server error' }`.
+ * - **500** — `validateApiKey` rejects unexpectedly after bounded retries
+ *   (e.g. database error). The raw error is written to `console.error` only;
+ *   the response body contains only `{ error: 'Internal server error' }`.
  *
  * Invariants:
  * - `req.apiKey` is never mutated on a failure path.
@@ -90,6 +196,7 @@ export function authenticateApiKey(
   req: ApiKeyAuthenticatedRequest,
   res: Response,
   next: NextFunction,
+  ctx?: ApiKeyValidatorContext,
 ): void {
   // Invariant 2: clear any stale credential from a prior middleware run.
   // This guarantees a failure cannot leave a previously-authenticated
@@ -103,7 +210,9 @@ export function authenticateApiKey(
     return;
   }
 
-  validateApiKey(apiKey)
+  const validator = resolveValidator(ctx);
+
+  validateWithRetry(apiKey, validator)
     .then(keyInfo => {
       if (!keyInfo) {
         res.status(401).json({ error: 'Invalid API key' });

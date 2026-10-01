@@ -57,6 +57,35 @@ const ALLOWED_CREATE_FIELDS = new Set(['name', 'scope', 'expiresAt']);
 /** Maximum allowed length for an API key id path parameter. */
 const ID_MAX_LEN = 128;
 
+// ─── Failure observability ───────────────────────────────────────────────────
+
+/**
+ * Emits a structured, redacted error log for a controller failure.
+ *
+ * Deterministic recovery requires that every failure path be observable
+ * without leaking secrets (API key material, tokens, request bodies). We log
+ * only the operation name, the authenticated user id (if any), the request
+ * id (if the request carries one), and the error message/name — never the
+ * raw error object, request body, or headers.
+ *
+ * @param operation - Stable identifier for the failing operation.
+ * @param req - The authenticated request (used for redacted correlation ids).
+ * @param error - The thrown value; only `name`/`message` are surfaced.
+ */
+function logControllerFailure(operation: string, req: AuthenticatedRequest, error: unknown): void {
+  const err = error instanceof Error ? error : new Error(String(error));
+  console.error(
+    JSON.stringify({
+      level: 'error',
+      operation,
+      userId: req.user?.userId ?? null,
+      requestId: (req as unknown as { id?: string }).id ?? null,
+      errorName: err.name,
+      errorMessage: err.message,
+    })
+  );
+}
+
 // ─── Validation helper ───────────────────────────────────────────────────────
 
 /**
@@ -265,7 +294,7 @@ export async function createApiKeyController(req: AuthenticatedRequest, res: Res
       info: result.info,
     });
   } catch (error) {
-    console.error('Error creating API key:', error);
+    logControllerFailure('createApiKey', req, error);
     res.status(500).json({ error: 'Internal server error' });
   }
 }
@@ -325,7 +354,7 @@ export async function listApiKeysController(req: AuthenticatedRequest, res: Resp
       limit: pageResult.limit
     });
   } catch (error) {
-    console.error('Error listing API keys:', error);
+    logControllerFailure('listApiKeys', req, error);
     res.status(500).json({ error: 'Internal server error' });
   }
 }
@@ -382,7 +411,7 @@ export async function rotateApiKeyController(req: AuthenticatedRequest, res: Res
       info: result.info
     });
   } catch (error) {
-    console.error('Error rotating API key:', error);
+    logControllerFailure('rotateApiKey', req, error);
     res.status(500).json({ error: 'Internal server error' });
   }
 }
@@ -438,7 +467,7 @@ export async function deactivateApiKeyController(req: AuthenticatedRequest, res:
       message: 'API key deactivated successfully'
     });
   } catch (error) {
-    console.error('Error deactivating API key:', error);
+    logControllerFailure('deactivateApiKey', req, error);
     res.status(500).json({ error: 'Internal server error' });
   }
 }
@@ -489,7 +518,7 @@ export async function getApiKeyController(req: AuthenticatedRequest, res: Respon
 
     res.json(safeKey);
   } catch (error) {
-    console.error('Error getting API key:', error);
+    logControllerFailure('getApiKey', req, error);
     res.status(500).json({ error: 'Internal server error' });
   }
 }

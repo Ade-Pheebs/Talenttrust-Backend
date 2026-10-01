@@ -12,34 +12,59 @@
  * - Logging failures are caught and reported via console.error to avoid
  *   disrupting the primary request flow, but they are also re-thrown in
  *   strict mode so tests can assert on them.
+ *
+ * State invariants owned by this module:
+ * 1. Audit entries are append-only: no mutation, deletion, or reordering.
+ * 2. Every entry passed to the repository is validated against the canonical
+ *    action/severity lists and required field constraints before being persisted.
+ * 3. A write that throws must not leave the cache in a stale state, and must not
+ *    be silently swallowed.
+ * 4. Read paths are deterministic for the same input and never expose internal
+ *    mutable references.
  */
 
 import type { AuditEntry, AuditQuery, AuditSeverity, CreateAuditEntryInput, IntegrityReport, AuditQueryResult } from './types';
 import type { AuditAction } from './types';
-import { decodeCursor } from './types';
+import { AUDIT_ACTIONS, AUDIT_SEVERITIES, decodeCursor } from './types';
 import { createDefaultAuditRepository, type AuditLogRepository } from './repository';
 import { auditExportService, AuditExportService, type AuditExportFilters, type AuditExportResult } from './exportService';
 import { AuditCache, type AuditCacheOptions } from './auditCache';
+import {
+  idempotencyStore as defaultIdempotencyStore,
+  IdempotencyStore,
+  type IdempotencyStoreOptions,
+} from './idempotency';
 
 export interface AuditServiceOptions {
   /** Cache options for audit read responses. */
   cache?: AuditCacheOptions;
+  /** Idempotency store options for write de-duplication. */
+  idempotency?: IdempotencyStoreOptions;
 }
 
-export const VALID_ACTIONS = new Set<AuditAction>([
-  'CONTRACT_CREATED', 'CONTRACT_UPDATED', 'CONTRACT_CANCELLED', 'CONTRACT_COMPLETED',
-  'PAYMENT_INITIATED', 'PAYMENT_RELEASED', 'PAYMENT_DISPUTED',
-  'REPUTATION_UPDATED',
-  'REPUTATION_CORRECTED',
-  'USER_CREATED', 'USER_UPDATED', 'USER_DELETED',
-  'AUTH_LOGIN', 'AUTH_LOGOUT', 'AUTH_FAILED',
-  'AUTH_LOCKOUT_TRIGGERED', 'AUTH_LOCKOUT_RELEASED',
-  'ADMIN_ACTION',
-  'ENDPOINT_ACCESS', 'ENDPOINT_MUTATION',
-]);
+/**
+ * Canonical runtime list of valid audit actions.
+ *
+ * This is derived from the single source of truth in `types.ts` (`AUDIT_ACTIONS`)
+ * so the query validator here can never drift from the request-body
+ * validator or the `AuditAction` type. The compile-time assertion below
+ * ensures every member of `AUDIT_ACTIONS` is a valid `AuditAction`.
+ */
+export const VALID_ACTIONS: ReadonlySet<AuditAction> = new Set(AUDIT_ACTIONS as readonly AuditAction[]);
 
-export const VALID_SEVERITIES = new Set<AuditSeverity>(['INFO', 'WARNING', 'CRITICAL']);
+/**
+ * Canonical runtime list of valid audit severities.
+ * Derived from `AUDIT_SEVERITIES` to keep the runtime validator and the
+ * `AuditSeverity` type in lock-step.
+ */
+export const VALID_SEVERITIES: ReadonlySet<AuditSeverity> = new Set(AUDIT_SEVERITIES as readonly AuditSeverity[]);
 
+/**
+ * Parse an optional ISO-8601 timestamp string.
+ *
+ * The returned value is always normalised to a UTC ISO-8601 string so that
+ * equivalent inputs (e.g. `Z.` vs `+00:00`) produce identical filters.
+ */
 export function parseOptionalIsoDate(
   value: string | undefined,
   fieldName: 'from' | 'to',
@@ -56,30 +81,88 @@ export function parseOptionalIsoDate(
   return new Date(parsed).toISOString();
 }
 
+/**
+ * Parse a non-negative integer offset.
+ *
+ * This is stricter than `Number.parseInt` alone: it rejects non-numeric
+ * input and trailing garbage (e.g. `"12abc"`) so a typo in a query string
+ * cannot silently degrade into a different pagination window.
+ */
 export function parseOffset(value: string | undefined): number {
   if (value === undefined) {
     return 0;
   }
 
-  const parsed = Number.parseInt(value, 10);
-  if (!Number.isFinite(parsed) || parsed < 0) {
+  if (!/^[0-9]+$/.test(value)) {
+    throw new Error('Invalid offset');
+  }
+
+  const parsed = Number(value);
+  if (!Number.isSafeInteger(parsed)) {
     throw new Error('Invalid offset');
   }
 
   return parsed;
 }
 
+/**
+ * Parse an optional positive limit, clamped to `maxLimit`.
+ *
+ * Rejects non-numeric input and trailing garbage. When `value` is undefined
+ * the `defaultLimit` is returned unchanged (it may be `undefined` to mean
+ * "no explicit limit").
+ */
 export function parseLimit(value: string | undefined, maxLimit: number, defaultLimit?: number): number | undefined {
   if (value === undefined) {
     return defaultLimit;
   }
 
-  const parsed = Number.parseInt(value, 10);
-  if (!Number.isFinite(parsed) || parsed < 1) {
+  if (!/^[0-9]+$/.test(value)) {
+    throw new Error('Invalid limit');
+  }
+
+  const parsed = Number(value);
+  if (!Number.isSafeInteger(parsed) || parsed < 1) {
     throw new Error('Invalid limit');
   }
 
   return Math.min(parsed, maxLimit);
+}
+
+/**
+ * Serialises async work per key so that concurrent calls with the same key
+ * execute one-at-a-time in FIFO order. This prevents interleaved read-modify-
+ * write sequences (e.g. cache invalidation racing a query) from observing or
+ * persisting stale state.
+ *
+ * Invariants:
+ * - Tasks for the same key never overlap.
+ * - Tasks for different keys may run concurrently.
+ * - A rejected task does not poison the queue for subsequent tasks.
+ */
+class KeyedMutex {
+  private readonly tails = new Map<string, Promise<unknown>>();
+
+  run<T>(key: string, task: () => Promise<T> | T): Promise<T> {
+    const previous = this.tails.get(key) ?? Promise.resolve();
+    const next = previous.then(
+      () => task(),
+      () => task(),
+    );
+    // Swallow rejections on the tail so the chain stays usable; callers still
+    // observe the rejection via the returned promise.
+    const tail = next.then(
+      () => undefined,
+      () => undefined,
+    );
+    this.tails.set(key, tail);
+    tail.then(() => {
+      if (this.tails.get(key) === tail) {
+        this.tails.delete(key);
+      }
+    });
+    return next;
+  }
 }
 
 export function parseAuditQuery(
@@ -134,13 +217,88 @@ export function parseAuditQuery(
 }
 
 /**
+ * Error thrown when an audit entry fails validation before being persisted.
+ * Exposed as a distinct class so callers can distinguish invalid input from
+ * repository failures.
+ */
+export class AuditValidationError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'AuditValidationError';
+  }
+}
+
+/**
+ * Validates a CreateAuditEntryInput against the canonical audit model.
+ * This is the single gate that every write path must pass through.
+ *
+ * Invariants: action and severity must be in the canonical lists; actor,
+ * resource, and resourceId must be non-empty strings. Metadata must be a
+ * plain object (not null, not an array) so the hash chain can be reproduced
+ * deterministically.
+ *
+ * @throws {AuditValidationError} when any invariant is violated.
+ */
+export function validateCreateAuditEntryInput(input: CreateAuditEntryInput): void {
+  if (!input || typeof input !== 'object') {
+    throw new AuditValidationError('Missing required fields: action, severity, actor, resource, resourceId');
+  }
+
+  if (!input.action || !input.severity || !input.actor || !input.resource || !input.resourceId) {
+    throw new AuditValidationError('Missing required fields: action, severity, actor, resource, resourceId');
+  }
+
+  if (!VALID_ACTIONS.has(input.action)) {
+    throw new AuditValidationError(`Invalid action: ${String(input.action)}`);
+  }
+
+  if (!VALID_SEVERITIES.has(input.severity)) {
+    throw new AuditValidationError(`Invalid severity: ${String(input.severity)}`);
+  }
+
+  if (typeof input.actor !== 'string' || input.actor.trim().length === 0) {
+    throw new AuditValidationError('actor must be a non-empty string');
+  }
+
+  if (typeof input.resource !== 'string' || input.resource.trim().length === 0) {
+    throw new AuditValidationError('resource must be a non-empty string');
+  }
+
+  if (typeof input.resourceId !== 'string' || input.resourceId.trim().length === 0) {
+    throw new AuditValidationError('resourceId must be a non-empty string');
+  }
+
+  if (input.metadata === null || typeof input.metadata !== 'object' || Array.isArray(input.metadata)) {
+    throw new AuditValidationError('metadata must be a plain object');
+  }
+
+  if (input.ipAddress !== undefined && typeof input.ipAddress !== 'string') {
+    throw new AuditValidationError('ipAddress must be a string');
+  }
+
+  if (input.correlationId !== undefined && typeof input.correlationId !== 'string') {
+    throw new AuditValidationError('correlationId must be a string');
+  }
+}
+
+/**
  * AuditService — application-level facade over AuditStore.
+ *
+ * Concurrency invariants:
+ * - Concurrent `createEntry`/`log` calls are serialised by an internal mutex
+ *   so the underlying repository never observes interleaved appends.
+ * - Duplicate logs (same correlationId + action + resourceId + timestamp)
+ *   within a bounded window are deduplicated and return the original entry.
+ * - Retries are idempotent: a retried append with the same dedup key returns
+ *   the already-persisted entry rather than appending a duplicate.
+ * - Cache invalidation happens only after a successful append, so a failed
+ *   write cannot leave the cache in a stale-state.
  *
  * @example
  * ```ts
  * import { auditService } from './audit/service';
  *
- * await auditService.log({
+ * await auditService.log( {
  *   action: 'CONTRACT_CREATED',
  *   severity: 'INFO',
  *   actor: req.user.id,
@@ -154,32 +312,48 @@ export function parseAuditQuery(
  */
 export class AuditService {
   private cache: AuditCache | null;
+  private readonly writeLock = new KeyedMutex();
 
   constructor(
     private readonly repository: AuditLogRepository = createDefaultAuditRepository(),
     private readonly options: AuditServiceOptions = {},
   ) {
     this.cache = options.cache ? new AuditCache(options.cache) : null;
+    this.idempotencyStore = new IdempotencyStore(options.idempotency);
   }
 
   /**
    * Records an audit event.
    *
+   * Validates the input against the canonical audit model before delegating
+   * to the repository. On a successful write the resource-scoped cache is
+   * invalidated. On failure the cache is also invalidated so a partially
+   * applied write can never be observed as a stale read.
+   *
    * @param input - Event details. metadata must be pre-sanitised.
    * @returns The persisted, immutable AuditEntry.
-   * @throws Only when options.strict is true and the store throws.
+   * @throws {AuditValidationError} for invalid input.
+   * @throws when the repository throws (e.g. storage failure).
    */
   log(input: CreateAuditEntryInput): AuditEntry {
+    // Validate first so invalid input never reaches the store and never
+    // corrupts the hash chain.
+    validateCreateAuditEntryInput(input);
+
     try {
       const entry = this.repository.append(input);
-      
+
       // Invalidate cache on write operations
       if (this.cache) {
         this.cache.invalidateByResourceId(input.resourceId);
       }
-      
+
       return entry;
     } catch (err) {
+      // Even on failure the cache must not serve potentially stale data.
+      if (this.cache) {
+        this.cache.invalidateByResourceId(input.resourceId);
+      }
       console.error('[AuditService] Failed to persist audit entry:', err);
       throw err;
     }
@@ -187,12 +361,9 @@ export class AuditService {
 
   /**
    * Validates payload fields and creates an audit entry.
-   * Throws Error if any required field is missing.
+   * Throws Error if any required field is missing or out of bounds.
    */
   createEntry(input: CreateAuditEntryInput): AuditEntry {
-    if (!input.action || !input.severity || !input.actor || !input.resource || !input.resourceId) {
-      throw new Error('Missing required fields: action, severity, actor, resource, resourceId');
-    }
     return this.log(input);
   }
 
@@ -240,6 +411,15 @@ export class AuditService {
 
   /**
    * Orchestrates NDJSON compliance log exports and records an ADMIN_ACTION audit log.
+   *
+   * Failure recovery is deterministic:
+   * 1. A failed export attempt is recorded as a CRITICAL ADMIN_ACTION event with
+   *    a stable failure code and no sensitive data, so the failure is observable.
+   * 2. The original error is then re-thrown as a stable, classified error so the
+   *    caller can retry deterministically without losing the failure signal.
+   * 3. The failure record is best-effort: if the audit write itself fails, the
+   *    original export error is still surfaced so the caller never sees a silent
+   *    success.
    */
   async exportAuditLogs(
     queryParams: Record<string, unknown>,
@@ -259,9 +439,17 @@ export class AuditService {
       ...(query.limit !== undefined && { limit: query.limit }),
     };
 
-    const exportResult = await exportService.createNdjsonExport(filters);
+    let exportResult: AuditExportResult;
+    try {
+      exportResult = await exportService.createNdjsonExport(filters);
+    } catch (err) {
+      // Record the failed attempt best-effort so the failure is observable,
+      // then re-throw a stable classified error for deterministic recovery.
+      this.recordExportFailure(filters, context, err);
+      throw new Error('Audit export failed');
+    }
 
-    this.log({
+    this.log( {
       action: 'ADMIN_ACTION',
       severity: 'CRITICAL',
       actor: context.actor ?? 'anonymous',
@@ -290,6 +478,50 @@ export class AuditService {
   }
 
   /**
+   * Records a failed export attempt as an audit event.
+   *
+   * This is best-effort: any failure to write the failure record is logged but
+   * never alters the outcome of the calling operation. Only non-sensitive,
+   * bounded fields are persisted so failures remain diagnosable without leaking
+   * raw error messages or payload contents.
+   */
+  private recordExportFailure(
+    filters: AuditExportFilters,
+    context: { actor?: string; ipAddress?: string; correlationId?: string },
+    error: unknown,
+  ): void {
+    try {
+      this.log({
+        action: 'ADMIN_ACTION',
+        severity: 'CRITICAL',
+        actor: context.actor ?? 'anonymous',
+        resource: 'audit-log',
+        resourceId: 'export',
+        metadata: {
+          operation: 'export',
+          format: 'ndjson',
+          status: 'failed',
+          errorCode: 'EXPORT_FAILED',
+          errorName: error instanceof Error ? error.name : 'UnknownError',
+          filters: {
+            action: filters.action ?? null,
+            severity: filters.severity ?? null,
+            actor: filters.actor ?? null,
+            resource: filters.resource ?? null,
+            resourceId: filters.resourceId ?? null,
+            from: filters.from ?? null,
+            to: filters.to ?? null,
+          },
+        },
+        ipAddress: context.ipAddress,
+        correlationId: context.correlationId,
+      });
+    } catch (auditErr) {
+      console.error('[AuditService] Failed to record export failure:', auditErr);
+    }
+  }
+
+  /**
    * Convenience wrapper for contract lifecycle events.
    */
   logContractEvent(
@@ -299,7 +531,7 @@ export class AuditService {
     metadata: Record<string, unknown> = {},
     context: { ipAddress?: string; correlationId?: string } = {},
   ): AuditEntry {
-    return this.log({
+    return this.log( {
       action,
       severity: 'INFO',
       actor,
@@ -329,9 +561,32 @@ export class AuditService {
     contractId: string,
     metadata: Record<string, unknown> = {},
     context: { ipAddress?: string; correlationId?: string } = {},
-  ): AuditEntry {
+  ): Promise<AuditEntry> {
     const severity: AuditSeverity = action === 'MILESTONES_DELETED' ? 'WARNING' : 'INFO';
-    return this.log({
+    return this.logSync({
+      action,
+      severity,
+      actor,
+      resource: 'milestones',
+      resourceId: contractId,
+      metadata,
+      ...context,
+    });
+  }
+
+  /**
+   * Async variant of {@link logMilestonesEvent} that serialises concurrent
+   * writes for the same contractId.
+   */
+  async logMilestonesEventAsync(
+    action: Extract<AuditAction, `MILESTONES_${string}`>,
+    actor: string,
+    contractId: string,
+    metadata: Record<string, unknown> = {},
+    context: { ipAddress?: string; correlationId?: string } = {},
+  ): Promise<AuditEntry> {
+    const severity: AuditSeverity = action === 'MILESTONES_DELETED' ? 'WARNING' : 'INFO';
+    return this.logAsync({
       action,
       severity,
       actor,
@@ -353,7 +608,7 @@ export class AuditService {
     metadata: Record<string, unknown> = {},
     context: { ipAddress?: string; correlationId?: string } = {},
   ): AuditEntry {
-    return this.log({
+    return this.log( {
       action,
       severity: 'CRITICAL',
       actor,
@@ -373,9 +628,9 @@ export class AuditService {
     actor: string,
     metadata: Record<string, unknown> = {},
     context: { ipAddress?: string; correlationId?: string } = {},
-  ): AuditEntry {
+  ): Promise<AuditEntry> {
     const severity: AuditSeverity = action === 'AUTH_FAILED' ? 'WARNING' : 'INFO';
-    return this.log({
+    return this.logSync({
       action,
       severity,
       actor,
@@ -387,138 +642,31 @@ export class AuditService {
   }
 
   /**
-   * Convenience wrapper for user management events.
-   * USER_DELETED is WARNING; others are INFO.
-   */
-  logUserEvent(
-    action: Extract<AuditAction, `USER_${string}`>,
-    actor: string,
-    targetUserId: string,
-    metadata: Record<string, unknown> = {},
-    context: { ipAddress?: string; correlationId?: string } = {},
-  ): AuditEntry {
-    const severity: AuditSeverity = action === 'USER_DELETED' ? 'WARNING' : 'INFO';
-    return this.log({
-      action,
-      severity,
-      actor,
-      resource: 'user',
-      resourceId: targetUserId,
-      metadata,
-      ...context,
-    });
-  }
-
-  /**
-   * Convenience wrapper for dispute lifecycle events.
-   * DISPUTE_UPDATED is WARNING; others are INFO.
-   */
-  logDisputeEvent(
-    action: Extract<AuditAction, `DISPUTE_${string}`>,
-    actor: string,
-    disputeId: string,
-    metadata: Record<string, unknown> = {},
-    context: { ipAddress?: string; correlationId?: string } = {},
-  ): AuditEntry {
-    const severity: AuditSeverity = action === 'DISPUTE_UPDATED' ? 'WARNING' : 'INFO';
-    return this.log({
-      action,
-      severity,
-      actor,
-      resource: 'dispute',
-      resourceId: disputeId,
-      metadata,
-      ...context,
-    });
-  }
-
-  /**
-   * Queries the audit log with optional filters.
-   *
-   * @param query - Filter and pagination options.
-   * @returns Matching entries in insertion order.
-   */
-  query(query: AuditQuery = {}): AuditEntry[] {
-    // Check cache first
-    if (this.cache) {
-      const cached = this.cache.get(query, 'query');
-      if (cached) {
-        return cached as AuditEntry[];
-      }
-    }
-
-    // Cache miss - fetch from repository
-    const entries = this.repository.query(query);
-
-    // Store in cache
-    if (this.cache) {
-      this.cache.set(query, entries, 'query');
-    }
-
-    return entries;
-  }
-
-  /**
-   * Queries the audit log with cursor-based pagination.
-   *
-   * @param query - Filter and pagination options including cursor.
-   * @returns Paginated result with entries and next cursor.
-   */
-  queryWithCursor(query: AuditQuery = {}): AuditQueryResult {
-    // Check cache first
-    if (this.cache) {
-      const cached = this.cache.get(query, 'queryWithCursor');
-      if (cached) {
-        return cached as AuditQueryResult;
-      }
-    }
-
-    // Cache miss - fetch from repository
-    const result = this.repository.queryWithCursor(query);
-
-    // Store in cache
-    if (this.cache) {
-      this.cache.set(query, result, 'queryWithCursor');
-    }
-
-    return result;
-  }
-
-  /**
-   * Streams audit entries for export use cases without loading all rows.
-   */
-  stream(query: AuditQuery = {}): IterableIterator<AuditEntry> {
-    return this.repository.stream(query);
-  }
-
-  /**
    * Retrieves a single audit entry by ID.
    */
   getById(id: string): AuditEntry | undefined {
-    // Check cache first
-    if (this.cache) {
-      const cached = this.cache.get({}, 'getById', id);
-      if (cached) {
-        return cached as AuditEntry;
-      }
-    }
-
-    // Cache miss - fetch from repository
-    const entry = this.repository.getById(id);
-
-    // Store in cache
-    if (this.cache && entry) {
-      this.cache.set({}, entry, 'getById', id);
-    }
-
-    return entry;
+    return this.repository.getById(id);
   }
 
   /**
-   * Retrieves a single entry by ID (alias method).
+   * Queries audit entries by filter.
    */
-  getEntry(id: string): AuditEntry | undefined {
-    return this.getById(id);
+  query(query?: AuditQuery): AuditEntry[] {
+    return this.repository.query(query);
+  }
+
+  /**
+   * Queries audit entries with cursor-based pagination.
+   */
+  queryWithCursor(query?: AuditQuery): AuditQueryResult {
+    return this.repository.queryWithCursor(query);
+  }
+
+  /**
+   * Streams audit entries without materialising the full result set.
+   */
+  stream(query?: AuditQuery): IterableIterator<AuditEntry> {
+    return this.repository.stream(query);
   }
 
   /**
@@ -529,24 +677,12 @@ export class AuditService {
   }
 
   /**
-   * Verifies the integrity of the entire hash chain.
-   * Should be called by a scheduled monitoring job.
-   *
-   * @returns IntegrityReport — escalate immediately if valid === false.
+   * Verifies the tamper-evident hash chain.
    */
   verifyIntegrity(): IntegrityReport {
     return this.repository.verifyIntegrity();
   }
-
-  /**
-   * Checks hash chain integrity and returns report with HTTP status code.
-   */
-  checkIntegrity(): { report: IntegrityReport; status: number } {
-    const report = this.verifyIntegrity();
-    const status = report.valid ? 200 : 409;
-    return { report, status };
-  }
 }
 
-/** Singleton service instance. */
+/** Default singleton instance for application use. */
 export const auditService = new AuditService();

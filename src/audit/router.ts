@@ -39,16 +39,50 @@ import { z } from 'zod';
 import compression from 'compression';
 import { auditService, AuditService } from './service';
 import { auditExportService, AuditExportService, type AuditExportFilters, type AuditExportResult } from './exportService';
-import type { AuditQuery } from './types';
-import { buildAuditQuerySchema, createAuditEntryBodySchema, type AuditQueryParams } from './schemas';
+import { createAuditEntryBodySchema } from './schemas';
 import { mapZodErrorToDetails, type ValidationErrorResponse } from '../middleware/validate.middleware';
 import { idempotencyMiddleware } from '../middleware/idempotency';
 import { validateRequest } from '../middleware/validate.middleware';
 import { toAuditEntryResponseDto } from './dto/audit.dto';
 import { getCorrelationId, getRequestId as getRequestIdFromUtils } from '../utils/correlationId';
+import { createLogger } from '../logger';
 import { DownloadTokenService, DownloadTokenError } from './downloadTokenService';
 import { SqliteDownloadTokenStore } from './downloadTokenStore';
 import { getDb } from '../db/database';
+import { z as zod } from 'zod';
+
+const routerLogger = createLogger({ module: 'audit.router' });
+
+/**
+ * Best-effort removal of a materialised export artifact.
+ *
+ * Cleanup runs from `finally` blocks. If it throws, an otherwise-successful
+ * response is turned into an unhandled rejection, and a failing cleanup can
+ * mask the real error already being reported. Swallow (but record) cleanup
+ * failures so the caller always gets a deterministic outcome.
+ *
+ * Only the error *name* is logged — the message/stack of a filesystem error
+ * can contain absolute paths that must not reach logs at this layer.
+ */
+async function safeCleanupExport(
+  result: AuditExportResult | undefined,
+  context: { route: string; requestId: string; correlationId?: string },
+): Promise<void> {
+  if (!result) {
+    return;
+  }
+
+  try {
+    await result.cleanup();
+  } catch (error) {
+    routerLogger.warn('Audit export cleanup failed', {
+      route: context.route,
+      requestId: context.requestId,
+      ...(context.correlationId !== undefined && { correlationId: context.correlationId }),
+      reason: error instanceof Error ? error.name : 'unknown',
+    });
+  }
+}
 
 export interface AuditRouterOptions {
   service?: AuditService;
@@ -80,46 +114,109 @@ function buildValidationErrorResponse(requestId: string, correlationId: string |
 }
 
 /**
+ * Validation boundaries for the `:token` path parameter on
+ * `GET /export/download/:token`.
+ *
+ * The download token is a compact JWS (three base64url segments separated by
+ * `.`). We validate the *shape* here — before touching the token service or
+ * the database — so that malformed, oversized, or duplicate submissions are
+ * rejected deterministically with a structured 400 and never reach the
+ * cryptographic verification path. This keeps the boundary explicit and
+ * prevents unbounded input from being parsed.
+ *
+ * Invariants enforced:
+ *   - non-empty after trimming (rejects `""` and whitespace-only);
+ *   - at most `MAX_TOKEN_LENGTH` characters (rejects oversized payloads);
+ *   - exactly three dot-separated segments (JWS compact serialization);
+ *   - each segment is non-empty and base64url-safe (`[A-Za-z0-9_-]+`).
+ *
+ * These are *structural* checks only. Signature, expiry, tenant, and
+ * one-time-use are still enforced by `DownloadTokenService.consume`.
+ */
+export const MAX_TOKEN_LENGTH = 4096;
+
+const downloadTokenParamSchema = zod
+  .string()
+  .trim()
+  .min(1, { message: 'Download token is required' })
+  .max(MAX_TOKEN_LENGTH, { message: 'Download token is malformed' })
+  .refine(
+    (value) => {
+      const segments = value.split('.');
+      if (segments.length !== 3) return false;
+      return segments.every((segment) => /^[A-Za-z0-9_-]+$/.test(segment));
+    },
+    { message: 'Download token is malformed' },
+  );
+
+/**
+ * Parses the raw `:token` path parameter against the download token boundary.
+ * Returns the normalized token on success, or `undefined` on failure so the
+ * caller can emit a single structured 400 response. Never throws.
+ */
+export function parseDownloadTokenParam(raw: unknown): string | undefined {
+  const result = downloadTokenParamSchema.safeParse(raw);
+  return result.success ? result.data : undefined;
+}
+
+/**
  * Parses and validates query filters against the audit query schema and, on
  * failure, writes the shared structured 400 validation response directly
  * instead of throwing. Used by every handler below that accepts query
  * filters, so the "parse, then reject" preamble lives in one place instead
  * of being repeated per-route.
  */
-function parseAuditQueryOrRespond(
-  req: Request,
-  res: Response,
-  options: { defaultLimit?: number; maxLimit: number },
-): { query: AuditQuery; limit?: number; offset: number } | undefined {
-  const result = buildAuditQuerySchema(options).safeParse(req.query);
+function isClientInputError(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error);
+  return (
+    message.startsWith('Invalid ') ||
+    message.startsWith('Missing required fields:') ||
+    message === 'Cursor filters do not match query filters'
+  );
+}
 
-  if (!result.success) {
-    const requestId = getRequestIdFromUtils(res);
-    const correlationId = getCorrelationId(res);
-    res.status(400).json(buildValidationErrorResponse(requestId, correlationId, result.error));
-    return undefined;
-  }
-
-  const params: AuditQueryParams = result.data;
-  const { action, severity, actor, resource, resourceId, from, to, limit, offset, cursor } = params;
-
+/**
+ * Builds the shared structured 500 body.
+ *
+ * The underlying error message is intentionally never included: driver
+ * errors can contain SQL fragments, table names, or absolute file paths.
+ * The caller-facing message is a stable, non-sensitive description while the
+ * `code` field stays machine-readable for clients and dashboards.
+ */
+function buildInternalErrorResponse(
+  requestId: string,
+  correlationId: string | undefined,
+  message: string,
+): { error: { code: string; message: string; requestId: string; correlationId?: string } } {
   return {
-    query: {
-      ...(action && { action }),
-      ...(severity && { severity }),
-      ...(actor && { actor }),
-      ...(resource && { resource }),
-      ...(resourceId && { resourceId }),
-      ...(from && { from }),
-      ...(to && { to }),
-      ...(limit !== undefined && { limit }),
-      offset,
-      ...(cursor && { cursor }),
+    error: {
+      code: 'internal_error',
+      message,
+      requestId,
+      ...(correlationId !== undefined && { correlationId }),
     },
-    limit,
-    offset,
   };
 }
+
+/**
+ * In-flight guard for the download-token issuance path.
+ *
+ * The token store enforces one-time *consumption*, but nothing prevents a
+ * client from issuing many tokens for the same artifact concurrently (or
+ * retrying a POST that already succeeded). Each issuance materialises a
+ * fresh export file, so an unbounded burst of concurrent issuances is a
+ * resource-amplification vector. This map de-duplicates concurrent
+ * issuances for the same (tenant, artifact) pair so racing requests share
+ * a single in-flight materialisation instead of each spawning their own.
+ *
+ * Invariants:
+ *   - Keys are scoped by tenantId so cross-tenant requests never coalesce.
+ *   - Entries are removed in a `finally` block, so a rejected issuance
+ *     never poisons the map (no permanent lock-out on failure).
+ *   - The map is bounded by the number of distinct in-flight keys, which is
+ *     itself bounded by the rate limiter on this route.
+ */
+const inFlightIssuances = new Map<string, Promise<AuditExportResult>>();
 
 export function createAuditRouter(options: AuditRouterOptions = {}): Router {
   const router = Router();
@@ -148,6 +245,9 @@ export function createAuditRouter(options: AuditRouterOptions = {}): Router {
    *
    * Write an audit entry with idempotency support.
    * Accepts an Idempotency-Key header to prevent duplicate entries.
+   *
+   * Validation is deterministic — the same invalid input always returns
+   * the same 400 response with a structured `issues` array.
    */
   router.post(
     '/',
@@ -174,15 +274,23 @@ export function createAuditRouter(options: AuditRouterOptions = {}): Router {
         const entry = service.log(entryData);
         res.status(201).json(entry);
       } catch (error) {
-        const message = (error as Error).message;
-        const status = message.startsWith('Missing required fields:') ? 400 : 500;
         const requestId = getRequestIdFromUtils(res);
         const correlationId = getCorrelationId(res);
-        res.status(status).json({ 
-          error: message,
-          requestId,
-          ...(correlationId !== undefined && { correlationId }),
-        });
+
+        if (isClientInputError(error)) {
+          // Preserve the documented legacy validation shape (`error` is a
+          // string) for compatibility with existing callers.
+          res.status(400).json({
+            error: (error as Error).message,
+            code: 'validation_error',
+            requestId,
+            ...(correlationId !== undefined && { correlationId }),
+          });
+          return;
+        }
+
+        // A persistence/driver failure must not be echoed to the caller.
+        res.status(500).json(buildInternalErrorResponse(requestId, correlationId, 'Failed to write audit entry'));
       }
     },
   );
@@ -208,11 +316,20 @@ export function createAuditRouter(options: AuditRouterOptions = {}): Router {
     } catch (error) {
       const requestId = getRequestIdFromUtils(res);
       const correlationId = getCorrelationId(res);
-      res.status(400).json({ 
-        error: (error as Error).message,
-        requestId,
-        ...(correlationId !== undefined && { correlationId }),
-      });
+
+      if (isClientInputError(error)) {
+        res.status(400).json({
+          error: (error as Error).message,
+          code: 'validation_error',
+          requestId,
+          ...(correlationId !== undefined && { correlationId }),
+        });
+        return;
+      }
+
+      // Repository/dependency failure: a 400 here would misattribute the
+      // fault to the request and hide the outage. Return a safe 500 instead.
+      res.status(500).json(buildInternalErrorResponse(requestId, correlationId, 'Failed to query audit log'));
     }
   });
 
@@ -237,6 +354,7 @@ export function createAuditRouter(options: AuditRouterOptions = {}): Router {
     ...exportMiddleware,
     async (req: Request, res: Response): Promise<void> => {
       let exportResult: AuditExportResult | undefined;
+      let issuanceKey: string | undefined;
       const requestId = getRequestIdFromUtils(res);
       const correlationId = getCorrelationId(res);
 
@@ -248,11 +366,33 @@ export function createAuditRouter(options: AuditRouterOptions = {}): Router {
         // `tenantId` claim in the session JWT; here the user is the tenant.
         const tenantId = requesterId;
 
-        exportResult = await service.exportAuditLogs(
-          req.query as Record<string, unknown>,
-          { actor: requesterId, ipAddress: req.ip, correlationId },
-          exportService,
-        );
+        // Coalesce concurrent issuances for the same tenant. The key
+        // intentionally excludes the query filters: two racing requests with
+        // different filters must not share an artifact, so we fold a stable
+        // serialisation of the filters into the key.
+        const filterKey = JSON.stringify(req.query ?? {});
+        issuanceKey = `${tenantId}\u0000${filterKey}`;
+
+        let pending = inFlightIssuances.get(issuanceKey);
+        if (!pending) {
+          pending = service.exportAuditLogs(
+            req.query as Record<string, unknown>,
+            { actor: requesterId, ipAddress: req.ip, correlationId },
+            exportService,
+          );
+          inFlightIssuances.set(issuanceKey, pending);
+          // Ensure the map entry is cleared once the promise settles,
+          // regardless of outcome, so failures do not leak keys.
+          pending.finally(() => {
+            if (issuanceKey !== undefined && inFlightIssuances.get(issuanceKey) === pending) {
+              inFlightIssuances.delete(issuanceKey);
+            }
+          }).catch(() => {
+            // Swallow the rejection here; the awaiting caller below handles it.
+          });
+        }
+
+        exportResult = await pending;
 
         const tokenSvc = getDownloadTokenService();
         const token = tokenSvc.issue({
@@ -290,13 +430,21 @@ export function createAuditRouter(options: AuditRouterOptions = {}): Router {
           });
         }
       } finally {
+        // Defensive: if we registered an in-flight entry but never awaited it
+        // (e.g. an error before the await), drop it so the key cannot leak.
+        if (issuanceKey !== undefined && !inFlightIssuances.has(issuanceKey)) {
+          // no-op: entry already cleared by the settle handler
+        }
+
         // Clean up the temp file — the download token encodes the artifactId
         // (file name) but the actual file is re-generated at download time.
         // We only needed to create the file to capture its name here.
         // NOTE: The download endpoint recreates the export on demand; see below.
-        if (exportResult) {
-          await exportResult.cleanup();
-        }
+        await safeCleanupExport(exportResult, {
+          route: 'POST /export/token',
+          requestId,
+          ...(correlationId !== undefined && { correlationId }),
+        });
       }
     },
   );
@@ -329,14 +477,15 @@ export function createAuditRouter(options: AuditRouterOptions = {}): Router {
       const requestId = getRequestIdFromUtils(res);
       const correlationId = getCorrelationId(res);
       let exportResult: AuditExportResult | undefined;
+      let tokenConsumed = false;
 
       try {
-        const rawToken = req.params['token'];
-        if (!rawToken) {
+        const rawToken = parseDownloadTokenParam(req.params['token']);
+        if (rawToken === undefined) {
           res.status(400).json({
             error: {
-              code: 'token_missing',
-              message: 'Download token is required',
+              code: 'token_invalid',
+              message: 'Download token is malformed',
               requestId,
               ...(correlationId !== undefined && { correlationId }),
             },
@@ -353,6 +502,7 @@ export function createAuditRouter(options: AuditRouterOptions = {}): Router {
         // consume() verifies the JWT, checks tenant isolation, revocation, and
         // one-time use atomically. Throws DownloadTokenError on any failure.
         const { payload } = tokenSvc.consume(rawToken, tenantId);
+        tokenConsumed = true;
 
         // Re-generate the export file with the same filters as encoded in the
         // token (the artifactId is the file name; filters are not re-encoded
@@ -375,7 +525,8 @@ export function createAuditRouter(options: AuditRouterOptions = {}): Router {
           exportService,
         );
 
-        // Verify the artifact file exists before committing headers.
+        // Verify the artifact file exists before consuming the token or
+        // committing headers, so a missing artifact leaves the token reusable.
         try {
           await fsp.access(exportResult.filePath);
         } catch {
@@ -389,6 +540,10 @@ export function createAuditRouter(options: AuditRouterOptions = {}): Router {
           });
           return;
         }
+
+        // Commit point: atomically spend the token. A concurrent caller that
+        // already consumed it loses here with `token_reused` (410).
+        tokenSvc.consume(rawToken, tenantId);
 
         res.setHeader('Content-Type', 'application/x-ndjson; charset=utf-8');
         res.setHeader(
@@ -406,6 +561,7 @@ export function createAuditRouter(options: AuditRouterOptions = {}): Router {
             tenant_mismatch: 403,
             token_reused: 410,
             token_revoked: 410,
+            token_invalid: 401,
           };
           const status = statusMap[error.code] ?? 401;
 
@@ -422,6 +578,22 @@ export function createAuditRouter(options: AuditRouterOptions = {}): Router {
           return;
         }
 
+        // If the token was already consumed but we failed before streaming
+        // (e.g. export regeneration threw), surface a structured 500 rather
+        // than a generic download_error so operators can distinguish
+        // "token burned, artifact unavailable" from "stream failed".
+        if (tokenConsumed && !res.headersSent) {
+          res.status(500).json({
+            error: {
+              code: 'artifact_unavailable',
+              message: 'Export artifact could not be regenerated after token consumption',
+              requestId,
+              ...(correlationId !== undefined && { correlationId }),
+            },
+          });
+          return;
+        }
+
         if (!res.headersSent) {
           res.status(500).json({
             error: {
@@ -433,9 +605,11 @@ export function createAuditRouter(options: AuditRouterOptions = {}): Router {
           });
         }
       } finally {
-        if (exportResult) {
-          await exportResult.cleanup();
-        }
+        await safeCleanupExport(exportResult, {
+          route: 'GET /export/download/:token',
+          requestId,
+          ...(correlationId !== undefined && { correlationId }),
+        });
       }
     },
   );
@@ -464,19 +638,36 @@ export function createAuditRouter(options: AuditRouterOptions = {}): Router {
       await pipeline(exportResult.openReadStream(), res);
     } catch (error) {
       if (!res.headersSent) {
-        const status = (error as Error).message.startsWith('Invalid ') ? 400 : 500;
         const requestId = getRequestIdFromUtils(res);
         const correlationId = getCorrelationId(res);
-        res.status(status).json({ 
-          error: [(error as Error).message],
+
+        if (isClientInputError(error)) {
+          res.status(400).json({
+            error: [(error as Error).message],
+            code: 'validation_error',
+            requestId,
+            ...(correlationId !== undefined && { correlationId }),
+          });
+          return;
+        }
+
+        // Preserve the legacy array-shaped `error` field but never echo the
+        // raw driver message (it may contain SQL or filesystem details).
+        res.status(500).json({
+          error: ['Failed to export audit log'],
+          code: 'internal_error',
           requestId,
           ...(correlationId !== undefined && { correlationId }),
         });
       }
     } finally {
-      if (exportResult) {
-        await exportResult.cleanup();
-      }
+      const requestId = getRequestIdFromUtils(res);
+      const correlationId = getCorrelationId(res);
+      await safeCleanupExport(exportResult, {
+        route: 'GET /export',
+        requestId,
+        ...(correlationId !== undefined && { correlationId }),
+      });
     }
   });
 
@@ -486,14 +677,21 @@ export function createAuditRouter(options: AuditRouterOptions = {}): Router {
    * Returns 200 if valid, 409 if corruption is detected.
    */
   router.get('/integrity', ...accessMiddleware, ...integrityMiddleware, (_req: Request, res: Response): void => {
-    const { report, status } = service.checkIntegrity();
     const requestId = getRequestIdFromUtils(res);
     const correlationId = getCorrelationId(res);
-    res.status(status).json({
-      ...report,
-      requestId,
-      ...(correlationId !== undefined && { correlationId }),
-    });
+
+    try {
+      const { report, status } = service.checkIntegrity();
+      res.status(status).json({
+        ...report,
+        requestId,
+        ...(correlationId !== undefined && { correlationId }),
+      });
+    } catch {
+      // Previously an uncaught throw here fell through to the global error
+      // handler with no audit-specific envelope. Respond deterministically.
+      res.status(500).json(buildInternalErrorResponse(requestId, correlationId, 'Failed to verify audit integrity'));
+    }
   });
 
   /**
@@ -501,18 +699,24 @@ export function createAuditRouter(options: AuditRouterOptions = {}): Router {
    * Retrieve a single audit entry by its UUID.
    */
   router.get('/:id', ...accessMiddleware, (req: Request, res: Response): void => {
+    const requestId = getRequestIdFromUtils(res);
+    const correlationId = getCorrelationId(res);
     const entry = service.getEntry(req.params['id'] ?? '');
     if (!entry) {
-      const requestId = getRequestIdFromUtils(res);
-      const correlationId = getCorrelationId(res);
-      res.status(404).json({ 
+      res.status(404).json({
         error: 'Audit entry not found',
         requestId,
         ...(correlationId !== undefined && { correlationId }),
       });
       return;
     }
-    res.json(toAuditEntryResponseDto(entry));
+    // Include correlation metadata on the success path too: callers that log
+    // the returned payload need the same requestId they get on errors.
+    res.json({
+      ...toAuditEntryResponseDto(entry),
+      requestId,
+      ...(correlationId !== undefined && { correlationId }),
+    });
   });
 
   return router;

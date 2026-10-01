@@ -24,7 +24,78 @@
  *     there is no shared mutable state involved.
  */
 
-import { Role, Resource, Action, ACCESS_CONTROL_MATRIX } from './roles';
+import {
+  Role,
+  Resource,
+  Action,
+  ACCESS_CONTROL_MATRIX,
+  VALID_ROLES,
+  VALID_RESOURCES,
+  VALID_ACTIONS,
+} from './roles';
+
+/**
+ * The set of identifiers that are considered valid for each dimension.
+ *
+ * These are derived from the canonical definitions in `roles.ts` so the
+ * validation boundaries cannot drift away from the access control matrix.
+ */
+const VALID_ROLE_SET: ReadonlySet<string> = new Set(VALID_ROLES);
+const VALID_RESOURCE_SET: ReadonlySet<string> = new Set(VALID_RESOURCES);
+const VALID_ACTION_SET: ReadonlySet<string> = new Set(VALID_ACTIONS);
+
+/**
+ * Returns true only when the value is a non-empty string.
+ *
+ * This is the first validation boundary: runtime callers may pass null,
+ * undefined, numbers, objects, or empty strings despite the TypeScript
+ * types. The authorization function must not throw on such inputs.
+ */
+function isNonEmptyString(value: unknown): value is string {
+  return typeof value === 'string' && value.length > 0;
+}
+
+/**
+ * Deep-freeze a value and recursively all of its own enumerable properties.
+ *
+ * This is used to make the access control matrix immutable at runtime.
+ * Immutability is the key invariant that guarantees concurrent calls to
+ * `isAllowed` observe a consistent snapshot of the matrix and therefore cannot
+ * produce stale or inconsistent authorization results.
+ *
+ * Care is taken to tolerate non-object values and cycles safely:
+ *   - Primitives and null/undefined are returned as-is.
+ *   - Already-frozen objects are skipped to avoid redundant work and cycles.
+ */
+function deepFreeze<T>(value: T): T {
+  if (value === null || typeof value !== 'object') {
+    return value;
+  }
+
+  if (Object.isFrozen(value)) {
+    return value;
+  }
+
+  Object.freeze(value);
+
+  for (const key of Object.getOwnPropertyNames(value)) {
+    const child = (value as Record<string, unknown>)[key];
+    if (child !== null && typeof child === 'object') {
+      deepFreeze(child);
+    }
+  }
+
+  return value;
+}
+
+/**
+ * The authorization matrix used at runtime.
+ *
+ * It is a deep-frozen view of `ACCESS_CONTROL_MATRIX` so that concurrent
+ * callers cannot observe or cause mutations. The reference is captured once at
+ * module load and never replaced.
+ */
+const FROZEN_MATRIX = deepFreeze(ACCESS_CONTROL_MATRIX);
 
 /**
  * Structured logger contract used by this module.

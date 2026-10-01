@@ -58,10 +58,10 @@ export function createCachedContractsService(
 ): ContractsService {
   const cache = new CacheService<any>(config, {
     onHit: (key) => {
-      config.metricsService?.recordCacheHit('contracts');
+      config.metricsService?.recordCacheHit?.('contracts');
     },
     onMiss: (key) => {
-      config.metricsService?.recordCacheMiss('contracts');
+      config.metricsService?.recordCacheMiss?.('contracts');
     },
   });
 
@@ -205,7 +205,7 @@ export function createCachedContractsService(
       // Cache it anyway for consistency, even though it never changes.
       const cached = cache.get('contracts:bounds');
       if (cached !== undefined) {
-        config.metricsService?.recordCacheHit('contracts');
+        config.metricsService?.recordCacheHit?.('contracts');
         return cached;
       }
       const result = service.getBounds();

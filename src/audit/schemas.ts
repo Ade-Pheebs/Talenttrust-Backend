@@ -9,26 +9,20 @@
  *     `src/middleware/validate.middleware.ts`) instead of a bare string
  *   - the response shapes are documented and can be asserted against in
  *     tests, catching drift between the service layer and the API contract
+ *
+ * Validation boundaries (issue: Define validation boundaries for
+ * src/audit/service.ts):
+ *   - Request schemas are the single source of truth for accepted input.
+ *   - `buildAuditQuerySchema` enforces deterministic handling of empty,
+ *     duplicate, and boundary values (limit/offset/from/to/cursor).
+ *   - Response schemas are the contract asserted against in tests.
  */
 
 import { z } from 'zod';
-import { decodeCursor } from './types';
+import { AUDIT_ACTIONS, AUDIT_SEVERITIES, decodeCursor } from './types';
 
-/** Mirrors the `AuditAction` union in `./types.ts`. Keep these in sync. */
-export const AUDIT_ACTIONS = [
-  'CONTRACT_CREATED', 'CONTRACT_UPDATED', 'CONTRACT_CANCELLED', 'CONTRACT_COMPLETED',
-  'PAYMENT_INITIATED', 'PAYMENT_RELEASED', 'PAYMENT_DISPUTED',
-  'REPUTATION_UPDATED',
-  'USER_CREATED', 'USER_UPDATED', 'USER_DELETED',
-  'AUTH_LOGIN', 'AUTH_LOGOUT', 'AUTH_FAILED',
-  'AUTH_LOCKOUT_TRIGGERED', 'AUTH_LOCKOUT_RELEASED',
-  'ADMIN_ACTION',
-  'ENDPOINT_ACCESS', 'ENDPOINT_MUTATION',
-  'DEPLOYMENT_PROMOTED', 'DEPLOYMENT_ROLLED_BACK',
-] as const;
-
-/** Mirrors the `AuditSeverity` union in `./types.ts`. */
-export const AUDIT_SEVERITIES = ['INFO', 'WARNING', 'CRITICAL'] as const;
+// Preserve the schema module's previous exports while keeping the type module authoritative.
+export { AUDIT_ACTIONS, AUDIT_SEVERITIES } from './types';
 
 export const auditActionSchema = z.enum(AUDIT_ACTIONS);
 export const auditSeveritySchema = z.enum(AUDIT_SEVERITIES);
@@ -56,6 +50,8 @@ export const createAuditEntryBodySchema = z.object({
 
 export type CreateAuditEntryBody = z.infer<typeof createAuditEntryBodySchema>;
 
+const MAX_CURSOR_LENGTH = 4096;
+
 const isoDateStringSchema = (fieldName: string) =>
   z
     .string()
@@ -82,6 +78,9 @@ const nonNegativeIntStringSchema = (message: string) =>
 
 const cursorSchema = z.string().refine(
   (value) => {
+    if (value.length > MAX_CURSOR_LENGTH) {
+      return false;
+    }
     try {
       decodeCursor(value);
       return true;
@@ -100,6 +99,15 @@ const cursorSchema = z.string().refine(
  * so rejected an empty string as invalid input. Preserving that exact split
  * (rather than "helpfully" making every field consistent) keeps this
  * refactor behaviour-neutral for existing callers relying on the old quirk.
+ *
+ * Boundary handling:
+ *   - `limit` is clamped to `[1, maxLimit]`; `0` and negatives are rejected.
+ *   - `offset` is clamped to `[0, MAX_OFFSET]`; negatives are rejected.
+ *   - `from`/`to` must parse as ISO-8601 timestamps; `from > to` is rejected
+ *     as a cross-field invariant.
+ *   - Duplicate query keys are collapsed by the underlying parser before
+ *     reaching this schema; the schema itself is deterministic for a given
+ *     scalar value.
  */
 const emptyStringToUndefined = <T extends z.ZodTypeAny>(schema: T) =>
   z.preprocess((value) => (value === '' ? undefined : value), schema.optional());
@@ -109,24 +117,39 @@ const emptyStringToUndefined = <T extends z.ZodTypeAny>(schema: T) =>
  * Both routes share the same filter fields but enforce different `limit`
  * ceilings and defaults, so this is a factory rather than a single schema —
  * mirrors the previous `parseAuditQuery(req, { defaultLimit, maxLimit })`.
+ *
+ * The returned schema is strict about unknown keys so typos in query
+ * parameters surface as validation errors instead of being silently ignored.
  */
 export function buildAuditQuerySchema(options: { maxLimit: number; defaultLimit?: number }) {
-  return z.object({
-    action: emptyStringToUndefined(auditActionSchema),
-    severity: emptyStringToUndefined(auditSeveritySchema),
-    actor: emptyStringToUndefined(z.string().min(1)),
-    resource: emptyStringToUndefined(z.string().min(1)),
-    resourceId: emptyStringToUndefined(z.string().min(1)),
-    from: isoDateStringSchema('from').optional(),
-    to: isoDateStringSchema('to').optional(),
-    limit: positiveIntStringSchema('Invalid limit')
-      .optional()
-      .transform((value) => (value === undefined ? options.defaultLimit : Math.min(value, options.maxLimit))),
-    offset: nonNegativeIntStringSchema('Invalid offset')
-      .optional()
-      .transform((value) => value ?? 0),
-    cursor: emptyStringToUndefined(cursorSchema),
-  });
+  const maxLimit = Math.max(1, Math.floor(options.maxLimit));
+  const defaultLimit = Math.min(
+    maxLimit,
+    Math.max(1, Math.floor(options.defaultLimit ?? AUDIT_QUERY_BOUNDS.DEFAULT_LIMIT)),
+  );
+
+  return z
+    .object({
+      action: emptyStringToUndefined(auditActionSchema),
+      severity: emptyStringToUndefined(auditSeveritySchema),
+      actor: emptyStringToUndefined(z.string().min(1)),
+      resource: emptyStringToUndefined(z.string().min(1)),
+      resourceId: emptyStringToUndefined(z.string().min(1)),
+      from: isoDateStringSchema('from').optional(),
+      to: isoDateStringSchema('to').optional(),
+      limit: positiveIntStringSchema('Invalid limit')
+        .optional()
+        .transform((value) => (value === undefined ? defaultLimit : Math.min(value, maxLimit))),
+      offset: nonNegativeIntStringSchema('Invalid offset')
+        .optional()
+        .transform((value) => Math.min(value ?? 0, AUDIT_QUERY_BOUNDS.MAX_OFFSET)),
+      cursor: emptyStringToUndefined(cursorSchema),
+    })
+    .strict()
+    .refine(
+      (value) => value.from === undefined || value.to === undefined || value.from <= value.to,
+      { message: '`from` must be less than or equal to `to`', path: ['from'] },
+    );
 }
 
 export type AuditQueryParams = z.infer<ReturnType<typeof buildAuditQuerySchema>>;
@@ -174,4 +197,19 @@ export const integrityReportResponseSchema = z.object({
   firstCorruptedIndex: z.number().optional(),
   firstCorruptedId: z.string().optional(),
   checkedAt: z.string(),
+});
+
+/**
+ * Convenience factory for the two supported audit query surfaces. Callers
+ * should prefer these over constructing `buildAuditQuerySchema` directly so
+ * that limit ceilings stay consistent across routes.
+ */
+export const auditListQuerySchema = buildAuditQuerySchema({
+  maxLimit: AUDIT_QUERY_BOUNDS.MAX_LIMIT,
+  defaultLimit: AUDIT_QUERY_BOUNDS.DEFAULT_LIMIT,
+});
+
+export const auditExportQuerySchema = buildAuditQuerySchema({
+  maxLimit: AUDIT_QUERY_BOUNDS.EXPORT_MAX_LIMIT,
+  defaultLimit: AUDIT_QUERY_BOUNDS.EXPORT_DEFAULT_LIMIT,
 });

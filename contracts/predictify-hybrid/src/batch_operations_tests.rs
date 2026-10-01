@@ -197,4 +197,81 @@ mod batch_operations_tests {
         // Second call with zero key must also succeed (no dedup check).
         client.place_bets(&user, &one_bet(&env), &zero);
     }
+
+    #[test]
+    fn invalid_bet_amount_rejected() {
+        let env = fresh_env();
+        let (_id, client) = register(&env);
+        let user = caller(&env);
+
+        let mut bets = Vec::new(&env);
+        bets.push_back(Bet {
+            market_id: 1,
+            amount: 0,
+        });
+
+        env.mock_all_auths();
+        let result = client.try_place_bets(&user, &bets, &key(&env, 0x09));
+        assert_eq!(
+            result,
+            Err(Ok(Error::InvalidBetAmount)),
+            "zero bet amount must return InvalidBetAmount error"
+        );
+
+        let mut bets_neg = Vec::new(&env);
+        bets_neg.push_back(Bet {
+            market_id: 1,
+            amount: -100,
+        });
+        let result_neg = client.try_place_bets(&user, &bets_neg, &key(&env, 0x0A));
+        assert_eq!(
+            result_neg,
+            Err(Ok(Error::InvalidBetAmount)),
+            "negative bet amount must return InvalidBetAmount error"
+        );
+    }
+
+    #[test]
+    fn invalid_market_id_rejected() {
+        let env = fresh_env();
+        let (_id, client) = register(&env);
+        let user = caller(&env);
+
+        let mut bets = Vec::new(&env);
+        bets.push_back(Bet {
+            market_id: 0,
+            amount: 100,
+        });
+
+        env.mock_all_auths();
+        let result = client.try_place_bets(&user, &bets, &key(&env, 0x0B));
+        assert_eq!(
+            result,
+            Err(Ok(Error::InvalidMarketId)),
+            "zero market ID must return InvalidMarketId error"
+        );
+    }
+
+    #[test]
+    fn batch_too_large_rejected() {
+        let env = fresh_env();
+        let (_id, client) = register(&env);
+        let user = caller(&env);
+
+        let mut bets = Vec::new(&env);
+        for _ in 0..101 {
+            bets.push_back(Bet {
+                market_id: 1,
+                amount: 100,
+            });
+        }
+
+        env.mock_all_auths();
+        let result = client.try_place_bets(&user, &bets, &key(&env, 0x0C));
+        assert_eq!(
+            result,
+            Err(Ok(Error::BatchTooLarge)),
+            "batch exceeding 100 bets must return BatchTooLarge error"
+        );
+    }
 }

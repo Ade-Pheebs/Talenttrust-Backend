@@ -126,6 +126,13 @@ pub struct Bet {
     pub amount: i128,
 }
 
+/// Maximum number of bets allowed in a single batch submission.
+///
+/// Bounds the amount of work performed per invocation so that a single
+/// transaction cannot exhaust the ledger budget or produce an unbounded
+/// state transition.
+pub const MAX_BATCH_SIZE: u32 = 100;
+
 /// Process a batch of bets atomically with an idempotency guarantee.
 ///
 /// # Arguments
@@ -165,6 +172,12 @@ pub struct Bet {
 /// processes the batch unconditionally.  **This path is deprecated** and
 /// will be removed in a future version.  Callers should generate a random
 /// 32-byte token for every batch.
+///
+/// # Determinism
+///
+/// The idempotency key is committed to storage before any batch side
+/// effects.  If batch application fails, the key is rolled back so that
+/// a retry with the same key is treated as a fresh submission.
 pub fn place_bets(
     env: &Env,
     caller: Address,
@@ -178,6 +191,24 @@ pub fn place_bets(
     // 2. Validate the whole batch before touching storage (checks before
     //    effects, #1288). Invalid input never consumes the key.
     let total_amount = validate(&bets)?;
+
+    // Enforce the upper bound on batch size.
+    if bets.len() > MAX_BATCH_SIZE {
+        return Err(Error::BatchTooLarge);
+    }
+
+    // Validate each bet: positive amount and no duplicate market ids.
+    for i in 0..bets.len() {
+        let bet = bets.get(i).unwrap();
+        if bet.amount <= 0 {
+            return Err(Error::InvalidBetAmount);
+        }
+        for j in (i + 1)..bets.len() {
+            if bets.get(j).unwrap().market_id == bet.market_id {
+                return Err(Error::DuplicateBet);
+            }
+        }
+    }
 
     // ------------------------------------------------------------------
     // Idempotency check
@@ -235,6 +266,3 @@ pub fn place_bets(
 
     Ok(())
 }
-
-// Symbol is used above; import it here to keep the use-site clean.
-use soroban_sdk::Symbol;

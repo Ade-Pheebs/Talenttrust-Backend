@@ -24,7 +24,20 @@ export const API_KEYS_MAX_PAGE_SIZE = 100;
 
 const CURSOR_VERSION = 1;
 const CURSOR_MAX_LENGTH = 512;
-const CURSOR_SECRET.process.env.API_KEYS_CURSOR_SECRET ?? 'talenttrust-api-keys-cursor-v1';
+/**
+ * Maximum allowed byte length for the `id` field embedded inside a cursor
+ * payload. Prevents crafted cursors from carrying unexpectedly large data
+ * values while staying under CURSOR_MAX_LENGTH.
+ */
+const CURSOR_ID_MAX_LENGTH = 200;
+/**
+ * Maximum allowed byte length for the `createdAt` ISO-8601 string embedded
+ * inside a cursor payload. An ISO-8601 date is at most ~30 characters, so
+ * 64 is a generous upper bound.
+ */
+const CURSOR_CREATED_AT_MAX_LENGTH = 64;
+
+const CURSOR_SECRET = process.env.API_KEYS_CURSOR_SECRET ?? 'talenttrust-api-keys-cursor-v1';
 
 export interface ApiKeyCursorPosition {
   createdAt: string;
@@ -143,9 +156,12 @@ export function decodeApiKeyCursor(cursor: string): ApiKeyCursorPosition {
     if (
       decoded.version !== CURSOR_VERSION ||
       typeof decoded.createdAt !== 'string' ||
+      decoded.createdAt.length === 0 ||
+      decoded.createdAt.length > CURSOR_CREATED_AT_MAX_LENGTH ||
       Number.isNaN(Date.parse(decoded.createdAt)) ||
       typeof decoded.id !== 'string' ||
-      decoded.id.length === 0
+      decoded.id.length === 0 ||
+      decoded.id.length > CURSOR_ID_MAX_LENGTH
     ) {
       throw new InvalidApiKeyCursorError();
     }
@@ -160,26 +176,40 @@ export function decodeApiKeyCursor(cursor: string): ApiKeyCursorPosition {
 }
 
 /**
- * Parse a raw `limit` value into a bounded page size.
+ * Parse and clamp a `limit` / page-size query parameter value.
  *
- * Accepts both query-string values (e.g. `"50"`) and already-parsed numbers
- * (e.g. `50`) so callers that coerce `req.query` first remain compatible.
- * Missing, non-numeric, non-integer, or non-positive values fall back to
- * {@link API_KEYS_DEFAULT_PAGE_SIZE}; larger values are clamped to
- * {@link API_KEYS_MAX_PAGE_SIZE}. Never throws.
+ * Validation rules (enforced at the boundary):
+ * - Only string values from query parameters are accepted; non-string types
+ *   (e.g. a raw number, boolean, or object) are treated as absent and return
+ *   the default. This prevents callers from bypassing string parsing.
+ * - The string must represent a **positive integer** (digits only, no decimal
+ *   point, no leading sign). Floats like `"1.5"` and strings like `"abc"`
+ *   fall back to the default rather than throwing.
+ * - Values above {@link API_KEYS_MAX_PAGE_SIZE} are clamped to the maximum.
+ * - `undefined`, `null`, and `""` return the default page size.
+ *
+ * @param value - Raw query parameter value (typically `req.query.limit`).
+ * @returns A positive integer in the range [1, {@link API_KEYS_MAX_PAGE_SIZE}].
  */
 export function parseApiKeyPageSize(value: unknown): number {
   if (value === undefined || value === null || value === '') {
     return API_KEYS_DEFAULT_PAGE_SIZE;
   }
 
-  const parsed =
-    typeof value === 'number'
-      ? value
-      : typeof value === 'string'
-        ? Number(value)
-        : Number.NaN;
+  // Only accept strings — numeric or other non-string types are treated as
+  // absent to prevent type-confusion bypasses from callers that coerce values.
+  if (typeof value !== 'string') {
+    return API_KEYS_DEFAULT_PAGE_SIZE;
+  }
 
+  // Require a string of pure digits (no sign, no decimal point, no whitespace).
+  // This explicitly rejects floats like "1.5", negative representations "-1",
+  // and strings with leading/trailing whitespace before further parsing.
+  if (!/^\d+$/.test(value)) {
+    return API_KEYS_DEFAULT_PAGE_SIZE;
+  }
+
+  const parsed = Number(value);
   if (!Number.isInteger(parsed) || parsed <= 0) {
     return API_KEYS_DEFAULT_PAGE_SIZE;
   }

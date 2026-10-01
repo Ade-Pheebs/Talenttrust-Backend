@@ -44,17 +44,7 @@ export interface AuditServiceOptions {
   maxRetries?: number;
 }
 
-export const VALID_ACTIONS = new Set<AuditAction>([
-  'CONTRACT_CREATED', 'CONTRACT_UPDATED', 'CONTRACT_CANCELLED', 'CONTRACT_COMPLETED',
-  'PAYMENT_INITIATED', 'PAYMENT_RELEASED', 'PAYMENT_DISPUED',
-  'REPUTATION_UPDATED',
-  'REPUTATION_CORRECTED',
-  'USER_CREATED', 'USER_UPDATED', 'USER_DELETED',
-  'AUTH_LOGIN', 'AUTH_LOGOUT', 'AUTH_FAILED',
-  'AUTH_LOCKOUT_TRIGGERED', 'AUTH_LOCKOUT_RELEASED',
-  'ADMIN_ACTION',
-  'ENDPOINT_ACCESS', 'ENDEPOINT_MUTATION',
-]);
+export const VALID_ACTIONS = new Set<AuditAction>(['CONTRACT_CREATED', 'CONTRACT_UPDATED', 'CONTRACT_CANCELLED', 'CONTRACT_COMPLETED', 'PAYMENT_INITIATED', 'PAYMENT_RELEASED', 'PAYMENT_DISPUTED', 'REPUTATION_UPDATED', 'REPUTATION_CORRECTED', 'USER_CREATED', 'USER_UPDATED', 'USER_DELETED', 'AUTH_LOGIN', 'AUTH_LOGOUT', 'AUTH_FAILED', 'AUTH_LOCKOUT_TRIGGERED', 'AUTH_LOCKOUT_RELEASED', 'ADMIN_ACTION', 'ENDPOINT_ACCESS', 'ENDPOINT_MUTATION']);
 
 export const VALID_SEVERITIES: ReadonlySet<AuditSeverity> = new Set<AuditSeverity>(AUDIT_SEVERITIES);
 
@@ -562,6 +552,15 @@ export class AuditService {
 
   /**
    * Orchestrates NDJSON compliance log exports and records an ADMIN_ACTION audit log.
+   *
+   * Failure recovery is deterministic:
+   * 1. A failed export attempt is recorded as a CRITICAL ADMIN_ACTION event with
+   *    a stable failure code and no sensitive data, so the failure is observable.
+   * 2. The original error is then re-thrown as a stable, classified error so the
+   *    caller can retry deterministically without losing the failure signal.
+   * 3. The failure record is best-effort: if the audit write itself fails, the
+   *    original export error is still surfaced so the caller never sees a silent
+   *    success.
    */
   async exportAuditLogs(
     queryParams: Record<string, unknown>,
@@ -581,7 +580,15 @@ export class AuditService {
       ...(query.limit !== undefined && { limit: query.limit }),
     };
 
-    const exportResult = await exportService.createNdJsonExport(filters);
+    let exportResult: AuditExportResult;
+    try {
+      exportResult = await exportService.createNdjsonExport(filters);
+    } catch (err) {
+      // Record the failed attempt best-effort so the failure is observable,
+      // then re-throw a stable classified error for deterministic recovery.
+      this.recordExportFailure(filters, context, err);
+      throw new Error('Audit export failed');
+    }
 
     this.log( {
       action: 'ADMIN_ACTION',
@@ -609,6 +616,50 @@ export class AuditService {
     });
 
     return exportResult;
+  }
+
+  /**
+   * Records a failed export attempt as an audit event.
+   *
+   * This is best-effort: any failure to write the failure record is logged but
+   * never alters the outcome of the calling operation. Only non-sensitive,
+   * bounded fields are persisted so failures remain diagnosable without leaking
+   * raw error messages or payload contents.
+   */
+  private recordExportFailure(
+    filters: AuditExportFilters,
+    context: { actor?: string; ipAddress?: string; correlationId?: string },
+    error: unknown,
+  ): void {
+    try {
+      this.log({
+        action: 'ADMIN_ACTION',
+        severity: 'CRITICAL',
+        actor: context.actor ?? 'anonymous',
+        resource: 'audit-log',
+        resourceId: 'export',
+        metadata: {
+          operation: 'export',
+          format: 'ndjson',
+          status: 'failed',
+          errorCode: 'EXPORT_FAILED',
+          errorName: error instanceof Error ? error.name : 'UnknownError',
+          filters: {
+            action: filters.action ?? null,
+            severity: filters.severity ?? null,
+            actor: filters.actor ?? null,
+            resource: filters.resource ?? null,
+            resourceId: filters.resourceId ?? null,
+            from: filters.from ?? null,
+            to: filters.to ?? null,
+          },
+        },
+        ipAddress: context.ipAddress,
+        correlationId: context.correlationId,
+      });
+    } catch (auditErr) {
+      console.error('[AuditService] Failed to record export failure:', auditErr);
+    }
   }
 
   /**
@@ -718,8 +769,8 @@ export class AuditService {
   /**
    * Queries audit entries with the given filters.
    */
-  query(filters: AuditQuery): AuditEntry[] {
-    return this.repository.query(filters);
+  query(query: AuditQuery): AuditEntry[] {
+    return this.repository.query(query);
   }
 
   /**
@@ -730,10 +781,10 @@ export class AuditService {
   }
 
   /**
-   * Verifies the integrity of the audit log.
+   * Returns an integrity report for the audit log.
    */
-  verifyIntegrity(): IntegrityReport {
-    return this.repository.verifyIntegrity();
+  getIntegrityReport(): IntegrityReport {
+    return this.repository.getIntegrityReport();
   }
 }
 

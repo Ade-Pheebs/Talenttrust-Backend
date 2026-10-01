@@ -19,12 +19,100 @@ import { appConfigSchema } from '../appConfiguration';
  *  - Do not log secret values in error messages.
  *  - Use transformations to sanitize inputs.
  */
+
+/**
+ * Validation boundaries for environment configuration.
+ *
+ * These constants define the accepted numeric ranges and string shapes for
+ * every bounded field in {@link envSchema}. They are exported so that tests
+ * and downstream consumers can assert against the same boundaries the schema
+ * enforces, avoiding drift between production validation and test fixtures.
+ *
+ * Invariants:
+ *  - Every numeric bound is inclusive on both ends unless documented otherwise.
+ *  - `PORT` and `SMTP_PORT` share the same TCP port range.
+ *  - Timeout/delay bounds are expressed in milliseconds and are always >= 0.
+ *  - Retry counts are always >= 0 and capped to prevent unbounded retry loops.
+ */
+export const VALIDATION_BOUNDS = Object.freeze({
+  PORT_MIN: 1,
+  PORT_MAX: 65535,
+  SMTP_PORT_MIN: 1,
+  SMTP_PORT_MAX: 65535,
+  STELLAR_RPC_TIMEOUT_MS_MIN: 1,
+  STELLAR_RPC_TIMEOUT_MS_MAX: 120_000,
+  STELLAR_RPC_MAX_RETRIES_MIN: 0,
+  STELLAR_RPC_MAX_RETRIES_MAX: 10,
+  STELLAR_RPC_RETRY_DELAY_MS_MIN: 0,
+  STELLAR_RPC_RETRY_DELAY_MS_MAX: 60_000,
+  QUEUE_FAILED_THRESHOLD_MIN: 0,
+  QUEUE_FAILED_THRESHOLD_MAX: 10_000,
+  QUEUE_BACKLOG_THRESHOLD_MIN: 0,
+  QUEUE_BACKLOG_THRESHOLD_MAX: 1_000_000,
+  QUEUE_PROBE_TIMEOUT_MS_MIN: 1,
+  QUEUE_PROBE_TIMEOUT_MS_MAX: 30_000,
+  WEBHOOK_DELIVERY_TIMEOUT_MS_MIN: 100,
+  WEBHOOK_DELIVERY_TIMEOUT_MS_MAX: 120_000,
+  WEBHOOK_MAX_PAYLOAD_SIZE_BYTES_MIN: 1024,
+  WEBHOOK_MAX_PAYLOAD_SIZE_BYTES_MAX: 10_485_760,
+  DISPUTES_CACHE_TTL_MS_MIN: 1,
+  DISPUTES_CACHE_TTL_MS_MAX: 300_000,
+  DISPUTES_CACHE_SWR_MS_MIN: 0,
+  DISPUTES_CACHE_SWR_MS_MAX: 600_000,
+  DISPUTES_CACHE_MAX_ENTRIES_MIN: 1,
+  DISPUTES_CACHE_MAX_ENTRIES_MAX: 10_000,
+  HTTP_METRICS_ROUTE_LABEL_LIMIT_MIN: 1,
+  HTTP_METRICS_ROUTE_LABEL_LIMIT_MAX: 10_000,
+  EMAIL_SEND_TIMEOUT_MS_MIN: 1000,
+  EMAIL_SEND_TIMEOUT_MS_MAX: 120_000,
+  FINALITY_DEFAULT_DEPTH_MIN: 0,
+  FINALITY_DEFAULT_DEPTH_MAX: 1000,
+  REPUTATION_DECAY_LAMBDA_MIN_EXCLUSIVE: 0,
+  REPUTATION_DECAY_LAMBDA_MAX: 1,
+  COMPLIANCE_AUDIT_SECRET_MIN_LENGTH: 32,
+  JWT_SECRET_MIN_LENGTH_PRODUCTION: 32,
+} as const);
+
+/**
+ * Parses a string into a base-10 integer, returning `undefined` for empty or
+ * whitespace-only input. This is the single canonical numeric coercion used
+ * by the schema so that `''`, `'  '`, and `undefined` behave identically.
+ */
+function parseOptionalInt(val: string | undefined): number | undefined {
+  if (val === undefined) return undefined;
+  const trimmed = val.trim();
+  if (trimmed === '') return undefined;
+  return parseInt(trimmed, 10);
+}
+
+/**
+ * Parses a string into a base-10 integer with a default fallback for empty
+ * or whitespace-only input.
+ */
+function parseIntOrDefault(val: string | undefined, fallback: number): number {
+  const parsed = parseOptionalInt(val);
+  return parsed === undefined ? fallback : parsed;
+}
+
+/**
+ * Parses a boolean-ish string. Accepts `true`/`1` as true and
+ * `false`/`0` as false. Any other value (including empty) yields `undefined`
+ * so callers can apply their own default.
+ */
+function parseOptionalBool(val: string | undefined): boolean | undefined {
+  if (val === undefined) return undefined;
+  const lower = val.trim().toLowerCase();
+  if (lower === 'true' || lower === '1') return true;
+  if (lower === 'false' || lower === '0') return false;
+  return undefined;
+}
+
 export const envSchema = z.object({
   // Server Configuration
   PORT: z.string()
     .default('3001')
     .transform((val) => val === '' ? 3001 : parseInt(val, 10))
-    .pipe(z.number().int().min(1).max(65535)),
+    .pipe(z.number().int().min(VALIDATION_BOUNDS.PORT_MIN).max(VALIDATION_BOUNDS.PORT_MAX)),
 
   NODE_ENV: z.enum(['development', 'staging', 'production', 'test'])
     .default('development'),
@@ -41,33 +129,28 @@ export const envSchema = z.object({
    */
   SSRF_ALLOW_PRIVATE_HOSTS: z.string()
     .optional()
-    .transform((val) => {
-      if (val === undefined || val.trim() === '') return false;
-      const lower = val.trim().toLowerCase();
-      if (lower === 'true' || lower === '1') return true;
-      if (lower === 'false' || lower === '0') return false;
-      return false;
-    })
+    .transform((val) => parseOptionalBool(val) ?? false)
     .pipe(z.boolean()),
 
 
   DEBUG: z.string()
     .optional()
-    .transform((val) => val === 'true'),
+    .transform((val) => parseOptionalBool(val) ?? false)
+    .pipe(z.boolean()),
 
   MAX_REQUEST_SIZE: z.string().default('10mb'),
 
   CORS_ALLOWED_ORIGINS: z.string()
     .optional()
     .transform((val) => {
-      if (val === undefined) return undefined;
+      if (val === undefined || val.trim() === '') return undefined;
       return val.split(',').map(o => o.trim()).filter(Boolean);
     }),
 
   // Feature Flags
   CONTRACTS_ENABLED: z.string()
     .optional()
-    .transform((val) => val !== 'false')
+    .transform((val) => parseOptionalBool(val) ?? true)
     .pipe(z.boolean()),
 
   // Database
@@ -77,13 +160,13 @@ export const envSchema = z.object({
   JWT_SECRET: z.string().optional(), // Required in non-test environments, validated by superRefine
   // Compliance audit HMAC secret – required for proof generation.
   COMPLIANCE_AUDIT_SECRET: z.string()
-    .min(32, "COMPLIANCE_AUDIT_SECRET must be at least 32 characters")
+    .min(VALIDATION_BOUNDS.COMPLIANCE_AUDIT_SECRET_MIN_LENGTH, "COMPLIANCE_AUDIT_SECRET must be at least 32 characters")
     .nonempty("COMPLIANCE_AUDIT_SECRET cannot be empty"),
   // Admin API Key Configuration
   ADMIN_API_KEY: z.string().optional(),
   ADMIN_API_KEY_SCOPES: z.string()
     .optional()
-    .transform((val) => val ? val.split(',') : ['deploy:*', '*', 'jobs:admin', 'jobs:*'])
+    .transform((val) => (val && val.trim() !== '') ? val.split(',').map(s => s.trim()).filter(Boolean) : ['deploy:*', '*', 'jobs:admin', 'jobs:*'])
     .pipe(z.array(z.string()).optional()),
 
   // API-key management rate limiting
@@ -126,38 +209,38 @@ export const envSchema = z.object({
   STELLAR_RPC_TIMEOUT_MS: z.string()
     .default('5000')
     .transform((val) => parseInt(val, 10))
-    .pipe(z.number().int().positive('STELLAR_RPC_TIMEOUT_MS must be greater than 0').max(120_000)),
+    .pipe(z.number().int().min(VALIDATION_BOUNDS.STELLAR_RPC_TIMEOUT_MS_MIN, 'STELLAR_RPC_TIMEOUT_MS must be greater than 0').max(VALIDATION_BOUNDS.STELLAR_RPC_TIMEOUT_MS_MAX)),
 
   STELLAR_RPC_MAX_RETRIES: z.string()
     .default('3')
     .transform((val) => parseInt(val, 10))
-    .pipe(z.number().int().min(0, 'STELLAR_RPC_MAX_RETRIES must be >= 0').max(10, 'STELLAR_RPC_MAX_RETRIES must be <= 10')),
+    .pipe(z.number().int().min(VALIDATION_BOUNDS.STELLAR_RPC_MAX_RETRIES_MIN, 'STELLAR_RPC_MAX_RETRIES must be >= 0').max(VALIDATION_BOUNDS.STELLAR_RPC_MAX_RETRIES_MAX, 'STELLAR_RPC_MAX_RETRIES must be <= 10')),
 
   STELLAR_RPC_RETRY_BASE_DELAY_MS: z.string()
     .default('200')
     .transform((val) => parseInt(val, 10))
-    .pipe(z.number().int().nonnegative('STELLAR_RPC_RETRY_BASE_DELAY_MS must be >= 0').max(60_000)),
+    .pipe(z.number().int().min(VALIDATION_BOUNDS.STELLAR_RPC_RETRY_DELAY_MS_MIN, 'STELLAR_RPC_RETRY_BASE_DELAY_MS must be >= 0').max(VALIDATION_BOUNDS.STELLAR_RPC_RETRY_DELAY_MS_MAX)),
 
    STELLAR_RPC_RETRY_MAX_DELAY_MS: z.string()
      .default('2000')
      .transform((val) => parseInt(val, 10))
-     .pipe(z.number().int().nonnegative('STELLAR_RPC_RETRY_MAX_DELAY_MS must be >= 0').max(60_000)),
+     .pipe(z.number().int().min(VALIDATION_BOUNDS.STELLAR_RPC_RETRY_DELAY_MS_MIN, 'STELLAR_RPC_RETRY_MAX_DELAY_MS must be >= 0').max(VALIDATION_BOUNDS.STELLAR_RPC_RETRY_DELAY_MS_MAX)),
 
    // Health Probe Configuration
    QUEUE_FAILED_THRESHOLD: z.string()
      .default('10')
      .transform((val) => parseInt(val, 10))
-     .pipe(z.number().int().nonnegative('QUEUE_FAILED_THRESHOLD must be >= 0').max(10_000)),
+     .pipe(z.number().int().min(VALIDATION_BOUNDS.QUEUE_FAILED_THRESHOLD_MIN, 'QUEUE_FAILED_THRESHOLD must be >= 0').max(VALIDATION_BOUNDS.QUEUE_FAILED_THRESHOLD_MAX)),
 
    QUEUE_BACKLOG_THRESHOLD: z.string()
      .default('100')
      .transform((val) => parseInt(val, 10))
-     .pipe(z.number().int().nonnegative('QUEUE_BACKLOG_THRESHOLD must be >= 0').max(1_000_000)),
+     .pipe(z.number().int().min(VALIDATION_BOUNDS.QUEUE_BACKLOG_THRESHOLD_MIN, 'QUEUE_BACKLOG_THRESHOLD must be >= 0').max(VALIDATION_BOUNDS.QUEUE_BACKLOG_THRESHOLD_MAX)),
 
    QUEUE_PROBE_TIMEOUT_MS: z.string()
      .default('3000')
      .transform((val) => parseInt(val, 10))
-     .pipe(z.number().int().positive('QUEUE_PROBE_TIMEOUT_MS must be > 0').max(30_000)),
+     .pipe(z.number().int().min(VALIDATION_BOUNDS.QUEUE_PROBE_TIMEOUT_MS_MIN, 'QUEUE_PROBE_TIMEOUT_MS must be > 0').max(VALIDATION_BOUNDS.QUEUE_PROBE_TIMEOUT_MS_MAX)),
 
    // Router / Blue-Green Deployment Configuration
   ACTIVE_COLOR: z.enum(['blue', 'green']).default('blue'),
@@ -167,54 +250,65 @@ export const envSchema = z.object({
   // Request Limits Configuration
   MAX_REQUEST_BODY_SIZE: z.string()
     .optional()
-    .transform((val) => val === undefined ? undefined : parseInt(val, 10))
+    .transform((val) => parseOptionalInt(val))
     .pipe(z.number().int().nonnegative().optional()),
 
   ENFORCE_JSON_CONTENT_TYPE: z.string()
     .optional()
-    .transform((val) => val === undefined ? undefined : val !== 'false')
+    .transform((val) => parseOptionalBool(val))
     .pipe(z.boolean().optional()),
 
   ALLOWED_CONTENT_TYPES: z.string()
     .optional()
-    .transform((val) => val ? val.split(',').map(ct => ct.trim()) : undefined)
+    .transform((val) => (val && val.trim() !== '') ? val.split(',').map(ct => ct.trim()).filter(Boolean) : undefined)
     .pipe(z.array(z.string()).optional()),
 
   REQUEST_LIMITS_EXCLUDE_PATHS: z.string()
     .optional()
-    .transform((val) => val ? val.split(',').map(p => p.trim()) : undefined)
+    .transform((val) => (val && val.trim() !== '') ? val.split(',').map(p => p.trim()).filter(Boolean) : undefined)
     .pipe(z.array(z.string()).optional()),
 
   WEBHOOK_DELIVERY_TIMEOUT_MS: z.string()
     .default('10000')
     .transform((val) => parseInt(val, 10))
-    .pipe(z.number().int().min(100).max(120_000)),
+    .pipe(z.number().int().min(VALIDATION_BOUNDS.WEBHOOK_DELIVERY_TIMEOUT_MS_MIN).max(VALIDATION_BOUNDS.WEBHOOK_DELIVERY_TIMEOUT_MS_MAX)),
 
   WEBHOOK_MAX_PAYLOAD_SIZE_BYTES: z.string()
     .default('1048576')
     .transform((val) => parseInt(val, 10))
-    .pipe(z.number().int().min(1024).max(10485760)),
+    .pipe(z.number().int().min(VALIDATION_BOUNDS.WEBHOOK_MAX_PAYLOAD_SIZE_BYTES_MIN).max(VALIDATION_BOUNDS.WEBHOOK_MAX_PAYLOAD_SIZE_BYTES_MAX)),
 
   IDEMPOTENCY_TTL_MS: z.string()
     .optional()
-    .transform((val) => val === undefined ? undefined : parseInt(val, 10))
+    .transform((val) => parseOptionalInt(val))
     .pipe(z.number().int().positive().optional()),
 
   // Disputes Cache Configuration
   DISPUTES_CACHE_TTL_MS: z.string()
     .default('5000')
     .transform((val) => parseInt(val, 10))
-    .pipe(z.number().int().positive('DISPUTES_CACHE_TTL_MS must be a positive integer').max(300_000)),
+    .pipe(z.number().int().min(VALIDATION_BOUNDS.DISPUTES_CACHE_TTL_MS_MIN, 'DISPUTES_CACHE_TTL_MS must be a positive integer').max(VALIDATION_BOUNDS.DISPUTES_CACHE_TTL_MS_MAX)),
 
   DISPUTES_CACHE_SWR_MS: z.string()
     .default('30000')
     .transform((val) => parseInt(val, 10))
-    .pipe(z.number().int().nonnegative('DISPUTES_CACHE_SWR_MS must be >= 0').max(600_000)),
+    .pipe(z.number().int().min(VALIDATION_BOUNDS.DISPUTES_CACHE_SWR_MS_MIN, 'DISPUTES_CACHE_SWR_MS must be >= 0').max(VALIDATION_BOUNDS.DISPUTES_CACHE_SWR_MS_MAX)),
 
   DISPUTES_CACHE_MAX_ENTRIES: z.string()
     .default('100')
     .transform((val) => parseInt(val, 10))
-    .pipe(z.number().int().positive('DISPUTES_CACHE_MAX_ENTRIES must be a positive integer').max(10000)),
+    .pipe(z.number().int().min(VALIDATION_BOUNDS.DISPUTES_CACHE_MAX_ENTRIES_MIN, 'DISPUTES_CACHE_MAX_ENTRIES must be a positive integer').max(VALIDATION_BOUNDS.DISPUTES_CACHE_MAX_ENTRIES_MAX)),
+
+  // Auth Cache Configuration
+  AUTH_CACHE_TTL_MS: z.string()
+    .default('5000')
+    .transform((val) => parseInt(val, 10))
+    .pipe(z.number().int().positive('AUTH_CACHE_TTL_MS must be a positive integer').max(300_000)),
+
+  AUTH_CACHE_MAX_ENTRIES: z.string()
+    .default('100')
+    .transform((val) => parseInt(val, 10))
+    .pipe(z.number().int().positive('AUTH_CACHE_MAX_ENTRIES must be a positive integer').max(10000)),
 
   RATE_LIMIT_STORE_TYPE: z.enum(['memory', 'redis'])
     .default('memory'),
@@ -253,7 +347,7 @@ export const envSchema = z.object({
   HTTP_METRICS_ROUTE_LABEL_LIMIT: z.string()
     .default('100')
     .transform((val) => parseInt(val, 10))
-    .pipe(z.number().int().positive().max(10000)),
+    .pipe(z.number().int().min(VALIDATION_BOUNDS.HTTP_METRICS_ROUTE_LABEL_LIMIT_MIN).max(VALIDATION_BOUNDS.HTTP_METRICS_ROUTE_LABEL_LIMIT_MAX)),
 
   // Metrics Rate Limiting
   METRICS_RATE_LIMIT_MAX_REQUESTS: z.string()
@@ -277,8 +371,8 @@ export const envSchema = z.object({
     .default('0.005')
     .transform((val) => parseFloat(val))
     .pipe(z.number()
-      .positive('REPUTATION_DECAY_LAMBDA must be greater than 0')
-      .max(1, 'REPUTATION_DECAY_LAMBDA must be less than or equal to 1')),
+      .gt(VALIDATION_BOUNDS.REPUTATION_DECAY_LAMBDA_MIN_EXCLUSIVE, 'REPUTATION_DECAY_LAMBDA must be greater than 0')
+      .max(VALIDATION_BOUNDS.REPUTATION_DECAY_LAMBDA_MAX, 'REPUTATION_DECAY_LAMBDA must be less than or equal to 1')),
 
   REPUTATION_SCORE_ALGORITHM_VERSION: z.string()
     .default('exp-decay-v1'),
@@ -315,13 +409,13 @@ export const envSchema = z.object({
   EMAIL_SEND_TIMEOUT_MS: z.string()
     .default('10000')
     .transform((val) => parseInt(val, 10))
-    .pipe(z.number().int().min(1000).max(120_000)),
+    .pipe(z.number().int().min(VALIDATION_BOUNDS.EMAIL_SEND_TIMEOUT_MS_MIN).max(VALIDATION_BOUNDS.EMAIL_SEND_TIMEOUT_MS_MAX)),
 
   SMTP_HOST: z.string().optional(),
   SMTP_PORT: z.string()
     .optional()
-    .transform((val) => val === undefined ? undefined : parseInt(val, 10))
-    .pipe(z.number().int().min(1).max(65535).optional()),
+    .transform((val) => parseOptionalInt(val))
+    .pipe(z.number().int().min(VALIDATION_BOUNDS.SMTP_PORT_MIN).max(VALIDATION_BOUNDS.SMTP_PORT_MAX).optional()),
   SMTP_USER: z.string().optional(),
   SMTP_PASSWORD: z.string().optional(),
   SMTP_FROM: z.string()
@@ -331,7 +425,7 @@ export const envSchema = z.object({
     }),
   SMTP_SECURE: z.string()
     .optional()
-    .transform((val) => val === undefined ? undefined : val === 'true'),
+    .transform((val) => parseOptionalBool(val)),
 
   AWS_ACCESS_KEY_ID: z.string().optional(),
   AWS_SECRET_ACCESS_KEY: z.string().optional(),
@@ -353,7 +447,7 @@ export const envSchema = z.object({
    */
   WEBHOOKS_ENABLED: z.string()
     .optional()
-    .transform((val) => val !== 'false'),
+    .transform((val) => parseOptionalBool(val) ?? true),
 
   // ── Audit Feature Flag ──────────────────────────────────────────────────────
   /**
@@ -370,7 +464,7 @@ export const envSchema = z.object({
    */
   AUDIT_ENABLED: z.string()
     .optional()
-    .transform((val) => val !== 'false'),
+    .transform((val) => parseOptionalBool(val) ?? true),
 
   // ── Blockchain Finality Configuration ───────────────────────────────────────
   /**
@@ -397,7 +491,7 @@ export const envSchema = z.object({
   FINALITY_DEFAULT_DEPTH: z.string()
     .default('6')
     .transform((val) => parseInt(val, 10))
-    .pipe(z.number().int().nonnegative('FINALITY_DEFAULT_DEPTH must be a non-negative integer').max(1000)),
+    .pipe(z.number().int().min(VALIDATION_BOUNDS.FINALITY_DEFAULT_DEPTH_MIN, 'FINALITY_DEFAULT_DEPTH must be a non-negative integer').max(VALIDATION_BOUNDS.FINALITY_DEFAULT_DEPTH_MAX)),
 
   /**
    * FINALITY_ALLOW_ZERO_CONFIRMATION — when `true`, a configured depth
@@ -407,13 +501,7 @@ export const envSchema = z.object({
    */
   FINALITY_ALLOW_ZERO_CONFIRMATION: z.string()
     .optional()
-    .transform((val) => {
-      if (val === undefined || val.trim() === '') return undefined;
-      const lower = val.trim().toLowerCase();
-      if (lower === 'true' || lower === '1') return true;
-      if (lower === 'false' || lower === '0') return false;
-      return undefined;
-    })
+    .transform((val) => parseOptionalBool(val))
     .pipe(z.boolean().optional()),
 
   /**
@@ -507,6 +595,14 @@ export type EnvConfig = z.infer<typeof envSchema>;
  * @returns The validated and typed configuration object
  * @throws {Error} If validation fails, with safe error messages
  */
+/**
+ * Validates the provided environment object against the schema.
+ *
+ * Determinism guarantees:
+ *  - The same input always produces the same output or the same error set.
+ *  - Error messages never include the offending value, only the field path.
+ *  - In test environments, validation failures throw instead of exiting.
+ */
 export function validateEnv(env: NodeJS.ProcessEnv = process.env): EnvConfig {
   const result = envSchema.safeParse(env);
 
@@ -514,7 +610,7 @@ export function validateEnv(env: NodeJS.ProcessEnv = process.env): EnvConfig {
     const errors = result.error.errors.map((err) => {
       const path = err.path.join('.');
       // Avoid leaking the actual value in the error message
-      return `Field "${path}": ${err.message}`;
+      return `Field "${path || '<root>'}": ${err.message}`;
     });
 
     const errorMsg = `Configuration validation failed:\n${errors.join('\n')}`;
@@ -523,7 +619,7 @@ export function validateEnv(env: NodeJS.ProcessEnv = process.env): EnvConfig {
     // Fail fast with clear error code
     const isTest = process.env.NODE_ENV === 'test' || process.env.JEST_WORKER_ID;
     if (!isTest) {
-      process.exit(1);
+      throw new Error(errorMsg);
     } else {
       throw new Error(errorMsg);
     }

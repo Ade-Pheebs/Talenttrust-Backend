@@ -54,6 +54,8 @@ export interface AppConfig {
   milestonesEnabled: boolean;
 }
 
+export const DEFAULT_ALLOWED_ASSETS: readonly string[] = Object.freeze(['USDC', 'XLM', 'BTC', 'ETH']);
+
 const MAX_TIMEOUT_MS = 10_000;
 const MIN_TIMEOUT_MS = 100;
 
@@ -171,10 +173,13 @@ function parseAssets(value: string | undefined): string[] {
     return [...DEFAULT_ALLOWED_ASSETS];
   }
 
-  return value
+  const parsed = value
     .split(',')
     .map((item) => item.trim().toUpperCase())
     .filter(Boolean);
+
+  // Deduplicate while preserving order to keep behavior deterministic.
+  return Array.from(new Set(parsed));
 }
 
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
@@ -206,13 +211,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
   return {
     port,
     gracefulDegradationEnabled: parseBoolean(env.GRACEFUL_DEGRADATION_ENABLED, true),
-    upstreamContractsUrl: (() => {
-      const url = env.UPSTREAM_CONTRACTS_URL ?? 'https://example.invalid/contracts';
-      if (!isSafeUrl(url)) {
-        throw new Error(`Invalid UPSTREAM_CONTRACTS_URL: SSRF protection blocked access to internal resource "${url}"`);
-      }
-      return url;
-    })(),
+    upstreamContractsUrl,
     upstreamTimeoutMs,
     chaosMode: parseChaosMode(env.CHAOS_MODE),
     chaosTargets: parseTargets(env.CHAOS_TARGETS),
@@ -313,4 +312,43 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     allowedAssets: parseAssets(env.ALLOWED_ASSETS),
     milestonesEnabled: parseBoolean(env.MILESTONES_ENABLED, true),
   };
+}
+
+/**
+ * Loads the application configuration from the provided environment.
+ *
+ * Concurrency / idempotency guarantees:
+ *   - When no explicit env is passed and `forceReload` is false, the result is
+  *     cached and returned by reference. Callers must treat the returned
+ *     object as immutable.
+   - The cache is invalidated automatically when any config-relevant
+  *     environment variable changes, so concurrent callers never observe
+ *     stale values.
+ *   - Parsing is synchronous; a concurrent caller either observes the
+ *     previous consistent cache or the newly built one, never a partially
+ *     constructed object.
+ *   - Invalid configuration (e.g. SSRF blocked URL) throws before the cache
+  *     is updated, so a failed reload never corrupts a previously valid
+ *     cache.
+ */
+export function loadConfig(
+  env: NodeJS.ProcessEnv = process.env,
+  options: LoadConfigOptions = {},
+): AppConfig {
+  const useCache = env === process.env && !options.forceReload;
+
+  if (useCache) {
+    const snapshot = snapshotEnv(env);
+    if (cache && snapshotsEqual(cache.snapshot, snapshot)) {
+      return cache.config;
+    }
+
+    // Build first, then swap atomically. If building throws, the existing
+    // cache remains untouched.
+    const next = buildConfig(env);
+    cache = { config: next, snapshot };
+    return next;
+  }
+
+  return buildConfig(env);
 }

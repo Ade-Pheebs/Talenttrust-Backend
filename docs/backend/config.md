@@ -102,6 +102,11 @@ The returned object is deep-frozen, so consumers cannot mutate configuration aft
 
 ## Security Notes
 
+The separate `AppConfig` compatibility loader in `src/appConfiguration.ts` keeps
+its existing gateway policy shape and accepts an explicit environment. See
+[AppConfig compatibility](./app-configuration-compatibility.md) for its input,
+SSRF isolation, retry, and diagnostic rules.
+
 - **Never log secrets.** The config module does not log any values. Avoid
   printing the full config object in production.
 - **Keep `.env` out of version control.** The `.gitignore` already excludes

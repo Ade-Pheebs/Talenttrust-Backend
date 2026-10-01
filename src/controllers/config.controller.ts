@@ -1,6 +1,18 @@
 import { Request, Response } from 'express';
 import { loadConfig, ConfigError, AppConfig, ConfigErrorCode } from '../appConfiguration';
 
+/**
+ * Controller for exposing the application configuration.
+ *
+ * Invariants:
+ *  - The configuration is loaded through the single `loadConfig` facade so that
+ *    concurrent requests observe the same, deterministic snapshot and any
+ *    internal caching / concurrency control is preserved.
+ *  - The response is always a fresh copy of the allowed assets so callers
+ *    cannot mutate shared configuration state through the returned reference.
+ *  - Failures are logged with a correlation id and returned as a stable
+ *    `internal_error` payload without leaking internal details.
+ */
 export class ConfigController {
   /**
    * Returns the application configuration, specifically the allowed assets.
@@ -9,6 +21,8 @@ export class ConfigController {
    * @param res - Express response
    */
   static getConfig(req: Request, res: Response) {
+    const requestId = req.headers['x-request-id'] ?? req.id ?? undefined;
+
     try {
       const config: AppConfig = loadConfig();
       return res.json({

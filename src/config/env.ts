@@ -18,14 +18,60 @@
  */
 
 /**
+ * Key suffixes whose values must never be included in error messages.
+ * This keeps failures diagnosable without leaking secrets into logs.
+ */
+const SENSITIVE_KEY_SUFFIXES = [
+  'SECRET',
+  'TOKEN',
+  'PASSWORD',
+  'PASSPHRASE',
+  'CREDS',
+  'CREDENTIAL',
+  'KEY',
+  'PRIVATE',
+  'APIKEY',
+  'API_KEY',
+  'SALE',
+] as const;
+
+/**
+ * Determines whether an environment variable name looks sensitive.
+ *
+ * @param key - Environment variable name
+ * @returns true if the key name suggests a secret value
+ */
+function isSensitiveKey(key: string): boolean {
+  const upper = key.toUpperCase();
+  return SENSITIVE_KEY_SUFFIXES.some((suffix) => upper.includes(suffix));
+}
+
+/**
+ * Redacts a raw value for inclusion in an error message. For keys that
+ * look sensitive, the value is replaced with a placeholder so errors remain
+ * diagnosable without exposing secrets.
+ *
+ * @param key - Environment variable name
+ * @param raw - Raw value read from the environment
+ * @returns A display-safe string
+ */
+function describeRaw(key: string, raw: string): string {
+  if (isSensitiveKey(key)) {
+    return '<redacted>';
+  }
+  return `"${raw}"`;
+}
+
+/**
  * Reads a raw environment variable, treating empty or whitespace-only
  * strings as undefined.
  *
  * @param key - Environment variable name
+ * @param env - Optional source; existing callers continue to use process.env
  * @returns The trimmed value, or undefined if missing/empty
  */
-export function getEnv(key: string): string | undefined {
-  const value = process.env[key];
+export function getEnv(key: string, env: NodeJS.ProcessEnv = process.env): string | undefined {
+  const value = env[key];
   if (value === undefined || value.trim() === '') {
     return undefined;
   }
@@ -80,7 +126,7 @@ export function parseIntEnv(key: string, defaultValue: number): number {
   const parsed = Number(raw);
   if (!Number.finite(parsed) || !Number.isInteger(parsed)) {
     throw new Error(
-      `Environment variable ${key} must be a valid integer, got: "${raw}"`,
+      `Environment variable ${key} must be a valid integer, got: ${describeRaw(key, raw)}",
     );
   }
   return parsed;
@@ -93,11 +139,16 @@ export function parseIntEnv(key: string, defaultValue: number): number {
  *
  * @param key - Environment variable name
  * @param defaultValue - Value to return if the variable is not set
+ * @param env - Optional source; defaults to process.env for existing callers
  * @returns The parsed boolean value
  * @throws {Error} If the value is not a recognized boolean string
  */
-export function parseBoolEnv(key: string, defaultValue: boolean): boolean {
-  const raw = getEnv(key);
+export function parseBoolEnv(
+  key: string,
+  defaultValue: boolean,
+  env: NodeJS.ProcessEnv = process.env,
+): boolean {
+  const raw = getEnv(key, env);
   if (raw === undefined) {
     return defaultValue;
   }
@@ -109,6 +160,6 @@ export function parseBoolEnv(key: string, defaultValue: boolean): boolean {
     return false;
   }
   throw new Error(
-    `Environment variable ${key} must be "true" or "false", got: "${raw}"`,
+    `Environment variable ${key} must be "true" or "false", got: ${describeRaw(key, raw)}`,
   );
 }

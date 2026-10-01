@@ -1,6 +1,6 @@
 import { ContractEventProcessor } from './processor';
 import { CursorRepository } from './cursor.repository';
-import { CursorResumeRequest, CursorResumeResult, CursorUpdateResult } from './cursor.types';
+import { CursorResumeRequest, CursorResumeResult, CursorUpdateResult, IndexerCursor } from './cursor.types';
 import { ContractEvent, PersistedContractEvent } from './types';
 
 /**
@@ -33,11 +33,7 @@ export interface IndexerBatchResult {
   errors: string[];
 
   /** Updated cursor after successful batch */
-  newCursor?: {
-    sourceId: string;
-    lastSequence: number;
-    updatedAt: string;
-  };
+  newCursor?: IndexerCursor;
 }
 
 /**
@@ -141,7 +137,11 @@ export class ContractEventIndexer {
         const result = await this.eventProcessor.ingest(event);
 
         if (result.status === 'accepted') {
-          processedCount++;
+          if (alreadyCheckpointed) {
+            duplicateCount++;
+          } else {
+            processedCount++;
+          }
         } else if (result.status === 'duplicate') {
           duplicateCount++;
         } else if (result.status === 'invalid') {
@@ -158,9 +158,9 @@ export class ContractEventIndexer {
             // of the contiguous range for this batch.
             expectedSequence = sequence + 1;
             contiguousMaxSequence = sequence;
-          } else if (sequence === expectedSequence) {
+          } else if (sequence > contiguousMaxSequence) {
             contiguousMaxSequence = sequence;
-            expectedSequence++;
+            expectedSequence = sequence + 1;
           }
         }
       } catch (error) {
@@ -186,11 +186,12 @@ export class ContractEventIndexer {
       const updateResult = await this.cursorRepository.updateCursor(cursorSourceId, contiguousMaxSequence);
       if (updateResult.success) {
         newCursor = {
-          sourceId: updateResult.cursor.sourceId,
-          lastSequence: updateResult.cursor.lastSequence,
-          updatedAt: updateResult.cursor.updatedAt,
+          ...updateResult.cursor,
         };
       }
+    } else if (existingCursor !== null && duplicateCount > 0 && processedCount === 0 && errors.length === 0) {
+      // All events were already checkpointed (pure duplicate batch) — return existing cursor
+      newCursor = { ...existingCursor };
     }
 
     return {

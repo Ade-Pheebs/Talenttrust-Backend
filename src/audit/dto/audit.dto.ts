@@ -103,6 +103,19 @@ export interface AuditQueryParamsDto {
   cursor?: string;
 }
 
+// ─── Validation boundaries ────────────────────────────────────────────────────
+
+/**
+ * Upper bound applied to `limit` when the caller does not supply one.
+ * Kept in sync with the default in {@link toAuditQuery}.
+ */
+export const AUDIT_QUERY_MAX_LIMIT = 100;
+
+/**
+ * Default `limit` applied when the caller does not supply one.
+ */
+export const AUDIT_QUERY_DEFAULT_LIMIT = 50;
+
 // ─── Response DTOs ────────────────────────────────────────────────────────────
 
 /**
@@ -254,7 +267,10 @@ export function toCreateAuditEntryInput(
  */
 export function toAuditQuery(
   dto: AuditQueryParamsDto,
-  options: { maxLimit: number; defaultLimit?: number } = { maxLimit: 100 },
+  options: { maxLimit: number; defaultLimit?: number } = {
+    maxLimit: AUDIT_QUERY_MAX_LIMIT,
+    defaultLimit: AUDIT_QUERY_DEFAULT_LIMIT,
+  },
 ): AuditQuery {
   // Snapshot the caller-supplied options once so a concurrent mutation of the
   // options object cannot change the effective bounds mid-mapping.
@@ -265,8 +281,8 @@ export function toAuditQuery(
   let limit: number | undefined = defaultLimit;
   if (dto.limit !== undefined) {
     const parsed = Number.parseInt(dto.limit, 10);
-    if (!Number.isFinite(parsed) || parsed < 1) {
-      throw new AuditQueryValidationError('Invalid limit', 'limit');
+    if (!Number.isInteger(parsed) || parsed < 1) {
+      throw new Error('Invalid limit');
     }
     limit = Math.min(parsed, maxLimit);
   }
@@ -275,8 +291,8 @@ export function toAuditQuery(
   let offset = 0;
   if (dto.offset !== undefined) {
     const parsed = Number.parseInt(dto.offset, 10);
-    if (!Number.isFinite(parsed) || parsed < 0) {
-      throw new AuditQueryValidationError('Invalid offset', 'offset');
+    if (!Number.isInteger(parsed) || parsed < 0) {
+      throw new Error('Invalid offset');
     }
     offset = parsed;
   }
@@ -300,10 +316,9 @@ export function toAuditQuery(
     to = new Date(parsed).toISOString();
   }
 
-  // Reject inverted ranges deterministically rather than letting the store
-  // interpret an ambiguous window under concurrency.
-  if (from !== undefined && to !== undefined && Date.parse(from) > Date.parse(to)) {
-    throw new Error('Invalid time range: from must be <= to');
+  // Enforce ordering invariant: `from` must not be after `to`.
+  if (from !== undefined && to !== undefined && from > to) {
+    throw new Error('Invalid time range');
   }
 
   return {

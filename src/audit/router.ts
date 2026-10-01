@@ -52,6 +52,7 @@ import { mapZodErrorToDetails, type ValidationErrorResponse } from '../middlewar
 import { idempotencyMiddleware } from '../middleware/idempotency';
 import { validateRequest } from '../middleware/validate.middleware';
 import { toAuditEntryResponseDto } from './dto/audit.dto';
+import { validateAuditQuery, validateAuditEntryBody, validateAuditBulkBody } from './dto/audit.dto';
 import { getCorrelationId, getRequestId as getRequestIdFromUtils } from '../utils/correlationId';
 import { createLogger } from '../logger';
 import { DownloadTokenService, DownloadTokenError } from './downloadTokenService';
@@ -96,32 +97,23 @@ function buildValidationErrorResponse(requestId: string, correlationId: string |
 }
 
 /**
- * Normalises the raw query object into a stable, JSON-serialisable filter
- * payload. Sorting keys makes the payload deterministic so the same logical
- * query produces the same token payload (useful for tests and caching).
- *
- * Only string/number/boolean values are kept; anything else is dropped to
- * avoid smuggling non-serialisable data into the JWT.
+ * Validates the raw query object against the audit query DTO boundaries and
+ * returns a structured 400 response on failure. This is the single entry
+ * point for query validation so every route enforces the same invariants
+ * (limit clamping, offset >= 0, ISO date ordering, etc.).
  */
-function normaliseDownloadFilters(query: Record<string, unknown>): DownloadTokenFilters {
-  const out: DownloadTokenFilters = {};
-  const keys = Object.keys(query).sort();
-  for (const key of keys) {
-    const value = query[key];
-    if (value === undefined || value === null) continue;
-    if (Array.isArray(value)) {
-      // Preserve arrays of primitives (e.g. repeated query params) as-is.
-      const filtered = value.filter(
-        (v) => typeof v === 'string' || typeof v === 'number' || typeof v === 'boolean',
-      );
-      if (filtered.length > 0) out[key] = filtered;
-      continue;
-    }
-    if (typeof value === 'string' || typeof value === 'number' || typeof value === 'boolean') {
-      out[key] = value;
-    }
+function validateAuditQueryOrRespond(
+  req: Request,
+  res: Response,
+): AuditQuery | undefined {
+  const result = validateAuditQuery(req.query);
+  if (!result.success) {
+    const requestId = getRequestIdFromUtils(res);
+    const correlationId = getCorrelationId(res);
+    res.status(400).json(buildValidationErrorResponse(requestId, correlationId, result.error));
+    return undefined;
   }
-  return out;
+  return result.data;
 }
 
 /**
@@ -140,19 +132,15 @@ function isClientInputError(error: unknown): boolean {
   );
 }
 
-/**
- * Builds the shared structured 500 body.
- *
- * The underlying error message is intentionally never included: driver
- * errors can contain SQL fragments, table names, or absolute file paths.
- * The caller-facing message is a stable, non-sensitive description while the
- * `code` field stays machine-readable for clients and dashboards.
- */
-function buildInternalErrorResponse(
-  requestId: string,
-  correlationId: string | undefined,
-  message: string,
-): { error: { code: string; message: string; requestId: string; correlationId?: string } } {
+  // Enforce DTO-level boundaries (limit range, offset >= 0, date ordering).
+  const dtoResult = validateAuditQuery(params);
+  if (!dtoResult.success) {
+    const requestId = getRequestIdFromUtils(res);
+    const correlationId = getCorrelationId(res);
+    res.status(400).json(buildValidationErrorResponse(requestId, correlationId, dtoResult.error));
+    return undefined;
+  }
+
   return {
     error: {
       code: 'internal_error',
@@ -220,6 +208,14 @@ export function createAuditRouter(options: AuditRouterOptions = {}): Router {
     ...accessMiddleware,
     (req: Request, res: Response): void => {
       try {
+        const dtoResult = validateAuditEntryBody(req.body);
+        if (!dtoResult.success) {
+          const requestId = getRequestIdFromUtils(res);
+          const correlationId = getCorrelationId(res);
+          res.status(400).json(buildValidationErrorResponse(requestId, correlationId, dtoResult.error));
+          return;
+        }
+
         const parseResult = createAuditEntryBodySchema.safeParse(req.body);
 
         if (!parseResult.success) {

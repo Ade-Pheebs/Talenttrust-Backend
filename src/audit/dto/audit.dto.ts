@@ -163,6 +163,35 @@ export interface IntegrityReportResponseDto {
   checkedAt: string;
 }
 
+// ─── Errors ───────────────────────────────────────────────────────────────────
+
+/**
+ * Deterministic, typed error raised by DTO mapping functions when an inbound
+ * payload fails validation.
+ *
+ * Invariants:
+ * - `name` is always `'AuditQueryValidationError'` so callers can branch on it
+ *   without relying on message text.
+ * - `field` identifies the offending input field (never contains user data).
+ * - `message` is a stable, non-sensitive description suitable for a 400 body.
+ *
+ * This error is intentionally serialisable and side-effect free so that retries
+ * and concurrent invocations produce identical, observable failures.
+ */
+export class AuditQueryValidationError extends Error {
+  /** Stable machine-readable error name. */
+  public readonly name = 'AuditQueryValidationError';
+  /** Name of the DTO field that failed validation. */
+  public readonly field: string;
+
+  constructor(message: string, field: string) {
+    super(message);
+    this.field = field;
+    // Restore prototype chain for transpiled targets (ES5 down-level).
+    Object.setPrototypeOf(this, AuditQueryValidationError.prototype);
+  }
+}
+
 // ─── Request mapping functions ────────────────────────────────────────────────
 
 /**
@@ -205,7 +234,8 @@ export function toCreateAuditEntryInput(
  * @param options.maxLimit - Upper bound for the parsed `limit` value.
  * @param options.defaultLimit - Default `limit` when not provided.
  * @returns A typed {@link AuditQuery}.
- * @throws {Error} When `from` or `to` is provided but not a valid ISO-8601 date.
+ * @throws {AuditQueryValidationError} When `from` or `to` is provided but not
+ *   a valid ISO-8601 date, or when `limit`/`offset` are malformed.
  */
 export function toAuditQuery(
   dto: AuditQueryParamsDto,
@@ -216,7 +246,7 @@ export function toAuditQuery(
   if (dto.limit !== undefined) {
     const parsed = Number.parseInt(dto.limit, 10);
     if (!Number.isFinite(parsed) || parsed < 1) {
-      throw new Error('Invalid limit');
+      throw new AuditQueryValidationError('Invalid limit', 'limit');
     }
     limit = Math.min(parsed, options.maxLimit);
   }
@@ -226,7 +256,7 @@ export function toAuditQuery(
   if (dto.offset !== undefined) {
     const parsed = Number.parseInt(dto.offset, 10);
     if (!Number.isFinite(parsed) || parsed < 0) {
-      throw new Error('Invalid offset');
+      throw new AuditQueryValidationError('Invalid offset', 'offset');
     }
     offset = parsed;
   }
@@ -236,7 +266,7 @@ export function toAuditQuery(
   if (dto.from !== undefined) {
     const parsed = Date.parse(dto.from);
     if (Number.isNaN(parsed)) {
-      throw new Error('Invalid from timestamp');
+      throw new AuditQueryValidationError('Invalid from timestamp', 'from');
     }
     from = new Date(parsed).toISOString();
   }
@@ -245,7 +275,7 @@ export function toAuditQuery(
   if (dto.to !== undefined) {
     const parsed = Date.parse(dto.to);
     if (Number.isNaN(parsed)) {
-      throw new Error('Invalid to timestamp');
+      throw new AuditQueryValidationError('Invalid to timestamp', 'to');
     }
     to = new Date(parsed).toISOString();
   }
@@ -351,6 +381,8 @@ export function toIntegrityReportResponseDto(
       firstCorruptedId: report.firstCorruptedId,
     }),
     checkedAt: report.checkedAt,
+  };
+}ckedAt,
   };
 }
 

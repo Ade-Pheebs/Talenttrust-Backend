@@ -124,6 +124,10 @@ const SENSITIVE_KEY_FRAGMENTS = [
   'apikey',
   'api_key',
   'private',
+  'authorization',
+  'cookie',
+  'session',
+  'stack',
 ];
 
 /** Matches a simple `local@domain` email pattern. */
@@ -197,36 +201,17 @@ export function maskEmail(value: string): string {
  * @returns A flat object safe for audit storage.
  */
 export function redactHeaders(
-  headers: Record<string, string | string[] | undefined>,
+  headers: Record<string, string | string[] | undefined> | undefined | null,
 ): Record<string, unknown> {
   if (!isRecord(headers)) throw new TypeError('Invalid audit headers');
   const result: Record<string, unknown> = {};
-  const names = Object.keys(headers);
-  if (names.length > MAX_NODES) throw new TypeError('Audit headers limit exceeded');
-  let remaining = MAX_NODES - names.length;
-  for (const name of names) {
-    const descriptor = Object.getOwnPropertyDescriptor(headers, name)!;
-    let value: unknown = INVALID;
-    if (isSensitiveHeader(name)) value = REDACTED;
-    else if (/^[!#$%&'*+.^_`|~0-9A-Za-z-]+$/.test(name) && 'value' in descriptor) {
-      const raw: unknown = descriptor.value;
-      if (raw === undefined || typeof raw === 'string') value = raw;
-      else if (Array.isArray(raw) && !types.isProxy(raw)) {
-        if (raw.length > remaining) {
-          put(result, name, LIMIT_EXCEEDED);
-          continue;
-        }
-        remaining -= raw.length;
-        const copy: string[] = [];
-        for (let i = 0; i < raw.length; i++) {
-          const item = Object.getOwnPropertyDescriptor(raw, String(i));
-          if (!item || !('value' in item) || typeof item.value !== 'string') break;
-          copy.push(item.value);
-        }
-        if (copy.length === raw.length) value = copy;
-      }
-    }
-    put(result, name, value);
+
+  if (!headers || typeof headers !== 'object') {
+    return result;
+  }
+
+  for (const [name, value] of Object.entries(headers)) {
+    result[name] = isSensitiveHeader(name) ? REDACTED : value;
   }
 
   try {
@@ -265,44 +250,87 @@ export function redactHeaders(
  * @param value - The value to sanitise (may be any JSON-serialisable type).
  * @returns A deep copy with sensitive data replaced.
  */
-export function redactBody(value: unknown): unknown {
-  // Per-call state: aliases are copied independently; only ancestor cycles are
-  // rejected. Retries and concurrent callers cannot affect one another.
-  const ancestors = new WeakSet<object>();
-  let nodes = 0;
-  function visit(input: unknown, depth: number): unknown {
-    if (++nodes > MAX_NODES || depth > MAX_DEPTH) return LIMIT_EXCEEDED;
-    if (input === null || input === undefined) return input;
-    if (typeof input === 'string') return maskEmail(input);
-    if (typeof input === 'boolean') return input;
-    if (typeof input === 'number') return Number.isFinite(input) ? input : INVALID;
-    if (typeof input !== 'object' || types.isProxy(input)) return INVALID;
-    const array = Array.isArray(input);
-    if ((!array && !isRecord(input)) || ancestors.has(input)) return INVALID;
-    const keys = array ? null : Object.keys(input);
-    const count = array ? input.length : keys!.length;
-    // Reject the container rather than silently dropping remaining fields.
-    if (count > MAX_NODES - nodes) return LIMIT_EXCEEDED;
-    ancestors.add(input);
-    const result: Record<string, unknown> | unknown[] = array ? [] : {};
-    for (let i = 0; i < count; i++) {
-      if (nodes >= MAX_NODES) {
-        ancestors.delete(input);
-        return LIMIT_EXCEEDED;
-      }
-      const key = keys ? keys[i] : String(i);
-      const descriptor = Object.getOwnPropertyDescriptor(input, key);
-      const sensitive = !array && (isSensitiveKey(key) || isSensitiveHeader(key));
-      const child = sensitive ? REDACTED
-        : !descriptor || !('value' in descriptor) ? INVALID
-          : visit(descriptor.value, depth + 1);
-      if (sensitive || !descriptor || !('value' in descriptor)) nodes++;
-      put(result, key, child);
+export function redactBody(value: unknown, seen = new WeakMap<object, unknown>()): unknown {
+  if (value === null || value === undefined) return value;
+
+  if (typeof value === 'string') {
+    return maskEmail(value);
+  }
+
+  if (value instanceof Date) {
+    return new Date(value.getTime());
+  }
+
+  if (value instanceof Set) {
+    if (seen.has(value)) {
+      return seen.get(value);
     }
-    ancestors.delete(input);
+
+    const result: unknown[] = [];
+    seen.set(value, result);
+    for (const item of value) {
+      result.push(redactBody(item, seen));
+    }
     return result;
   }
-  return visit(value, 0);
+
+  if (value instanceof Map) {
+    if (seen.has(value)) {
+      return seen.get(value);
+    }
+
+    const result: Record<string, unknown> = {};
+    seen.set(value, result);
+    for (const [key, item] of value.entries()) {
+      result[String(key)] = redactBody(item, seen);
+    }
+    return result;
+  }
+
+  if (Array.isArray(value)) {
+    if (seen.has(value)) {
+      return seen.get(value);
+    }
+
+    const result: unknown[] = [];
+    seen.set(value, result);
+    for (const item of value) {
+      result.push(redactBody(item, seen));
+    }
+    return result;
+  }
+
+  if (typeof value === 'object') {
+    if (seen.has(value)) {
+      return seen.get(value);
+    }
+
+    const result: Record<string, unknown> = {};
+    seen.set(value, result);
+
+    if (value instanceof Error) {
+      result.name = value.name;
+      result.message = REDACTED;
+      if (typeof value.stack === 'string' && value.stack.length > 0) {
+        result.stack = REDACTED;
+      }
+      for (const [key, val] of Object.entries(value as Record<string, unknown>)) {
+        if (key !== 'name' && key !== 'message' && key !== 'stack') {
+          result[key] = redactBody(val, seen);
+        }
+      }
+      return result;
+    }
+
+    for (const [key, val] of Object.entries(value as Record<string, unknown>)) {
+      result[key] = isSensitiveKey(key) ? REDACTED : redactBody(val, seen);
+    }
+    return result;
+  }
+
+  // Numbers, booleans, symbols, bigint, and functions — safe to log verbatim
+  // when they are present in ad hoc payloads, but they are not traversed.
+  return value;
 }
 
 /**
@@ -327,21 +355,14 @@ export function redactBody(value: unknown): unknown {
 export function buildAuditMetadata(
   method: string,
   path: string,
-  headers: Record<string, string | string[] | undefined>,
+  headers: Record<string, string | string[] | undefined> | undefined | null,
   body: unknown,
-  query: Record<string, unknown>,
+  query: Record<string, unknown> | undefined | null,
   statusCode: number,
   requestId: string | undefined,
 ): Record<string, unknown> {
-  assertString(method);
-  assertString(path);
-  if (!/^[!#$%&'*+.^_`|~0-9A-Za-z-]+$/.test(method)
-    || !path.startsWith('/') || /[?#\r\n]/.test(path)
-    || !Number.isInteger(statusCode) || statusCode < 100 || statusCode > 599
-    || (requestId !== undefined && (typeof requestId !== 'string' || /[\r\n]/.test(requestId)))
-    || !isRecord(query)) {
-    throw new TypeError('Invalid audit metadata envelope');
-  }
+  const safeQuery = query && typeof query === 'object' ? query : {};
+
   return {
     method: safeMethod,
     path: safePath,
@@ -349,6 +370,6 @@ export function buildAuditMetadata(
     requestId: typeof requestId === 'string' ? requestId : null,
     headers: redactHeaders(headers),
     body: body !== undefined && body !== null ? redactBody(body) : null,
-    query: query && typeof query === 'object' && Object.keys(query).length > 0 ? redactBody(query) : null,
+    query: Object.keys(safeQuery).length > 0 ? redactBody(safeQuery) : null,
   };
 }

@@ -120,6 +120,14 @@ mod batch_operations_tests {
     #[test]
     fn same_key_accepted_after_ttl_expiry() {
         let env = fresh_env();
+
+        // `extend_ttl` only fires when an entry's remaining TTL is already
+        // under the threshold, so start the ledger's persistent-entry floor
+        // low enough for the contract's instance/code bump to be exercised
+        // once the ledger jumps past the receipt window.
+        env.ledger()
+            .with_mut(|li| li.min_persistent_entry_ttl = 500);
+
         let (_id, client) = register(&env);
         let user = caller(&env);
         let idem = key(&env, 0x06);

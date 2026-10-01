@@ -18,14 +18,8 @@ use soroban_contracterror;
 ///
 /// All variants map to a stable `u32` discriminant that clients can
 /// pattern-match on after invoking the contract.  **Do not renumber
-/// existing variants** — that would break on-chain consumers.
-///
-/// # Invariants
-///
-/// - Every error discriminant is unique and non-zero.
-/// - Error codes are append-only: new variants must use fresh values.
-/// - Validation failures return a deterministic code for a given input
-///   shape, so retries and concurrent calls observe the same result.
+/// existing variants** — that would break on-chain consumers.  New
+/// variants must take the next free discriminant.
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum Error {
@@ -39,33 +33,30 @@ pub enum Error {
     /// The idempotency key is not consumed in this case.
     EmptyBatch = 2,
 
-    /// The `bets` vector exceeded the maximum allowed batch size.
-    /// Oversized batches are rejected before any state mutation so that
-    /// a partial application cannot occur.
+    /// The `bets` vector exceeded `MAX_BETS_PER_BATCH`.
+    ///
+    /// Returned before any state is written, so the caller may split the
+    /// batch and resubmit with the *same* idempotency key.
     BatchTooLarge = 3,
 
-    /// A bet entry contained a zero or negative amount.  Amounts are
-    /// required to be strictly positive.
-    InvalidAmount = 4,
+    /// A [`crate::bets::Bet`] carried a non-positive `amount`.
+    ///
+    /// A zero amount is a no-op that would still consume an idempotency
+    /// key, and a negative amount would credit one side of a market
+    /// while debiting the other.  Both are rejected before anything is
+    /// recorded, so the same key stays reusable.
+    InvalidBetAmount = 4,
 
-    /// A duplicate market identifier was found within a single batch.
-    /// Deduplication is enforced before any state transition.
-    DuplicateMarket = 5,
+    /// A [`crate::bets::Bet`] carried `market_id == 0`.
+    ///
+    /// `0` is reserved as the "no market" sentinel; stake recorded
+    /// against it could never be resolved or paid out.
+    InvalidMarketId = 5,
 
-    /// A market identifier was not recognized by the contract.
-    UnknownMarket = 6,
-
-    /// The contract has not been initialized yet.
-    NotInitialized = 7,
-
-    /// The contract has already been initialized.
-    AlreadyInitialized = 8,
-
-    /// The caller is not authorized to perform the requested operation.
-    Unauthorized = 9,
-
-    /// An internal invariant was violated.  This indicates a bug in the
-    /// contract rather than bad input and should never be observed in
-    /// normal operation.
-    InvariantViolated = 10,
+    /// The sum of the batch's `amount` values does not fit in an `i128`.
+    ///
+    /// The release profile disables debug assertions, so an unchecked sum
+    /// would wrap and record a negative total.  The batch is rejected
+    /// instead, and the same key stays reusable.
+    BatchAmountOverflow = 6,
 }

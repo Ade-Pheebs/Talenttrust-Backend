@@ -1,113 +1,119 @@
+//! `place_bets` — batch bet submission and the state it owns.
+//!
+//! # State model
+//!
+//! This module owns exactly one piece of durable state: the
+//! **idempotency receipt** for a `(caller, key)` pair, stored under
+//! [`DataKey::PlaceBetsIdem`]. A receipt exists **if and only if** a
+//! batch was fully validated and applied for that pair. Market state is
+//! deliberately not written here yet — see *Market mutations* below —
+//! and this module never writes speculative state to compensate for the
+//! gap.
+//!
+//! # Invariants
+//!
+//! * **I1 — authorized submitter.** The batch is attributed to `caller`,
+//!   which must have signed via [`Address::require_auth`]. No other
+//!   principal can spend or replay a caller's receipt, and the receipt
+//!   key is scoped to the caller, so a token is not a bearer token.
+//! * **I2 — receipt ⇔ applied batch.** A `(caller, key)` receipt exists
+//!   exactly when a batch for that pair was accepted. A *rejected* batch
+//!   leaves no receipt, so the caller can safely fix the payload and
+//!   retry with the same token.
+//! * **I3 — at most once per window.** While a receipt is live, a
+//!   `(caller, key)` pair is accepted at most once. Replays fail with
+//!   [`Error::IdempotentBatchAlreadyApplied`] before any mutation, so a
+//!   replay is read-only.
+//! * **I4 — all-or-nothing.** The whole batch is validated before the
+//!   first write. Soroban additionally reverts every write when a
+//!   contract call returns `Err`, so no failure path can leave a
+//!   half-applied batch or a receipt without its batch.
+//! * **I5 — positive stake, real market.** Every `Bet` has
+//!   `amount > 0` and `market_id != 0`, and the batch total is checked
+//!   for `i128` overflow. Zero/negative amounts and the sentinel market
+//!   are refused rather than recorded.
+//! * **I6 — bounded work.** `bets.len() <= MAX_BETS_PER_BATCH` keeps the
+//!   cost of a single invocation deterministic and stops one transaction
+//!   from monopolizing the ledger.
+//! * **I7 — bounded durable state.** Receipts live in temporary storage
+//!   (one ledger entry per `(caller, key)`) under a TTL, so the contract
+//!   instance entry stays a constant size no matter how many batches
+//!   succeed and expired receipts are deleted by the network rather than
+//!   archived. See [`DataKey`] for why instance and persistent storage are
+//!   both unsafe here.
+//!
+//! # Failure modes
+//!
+//! Every rejection is a typed [`Error`] returned *before* any state is
+//! written: empty batch, oversized batch, `market_id == 0`, non-positive
+//! `amount`, total overflow, and duplicate idempotency key. Because I2
+//! and I4 hold, a caller may retry the *same* token after a rejection —
+//! the token was never consumed. A caller that loses the response of a
+//! *successful* call cannot retry with that token; it should submit a
+//! new batch under a fresh token, which is the only state change a
+//! replay could cause.
+
 use soroban_sdk::{Address, BytesN, Env, Symbol, Vec};
 
 use crate::{
     errors::Error,
-    storage::{DataKey, IDEM_KEY_TTL_LEDGERS, INSTANCE_TTL_LEDGERS, MAX_BATCH_SIZE},
+    storage::{
+        DataKey, CONTRACT_TTL_LEDGERS, CONTRACT_TTL_THRESHOLD_LEDGERS, IDEM_KEY_TTL_LEDGERS,
+        IDEM_KEY_TTL_THRESHOLD_LEDGERS,
+    },
 };
 
-/// Durable record of an applied batch, stored under its idempotency key
-/// (#1288). Lets a caller whose response was lost learn, deterministically,
-/// whether and what was applied — without re-submitting.
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct BatchReceipt {
-    /// Number of bets applied.
-    pub bet_count: u32,
-    /// Sum of all `amount`s in the batch.
-    pub total_amount: i128,
-    /// `sha256(xdr(bets))`. Compare with the hash of the batch you meant to
-    /// send to tell "my batch landed" from "this key was used for another
-    /// batch" (both are reported as error code `1` on resubmission).
-    pub batch_hash: BytesN<32>,
-    /// Ledger sequence the batch was applied in.
-    pub applied_ledger: u32,
-    /// `true` when the key was consumed by a pre-#1288 contract version
-    /// (instance-storage sentinel). Only `bet_count == 0` and zeroed fields
-    /// are known for such keys.
-    pub legacy: bool,
-}
-
-/// Deterministic fingerprint of a batch: `sha256` of its XDR encoding.
-pub fn batch_hash(env: &Env, bets: &Vec<Bet>) -> BytesN<32> {
-    env.crypto().sha256(&bets.clone().to_xdr(env)).to_bytes()
-}
-
-fn zero_key(env: &Env) -> BytesN<32> {
-    BytesN::from_array(env, &[0u8; 32])
-}
-
-/// Receipt for `(caller, key)`, from the current tier or the legacy tier.
-/// `None` means the key is unused (or has expired): nothing was applied
-/// under it and it is safe to submit.
-pub fn batch_receipt(
-    env: &Env,
-    caller: Address,
-    idempotency_key: BytesN<32>,
-) -> Option<BatchReceipt> {
-    if idempotency_key == zero_key(env) {
-        return None; // zero key never records anything
-    }
-    let key = DataKey::PlaceBetsIdem(caller, idempotency_key);
-    if let Some(receipt) = env.storage().temporary().get::<_, BatchReceipt>(&key) {
-        return Some(receipt);
-    }
-    if env.storage().instance().has(&key) {
-        return Some(BatchReceipt {
-            bet_count: 0,
-            total_amount: 0,
-            batch_hash: zero_key(env),
-            applied_ledger: 0,
-            legacy: true,
-        });
-    }
-    None
-}
-
-/// Validates a batch and returns its total. Pure: no storage access, so it
-/// gives the same answer for the same input on every call (#1280 item 5).
-fn validate(bets: &Vec<Bet>) -> Result<i128, Error> {
-    if bets.is_empty() {
-        return Err(Error::EmptyBatch);
-    }
-    if bets.len() > MAX_BATCH_SIZE {
-        return Err(Error::BatchTooLarge);
-    }
-    let mut total: i128 = 0;
-    for bet in bets.iter() {
-        if bet.amount <= 0 {
-            return Err(Error::InvalidAmount);
-        }
-        total = total.checked_add(bet.amount).ok_or(Error::AmountOverflow)?;
-    }
-    Ok(total)
-}
+/// Maximum number of bets accepted in a single `place_bets` batch.
+///
+/// Mirrors the API-layer policy cap
+/// (`BULK_OPERATION_MAX_BATCH_SIZE` in
+/// `src/modules/contracts/dto/bulk-operations.dto.ts`) so a batch the
+/// HTTP layer accepts is never rejected for size on-chain, and a
+/// hand-built transaction cannot force unbounded per-call work.
+pub const MAX_BETS_PER_BATCH: u32 = 100;
 
 /// A single bet submitted inside a batch.
 ///
 /// Extend this struct with market-specific fields as the contract grows.
-///
-/// # Validation boundaries
-///
-/// * `market_id` must be non-zero; `0` is reserved as an invalid sentinel.
-/// * `amount` must be strictly positive (`> 0`). Zero and negative amounts
-///   are rejected to prevent no-op or refund-style state transitions.
-/// * Duplicate `market_id` entries within the same batch are rejected so a
-///   single submission cannot silently double-apply to the same market.
+/// Any new field is covered by I5: it must be validated in
+/// [`validate_bets`] before the first write.
 #[soroban_sdk::contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Bet {
     /// Identifier of the prediction market being bet on.
+    ///
+    /// `0` is reserved as the "no market" sentinel and is rejected with
+    /// [`Error::InvalidMarketId`].
     pub market_id: u64,
     /// Amount of the base asset staked, in stroops.
+    ///
+    /// Must be strictly positive; `0` and negative values are rejected
+    /// with [`Error::InvalidBetAmount`].
     pub amount: i128,
 }
 
-/// Maximum number of bets allowed in a single batch submission.
+/// Durable record written when a batch is accepted.
 ///
-/// Bounds the amount of work performed per invocation so that a single
-/// transaction cannot exhaust the ledger budget or produce an unbounded
-/// state transition.
-pub const MAX_BATCH_SIZE: u32 = 100;
+/// Stored under [`DataKey::PlaceBetsIdem`], so "this key was consumed"
+/// and "this is what was applied" are the same fact. An operator can
+/// reconcile a receipt against the emitted `bets_placed` event without
+/// trusting an off-chain index. The fields carry no data beyond what the
+/// caller already revealed by submitting the batch, and the idempotency
+/// token itself is deliberately **not** stored here or published in any
+/// event — see [`place_bets`].
+#[soroban_sdk::contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BatchReceipt {
+    /// Number of bets applied. Equal to the `bet_count` of the
+    /// `bets_placed` event for the same call.
+    pub bet_count: u32,
+    /// Sum of every `Bet::amount` in the batch, in stroops. Always `> 0`
+    /// for an accepted batch, and equal to the event's `total_amount`.
+    pub total_amount: i128,
+    /// Ledger sequence the batch was applied on, for reconciling a
+    /// receipt with the ledger it landed in.
+    pub applied_at_ledger: u32,
+}
 
 /// Process a batch of bets atomically with an idempotency guarantee.
 ///
@@ -116,7 +122,8 @@ pub const MAX_BATCH_SIZE: u32 = 100;
 /// * `env`             – Soroban host environment.
 /// * `caller`          – Address of the submitting account; `require_auth` is
 ///                       called to authenticate the caller.
-/// * `bets`            – Non-empty vector of [`Bet`] entries.
+/// * `bets`            – Non-empty vector of [`Bet`] entries, at most
+///                       [`MAX_BETS_PER_BATCH`] of them.
 /// * `idempotency_key` – 32-byte caller-generated token that makes this
 ///                       submission unique.  The key is bound to `caller` so
 ///                       the same token may be used by different callers
@@ -124,119 +131,111 @@ pub const MAX_BATCH_SIZE: u32 = 100;
 ///
 /// # Errors
 ///
-/// * [`Error::EmptyBatch`]                   – `bets` is empty.
-/// * [`Error::InvalidMarketId`]              – a bet has `market_id == 0`.
-/// * [`Error::InvalidAmount`]                – a bet has `amount <= 0`.
-/// * [`Error::DuplicateMarketInBatch`]       – the batch contains the same
-///                                              `market_id` more than once.
+/// * [`Error::EmptyBatch`]                  – `bets` is empty.
+/// * [`Error::BatchTooLarge`]               – `bets.len() > MAX_BETS_PER_BATCH`.
+/// * [`Error::InvalidMarketId`]             – a bet referenced `market_id == 0`.
+/// * [`Error::InvalidBetAmount`]            – a bet had `amount <= 0`.
+/// * [`Error::BatchAmountOverflow`]         – the batch total does not fit in an `i128`.
 /// * [`Error::IdempotentBatchAlreadyApplied`] – the `(caller, idempotency_key)`
 ///                                              pair has already been consumed.
 ///
+/// All six are returned *before* any state is written, so the caller may
+/// correct the payload and retry with the same idempotency key.
+///
 /// # Idempotency semantics
 ///
-/// The key is written to temporary storage **before** processing the bets.
-/// If a previous call with the same key succeeded, the function returns
-/// [`Error::IdempotentBatchAlreadyApplied`] immediately without re-applying
-/// the batch.  Once written, the key expires after [`IDEM_KEY_TTL_LEDGERS`]
-/// ledgers; after expiry a new submission with the same token is accepted as
-/// a fresh batch.
+/// The receipt is written to temporary storage **before** the batch is
+/// applied, and only after the batch has fully validated. If a previous
+/// call with the same key succeeded, the function returns
+/// [`Error::IdempotentBatchAlreadyApplied`] immediately without
+/// re-applying the batch. Once written, the receipt expires after
+/// [`IDEM_KEY_TTL_LEDGERS`] ledgers; after expiry the network has deleted
+/// it, a new submission with the same token is accepted as a fresh
+/// batch, and a client that lost the response of a successful call can
+/// safely retry inside the window or resubmit under a new token after it.
+/// See [`DataKey`] for why the receipt lives in temporary rather than
+/// instance or persistent storage.
+///
+/// Writing the receipt before applying is what makes the guarantee hold
+/// under same-ledger concurrency: a second transaction that touches the
+/// same receipt entry conflicts in the host's transaction footprint and
+/// is rejected before it executes; resubmitted in a later ledger it then
+/// fails the `has` check below. If this call instead fails, the host
+/// reverts the receipt together with everything else, so a rejected batch
+/// never burns a token.
 ///
 /// # Deprecation note — zero-key backward path
 ///
 /// Passing `[0u8; 32]` as the key disables idempotency checking and
 /// processes the batch unconditionally.  **This path is deprecated** and
 /// will be removed in a future version.  Callers should generate a random
-/// 32-byte token for every batch.
-///
-/// # Determinism
-///
-/// The idempotency key is committed to storage before any batch side
-/// effects.  If batch application fails, the key is rolled back so that
-/// a retry with the same key is treated as a fresh submission.
+/// 32-byte token for every batch. It offers no replay protection and no
+/// same-ledger dedup, but all validation in I5/I6 still applies, and the
+/// `bets_placed` event reports `deduplicated == false` so indexers can
+/// account for these submissions separately.
 pub fn place_bets(
     env: &Env,
     caller: Address,
     bets: Vec<Bet>,
     idempotency_key: BytesN<32>,
 ) -> Result<(), Error> {
-    // 1. Authenticate the caller. A failed auth aborts the invocation
-    //    before any read or write.
+    // I1 — authenticate before doing anything observable. A caller that
+    // cannot authorize must not be able to burn its own token.
     caller.require_auth();
 
-    // 2. Validate the whole batch before touching storage (checks before
-    //    effects, #1288). Invalid input never consumes the key.
-    let total_amount = validate(&bets)?;
-
-    // Enforce the upper bound on batch size.
-    if bets.len() > MAX_BATCH_SIZE {
+    // ------------------------------------------------------------------
+    // Shape validation (I6)
+    // ------------------------------------------------------------------
+    // Bound the batch before any per-bet work, so the cost of a rejected
+    // oversized batch is O(1).
+    let bet_count = bets.len();
+    if bet_count == 0 {
+        return Err(Error::EmptyBatch);
+    }
+    if bet_count > MAX_BETS_PER_BATCH {
         return Err(Error::BatchTooLarge);
     }
 
-    // Validate each bet: positive amount and no duplicate market ids.
-    for i in 0..bets.len() {
-        let bet = bets.get(i).unwrap();
-        if bet.amount <= 0 {
-            return Err(Error::InvalidBetAmount);
-        }
-        for j in (i + 1)..bets.len() {
-            if bets.get(j).unwrap().market_id == bet.market_id {
-                return Err(Error::DuplicateBet);
-            }
-        }
-    }
+    // ------------------------------------------------------------------
+    // Content validation (I5), completing before the first write (I4)
+    // ------------------------------------------------------------------
+    // The total is returned from validation and written verbatim into the
+    // receipt and the event, so the aggregate that was checked and the
+    // aggregate that is recorded cannot diverge.
+    let total_amount = validate_bets(&bets)?;
 
     // ------------------------------------------------------------------
-    // Per-bet validation (deterministic, order-independent)
-    // ------------------------------------------------------------------
-    // Validate every entry before touching idempotency state or emitting
-    // events so that a rejected batch leaves no observable side effects.
-    //
-    // Invariants enforced here:
-    //   1. `market_id != 0` (0 is a reserved invalid sentinel).
-    //   2. `amount > 0` (no zero-value or negative-value stakes).
-    //   3. No duplicate `market_id` within the same batch.
-    //
-    // The duplicate check is O(n^2) over the batch length. Batches are
-    // expected to be small; if this becomes a hot path, replace with a
-    // sorted scan or a temporary `Map<u64, ()>` in temporary storage.
-    let len = bets.len();
-    for i in 0..len {
-        let bet = bets.get(i).ok_or(Error::EmptyBatch)?;
-
-        if bet.market_id == 0 {
-            return Err(Error::InvalidMarketId);
-        }
-        if bet.amount <= 0 {
-            return Err(Error::InvalidAmount);
-        }
-
-        // Duplicate detection: compare against all previous entries.
-        for j in 0..i {
-            let prev = bets.get(j).ok_or(Error::EmptyBatch)?;
-            if prev.market_id == bet.market_id {
-                return Err(Error::DuplicateMarketInBatch);
-            }
-        }
-    }
-
-    // ------------------------------------------------------------------
-    // Idempotency check
+    // Idempotency claim (I2, I3, I7)
     // ------------------------------------------------------------------
     // A zero key opts out of deduplication (deprecated backward compat).
     let zero_key: BytesN<32> = BytesN::from_array(env, &[0u8; 32]);
-    if idempotency_key != zero_key {
+    let deduplicated = idempotency_key != zero_key;
+
+    if deduplicated {
         let idem_key = DataKey::PlaceBetsIdem(caller.clone(), idempotency_key.clone());
 
+        // A live receipt means this pair was already applied. Reject
+        // before any mutation so a replay is read-only (I3).
         if env.storage().temporary().has(&idem_key) {
             return Err(Error::IdempotentBatchAlreadyApplied);
         }
 
-        // Mark the key as consumed before applying the batch so that
-        // concurrent invocations on the same ledger also fail fast.
-        env.storage().temporary().set(&idem_key, &true);
-        env.storage()
-            .temporary()
-            .extend_ttl(&idem_key, IDEM_KEY_TTL_LEDGERS, IDEM_KEY_TTL_LEDGERS);
+        // Claim the key *before* the batch is applied. See the module
+        // documentation for why, and for why a later failure does not
+        // burn the token.
+        env.storage().temporary().set(
+            &idem_key,
+            &BatchReceipt {
+                bet_count,
+                total_amount,
+                applied_at_ledger: env.ledger().sequence(),
+            },
+        );
+        env.storage().temporary().extend_ttl(
+            &idem_key,
+            IDEM_KEY_TTL_THRESHOLD_LEDGERS,
+            IDEM_KEY_TTL_LEDGERS,
+        );
     }
     env.storage()
         .instance()
@@ -248,23 +247,114 @@ pub fn place_bets(
         .instance()
         .extend_ttl(INSTANCE_TTL_LEDGERS / 2, INSTANCE_TTL_LEDGERS);
 
+    // Keep the contract itself reachable. The instance/code entry has its
+    // own TTL that no per-key receipt bump renews, so an accepted batch
+    // refreshes it here; see CONTRACT_TTL_LEDGERS. Done for the
+    // zero-key path too — that path writes no receipt, so this is the
+    // only thing keeping the contract alive for those callers.
+    env.storage()
+        .instance()
+        .extend_ttl(CONTRACT_TTL_THRESHOLD_LEDGERS, CONTRACT_TTL_LEDGERS);
+
     // ------------------------------------------------------------------
     // Apply the batch
     // ------------------------------------------------------------------
-    // TODO: replace with real market-state mutations once the market
-    //       storage module is added.  For now we emit a diagnostic event
-    //       so the batch is observable on-chain.
-    // Compatibility event (#1280 item 4) — unchanged shape.
-    env.events()
-        .publish((Symbol::new(env, "place_bets"), caller.clone()), bets.len());
+    // Market mutations belong here, once the market-state module exists.
+    // Everything above is total and side-effect free apart from the
+    // idempotency claim, so the batch is all-or-nothing by construction
+    // and the recorded `total_amount` is exactly the amount that will be
+    // applied. Keep this section free of `unwrap`/panics: a panic here
+    // would revert the receipt too, and the caller would see a generic
+    // host failure instead of a typed error.
+    let _ = total_amount;
 
-    // Observability (#1288): a separate receipt event so indexers can
-    // reconcile applied batches. Carries no secrets — the key is a
-    // caller-chosen nonce and the hash only fingerprints public bet data.
-    env.events().publish(
-        (symbol_short!("bet_rcpt"), caller, idempotency_key),
-        (bets.len(), total_amount, hash, dedupe),
-    );
+    // ------------------------------------------------------------------
+    // Observability
+    // ------------------------------------------------------------------
+    // Emitted only on the success path, and only with values the caller
+    // already supplied. The idempotency token is never published: it is
+    // a replay credential, and on-chain logs are public and permanent.
+    publish_bets_placed(env, &caller, bet_count, total_amount, deduplicated);
+    publish_legacy_place_bets(env, &caller, bet_count);
 
     Ok(())
+}
+
+/// Validate a batch and return its total stake in stroops.
+///
+/// Runs to completion before [`place_bets`] performs any write, so a
+/// rejection can never leave partial state (I4). Every failure is a
+/// typed [`Error`] that says which bet was wrong without echoing its
+/// contents.
+///
+/// Duplicate `market_id`s inside one batch are **allowed** and simply
+/// add up: each [`Bet`] is an independent stake, and rejecting
+/// duplicates would break callers that already submit them.
+fn validate_bets(bets: &Vec<Bet>) -> Result<i128, Error> {
+    let mut total: i128 = 0;
+
+    for bet in bets.iter() {
+        // I5a — `market_id` 0 is the reserved "no market" sentinel.
+        // Stake recorded against it could never be resolved or paid out,
+        // so it is refused rather than stored.
+        if bet.market_id == 0 {
+            return Err(Error::InvalidMarketId);
+        }
+
+        // I5b — a bet is a transfer of value. Zero would be a no-op that
+        // still consumes an idempotency key; negative would credit one
+        // side of a market and debit the other.
+        if bet.amount <= 0 {
+            return Err(Error::InvalidBetAmount);
+        }
+
+        // I5c — checked addition. `a + b` wraps on `i128` overflow once
+        // debug assertions are off (which they are in the release
+        // profile), turning a large batch into a negative recorded total.
+        total = total
+            .checked_add(bet.amount)
+            .ok_or(Error::BatchAmountOverflow)?;
+    }
+
+    Ok(total)
+}
+
+/// Publish the post-apply `bets_placed` event.
+///
+/// Topics: `("bets_placed", caller)`. Data: `(bet_count, total_amount,
+/// deduplicated)`.
+///
+/// The payload mirrors [`BatchReceipt`] field for field, so an indexer can
+/// verify a receipt against the event that was emitted with it.
+/// `deduplicated` is `false` only for the deprecated zero-key path, which
+/// makes those submissions visible as a separate class instead of
+/// silently weakening replay accounting.
+fn publish_bets_placed(
+    env: &Env,
+    caller: &Address,
+    bet_count: u32,
+    total_amount: i128,
+    deduplicated: bool,
+) {
+    env.events().publish(
+        (Symbol::new(env, "bets_placed"), caller.clone()),
+        (bet_count, total_amount, deduplicated),
+    );
+}
+
+/// Publish the pre-#1277 `place_bets` event.
+///
+/// Topics: `("place_bets", caller)`. Data: `bet_count`.
+///
+/// # Deprecation
+///
+/// Superseded by [`publish_bets_placed`], which additionally carries the
+/// batch total and the dedup marker. This event is still emitted so
+/// indexers written against the previous contract build keep working;
+/// it will be removed once consumers have migrated. Note that it cannot
+/// be used to distinguish a deduplicated submission from a zero-key one,
+/// which is precisely why `bets_placed` exists.
+fn publish_legacy_place_bets(env: &Env, caller: &Address, bet_count: u32) {
+    env.events()
+        .publish((Symbol::new(env, "place_bets"), caller.clone()), bet_count);
 }

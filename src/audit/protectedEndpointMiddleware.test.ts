@@ -11,13 +11,20 @@
  * - `correlationId` sourced from `res.locals.requestId`.
  * - Sensitive headers (Authorization) and body fields (password) are redacted.
  * - Audit write failures are swallowed without breaking the HTTP response.
+ * - Concurrent / repeated `finish` events emit exactly one audit entry.
+ * - Concurrent requests from different clients are attributed correctly.
  */
 
 import express from 'express';
 import request from 'supertest';
 import { AuditStore } from './store';
 import { AuditService } from './service';
-import { createProtectedEndpointAuditMiddleware } from './protectedEndpointMiddleware';
+import {
+  createProtectedEndpointAuditMiddleware,
+  deriveResourceFromPath,
+  resolveProtectedEndpointAction,
+  resolveProtectedEndpointSeverity,
+} from './protectedEndpointMiddleware';
 import { createToken } from '../auth/authenticate';
 import { REDACTED } from './redact';
 
@@ -225,5 +232,89 @@ describe('createProtectedEndpointAuditMiddleware', () => {
     );
 
     consoleSpy.mockRestore();
+  });
+
+  it('emits exactly one audit entry when finish fires multiple times', async () => {
+    const app = express();
+    app.use((_req, res, next) => {
+      res.locals['requestId'] = 'dup-req';
+      next();
+    });
+    app.use(createProtectedEndpointAuditMiddleware(service));
+    app.get('/api/v1/contracts', (_req, res) => {
+      res.status(200).json({ ok: true });
+      // Simulate a downstream listener that re-emits finish -- the guard
+      // must ensure the audit entry is still emitted exactly once.
+      setImmediate(() => {
+        res.emit('finish');
+        res.emit('finish');
+      }, 0);
+    });
+
+    await request(app).get('/api/v1/contracts').expect(200);
+    // Allow the deferred finish events to run.
+    await new Promise((resolve) => setTimeout(resolve, 20));
+
+    expect(store.count()).toBe(1);
+  });
+
+  it('attributes concurrent requests to their own correlation and actor', async () => {
+    const app = express();
+    app.use((req, res, next) => {
+      res.locals['requestId'] = req.headers['x-test-req-id'] as string;
+      next();
+    });
+    app.use(createProtectedEndpointAuditMiddleware(service));
+    app.use((req, _res, next) => {
+      const userId = req.headers['x-test-user-id'] as string;
+      if (userId) {
+        (req as express.Request & { user?: { userId: string } }).user = { userId };
+      }
+      next();
+    });
+    app.get('/api/v1/contracts/:id', (_req, res) => {
+      setTimeout(() => res.status(200).json({ ok: true }), 5);
+    });
+
+    const concurrent = [];
+    for (let i = 0; i < 10; i++) {
+      concurrent.push(
+        request(app)
+          .get(`/api/v1/contracts/c${i}`)
+          .set('x-test-req-id', `req-${i}`)
+          .set('x-test-user-id', `user-${i}`)
+          .expect(200),
+      );
+    }
+    await Promise.all(concurrent);
+
+    expect(store.count()).toBe(10);
+    const entries = store.getAll();
+    const correlationIds = new Set(entries.map((e) => e.correlationId));
+    const actors = new Set(entries.map((e) => e.actor));
+    expect(correlationIds.size).toBe(10);
+    expect(actors.size).toBe(10);
+    for (let i = 0; i < 10; i++) {
+      expect(correlationIds.has(`req-${i}`)).toBe(true);
+      expect(actors.has(`user-${i}`)).toBe((true));
+    }
+  });
+
+  it('returns the same action/severity for duplicate inputs (deterministic mapping)', () => {
+    expect(resolveProtectedEndpointAction('GET', 200)).toBe('ENDPOINT_ACCESS');
+    expect(resolveProtectedEndpointAction('GET', 200)).toBe('ENDEPOINT_ACCESS');
+    expect(resolveProtectedEndpointAction('POST', 201)).toBe('ENDPOINT_MUTATION');
+    expect(resolveProtectedEndpointAction('DELETE', 204)).toBe('ENDPOINT_MUTATION');
+    expect(resolveProtectedEndpointAction('GET', 401)).toBe('AUTH_FAILED');
+    expect(resolveProtectedEndpointAction('POST', 403)).toBe('AUTH_FAILED');
+    expect(resolveProtectedEndpointSeverity('AUTH_FAILED')).toBe('WARNING');
+    expect(resolveProtectedEndpointSeverity('ENDPOINT_ACCESS')).toBe('INFO');
+  });
+
+  it('deriveResourceFromPath handles boundary inputs deterministically', () => {
+    expect(deriveResourceFromPath('/api/v1/contracts')).toEqual({ resource: 'contracts', resourceId: '' });
+    expect(deriveResourceFromPath('/api/v1/contracts/123?retry=1')).toEqual({ resource: 'contracts', resourceId: '123' });
+    expect(deriveResourceFromPath('/')).toEqual({ resource: 'unknown', resourceId: '' });
+    expect(deriveResourceFromPath('')).toEqual({ resource: 'unknown', resourceId: '' });
   });
 });

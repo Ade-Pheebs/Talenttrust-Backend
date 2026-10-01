@@ -499,3 +499,19 @@ All `PATCH` requests must include a `version` field. The update succeeds only if
 4. If version differs → `409 ERR_CONFLICT`
 
 Source: [`src/services/contracts.service.ts:130-167`](../src/services/contracts.service.ts#L130-L167)
+
+---
+
+## Soft-delete, restore, and purge
+
+Milestones support soft-delete so deletes are reversible within a retention window.
+
+| Concern | Behaviour |
+|---------|-----------|
+| Soft-delete | `DELETE /api/v1/contracts/:id/milestones/:milestoneId` sets `deletedAt` (record is kept) |
+| Default reads | `GET /api/v1/contracts/:id/milestones` excludes soft-deleted rows (`?includeDeleted=true` to include) |
+| Restore | `POST /api/v1/contracts/:id/milestones/:milestoneId/restore` clears `deletedAt` if still inside the retention window; otherwise `410 soft_delete_retention_expired` |
+| Retention | `MILESTONES_SOFT_DELETE_RETENTION_DAYS` (default **30**) |
+| Purge | `runMilestonesSoftDeletePurge()` hard-deletes soft-deleted rows past the window (maintenance / cron) |
+
+Sources: [`src/services/milestones.service.ts`](../src/services/milestones.service.ts), [`src/controllers/milestones.softdelete.controller.ts`](../src/controllers/milestones.softdelete.controller.ts), [`src/utils/softDelete.ts`](../src/utils/softDelete.ts)

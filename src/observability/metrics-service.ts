@@ -14,11 +14,23 @@ import {
   assertDisputesErrorCause,
   assertServiceStatus,
   assertWebhookOutcome,
+  assertContractsRequestMetric,
+  assertReputationRequestMetric,
+  ContractsErrorCause,
+  ContractsRequestMetric,
+  ContractsRequestStatus,
   DisputesErrorCause,
+  ReputationRequestMetric,
   WebhookOutcome as ValidatedWebhookOutcome,
 } from './metrics-validation';
 import { DEFAULT_HISTOGRAM_BUCKETS, validateHistogramBuckets } from './observability-config';
 import { Logger, logger as rootLogger } from '../logger';
+
+export type {
+  ContractsErrorCause,
+  ContractsRequestMetric,
+  ContractsRequestStatus,
+} from './metrics-validation';
 
 /**
  * Re-exported from metrics-validation to preserve existing import paths.
@@ -41,27 +53,70 @@ export const CATALOG_METRIC_NAMES: readonly string[] = [
   'api_keys_requests_total',
   'api_keys_request_duration_seconds',
   'api_keys_errors_total',
+  'auth_requests_total',
+  'auth_request_duration_seconds',
+  'auth_errors_total',
+  'reputation_requests_total',
+  'reputation_request_duration_seconds',
+  'reputation_errors_total',
   'service_health_status',
   'webhook_deliveries_total',
   'webhook_dlq_depth',
   'webhook_rate_limit_tokens',
   'webhook_rate_limit_queue_depth',
+  'milestone_operations_total',
+  'milestone_operation_duration_seconds',
   'disputes_requests_total',
   'disputes_request_duration_seconds',
+  'contracts_requests_total',
+  'contracts_request_duration_seconds',
 ] as const;
 
-export interface DisputesRequestMetricInput {
-  method: string;
-  route: string;
+export const REPUTATION_OPERATIONS = ['get_profile', 'create_rating'] as const;
+export type ReputationOperation = (typeof REPUTATION_OPERATIONS)[number];
+
+export const REPUTATION_STATUSES = ['success', 'client_error', 'server_error'] as const;
+export type ReputationRequestStatus = (typeof REPUTATION_STATUSES)[number];
+
+export const REPUTATION_ERROR_CAUSES = [
+  'none',
+  'bad_request',
+  'authentication',
+  'authorization',
+  'not_found',
+  'conflict',
+  'validation',
+  'rate_limit',
+  'client_error',
+  'internal_error',
+] as const;
+export type ReputationErrorCause = (typeof REPUTATION_ERROR_CAUSES)[number];
+
+export interface ReputationRequestMetric {
+  operation: ReputationOperation;
+  status: ReputationRequestStatus;
   statusCode: number;
-  errorCause: DisputesErrorCause;
+  errorCause: ReputationErrorCause;
   durationSeconds: number;
 }
+
+/** The type of milestone operation being instrumented. */
+export type MilestoneOperation = 'create' | 'update' | 'read';
+
+/**
+ * The outcome category of a milestone operation.
+ *
+ * - success: the operation completed with a 2xx response
+ * - client_error: the operation was rejected due to bad input (4xx)
+ * - server_error: an unexpected error occurred (5xx)
+ */
+export type MilestoneOperationStatus = 'success' | 'client_error' | 'server_error';
 
 export interface MetricsServiceLike {
   contentType: string;
   trackHttpRequest: (req: Request, res: Response, next: NextFunction) => void;
   trackApiKeysRequest: (req: Request, res: Response, next: NextFunction) => void;
+  trackAuthRequest: (req: Request, res: Response, next: NextFunction) => void;
   getMetrics: () => Promise<string>;
   recordReputationRequest: (metric: ReputationRequestMetric) => void;
   recordHealthStatus: (status: ServiceStatus) => void;
@@ -70,6 +125,13 @@ export interface MetricsServiceLike {
   recordDisputesRequest: (input: DisputesRequestMetricInput) => void;
   startRateLimitMetricsSampling?: (limiter: any, intervalMs?: number) => void;
   stopRateLimitMetricsSampling?: () => void;
+  recordMilestoneOperation: (
+    operation: MilestoneOperation,
+    status: MilestoneOperationStatus,
+    durationSeconds: number,
+    errorCause?: string,
+  ) => void;
+  recordContractsRequest: (metric: ContractsRequestMetric) => void;
 }
 
 const HEALTH_STATUS_VALUE: Record<ServiceStatus, number> = {
@@ -105,11 +167,23 @@ export class MetricsService implements MetricsServiceLike {
 
   private readonly httpRequestDurationSeconds: Histogram;
 
+  private readonly reputationRequestsTotal: Counter;
+
+  private readonly reputationRequestDurationSeconds: Histogram;
+
+  private readonly reputationErrorsTotal: Counter;
+
   private readonly apiKeysRequestsTotal: Counter;
 
   private readonly apiKeysRequestDurationSeconds: Histogram;
 
   private readonly apiKeysErrorsTotal: Counter;
+
+  private readonly authRequestsTotal: Counter;
+
+  private readonly authRequestDurationSeconds: Histogram;
+
+  private readonly authErrorsTotal: Counter;
 
   private readonly serviceHealthStatus: Gauge;
 
@@ -121,9 +195,17 @@ export class MetricsService implements MetricsServiceLike {
 
   private readonly webhookRateLimitQueueDepth: Gauge;
 
+  private readonly milestoneOperationsTotal: Counter;
+
+  private readonly milestoneOperationDurationSeconds: Histogram;
+
   private readonly disputesRequestsTotal: Counter;
 
   private readonly disputesRequestDurationSeconds: Histogram;
+
+  private readonly contractsRequestsTotal: Counter;
+
+  private readonly contractsRequestDurationSeconds: Histogram;
 
   private readonly httpRouteLabelLimit: number;
 
@@ -163,6 +245,28 @@ export class MetricsService implements MetricsServiceLike {
       registers: [this.register],
     });
 
+    this.reputationRequestsTotal = new Counter({
+      name: 'reputation_requests_total',
+      help: 'Total reputation endpoint requests by operation, status, and error cause.',
+      labelNames: ['operation', 'status', 'status_code', 'error_cause'],
+      registers: [this.register],
+    });
+
+    this.reputationRequestDurationSeconds = new Histogram({
+      name: 'reputation_request_duration_seconds',
+      help: 'Duration of reputation endpoint requests in seconds.',
+      labelNames: ['operation', 'status', 'status_code', 'error_cause'],
+      buckets: resolvedBuckets,
+      registers: [this.register],
+    });
+
+    this.reputationErrorsTotal = new Counter({
+      name: 'reputation_errors_total',
+      help: 'Total reputation endpoint errors by operation and error cause.',
+      labelNames: ['operation', 'error_cause'],
+      registers: [this.register],
+    });
+
     this.apiKeysRequestsTotal = new Counter({
       name: 'api_keys_requests_total',
       help: 'Total number of API key management requests.',
@@ -181,6 +285,28 @@ export class MetricsService implements MetricsServiceLike {
     this.apiKeysErrorsTotal = new Counter({
       name: 'api_keys_errors_total',
       help: 'Total number of API key management request errors by cause.',
+      labelNames: ['operation', 'cause'],
+      registers: [this.register],
+    });
+
+    this.authRequestsTotal = new Counter({
+      name: 'auth_requests_total',
+      help: 'Total number of authentication requests.',
+      labelNames: ['operation', 'status_code'],
+      registers: [this.register],
+    });
+
+    this.authRequestDurationSeconds = new Histogram({
+      name: 'auth_request_duration_seconds',
+      help: 'Duration of authentication requests in seconds.',
+      labelNames: ['operation', 'status_code'],
+      buckets: resolvedBuckets,
+      registers: [this.register],
+    });
+
+    this.authErrorsTotal = new Counter({
+      name: 'auth_errors_total',
+      help: 'Total number of authentication request errors by cause.',
       labelNames: ['operation', 'cause'],
       registers: [this.register],
     });
@@ -222,17 +348,47 @@ export class MetricsService implements MetricsServiceLike {
       registers: [this.register],
     });
 
+    this.milestoneOperationsTotal = new Counter({
+      name: 'milestone_operations_total',
+      help: 'Total number of milestone operations by type, status, and error cause.',
+      labelNames: ['operation', 'status', 'error_cause'],
+      registers: [this.register],
+    });
+
+    this.milestoneOperationDurationSeconds = new Histogram({
+      name: 'milestone_operation_duration_seconds',
+      help: 'Duration of milestone operations in seconds, labelled by operation type and status.',
+      labelNames: ['operation', 'status'],
+      buckets: resolvedBuckets,
+      registers: [this.register],
+    });
+
     this.disputesRequestsTotal = new Counter({
       name: 'disputes_requests_total',
-      help: 'Total disputes API requests by method, route, status, and error cause.',
+      help: 'Total number of disputes endpoint requests.',
       labelNames: ['method', 'route', 'status_code', 'error_cause'],
       registers: [this.register],
     });
 
     this.disputesRequestDurationSeconds = new Histogram({
       name: 'disputes_request_duration_seconds',
-      help: 'Duration of disputes API requests in seconds.',
+      help: 'Duration of disputes endpoint requests in seconds.',
       labelNames: ['method', 'route', 'status_code', 'error_cause'],
+      buckets: resolvedBuckets,
+      registers: [this.register],
+    });
+
+    this.contractsRequestsTotal = new Counter({
+      name: 'contracts_requests_total',
+      help: 'Total number of contracts requests by method, route, status, status_code, and error_cause.',
+      labelNames: ['method', 'route', 'status', 'status_code', 'error_cause'],
+      registers: [this.register],
+    });
+
+    this.contractsRequestDurationSeconds = new Histogram({
+      name: 'contracts_request_duration_seconds',
+      help: 'Duration of contracts requests in seconds.',
+      labelNames: ['method', 'route', 'status', 'status_code', 'error_cause'],
       buckets: resolvedBuckets,
       registers: [this.register],
     });
@@ -316,6 +472,45 @@ export class MetricsService implements MetricsServiceLike {
     next();
   }
 
+  trackAuthRequest(req: Request, res: Response, next: NextFunction): void {
+    const start = process.hrtime.bigint();
+
+    res.on('finish', () => {
+      const durationSeconds = Number(process.hrtime.bigint() - start) / 1_000_000_000;
+      const statusCode = res.statusCode;
+      const operation = authOperation(req.method, req.route?.path);
+      const labels = { operation, status_code: String(statusCode) };
+      const errorCause = authErrorCause(statusCode, res);
+
+      this.authRequestsTotal.inc(labels);
+      this.authRequestDurationSeconds.observe(labels, durationSeconds);
+      if (errorCause !== null) {
+        this.authErrorsTotal.inc({ operation, cause: errorCause });
+      }
+
+      const log = (res.locals['log'] as Logger | undefined) ?? rootLogger;
+      const logFields = {
+        method: req.method,
+        route: authRouteTemplate(req.route?.path),
+        operation,
+        statusCode,
+        durationMs: Number((durationSeconds * 1000).toFixed(3)),
+        outcome: statusCode < 400 ? 'success' : 'error',
+        ...(errorCause !== null && { errorCause }),
+      };
+
+      if (statusCode >= 500) {
+        log.error('auth_request', logFields);
+      } else if (statusCode >= 400) {
+        log.warn('auth_request', logFields);
+      } else {
+        log.info('auth_request', logFields);
+      }
+    });
+
+    next();
+  }
+
   recordHealthStatus(status: ServiceStatus): void {
     // Runtime guard: reject unknown status strings that bypass TypeScript types
     // (e.g. from JSON-deserialized or cross-process call sites).
@@ -378,6 +573,40 @@ export class MetricsService implements MetricsServiceLike {
       this.rateLimitStopSampling();
       this.rateLimitStopSampling = null;
     }
+  }
+
+  /**
+   * Record a completed milestone operation.
+   *
+   * @param operation - The type of operation: create, update, or read.
+   * @param status    - Outcome category: success, client_error, or server_error.
+   * @param durationSeconds - Wall-clock time in seconds.
+   * @param errorCause - Optional machine-readable cause label (e.g. "not_found",
+   *   "contract_bounds_error") for failed operations.  Defaults to the empty
+   *   string for success outcomes.  Never include PII.
+   */
+  recordMilestoneOperation(
+    operation: MilestoneOperation,
+    status: MilestoneOperationStatus,
+    durationSeconds: number,
+    errorCause: string = '',
+  ): void {
+    this.milestoneOperationsTotal.inc({ operation, status, error_cause: errorCause });
+    this.milestoneOperationDurationSeconds.observe({ operation, status }, durationSeconds);
+  }
+
+  recordContractsRequest(metric: ContractsRequestMetric): void {
+    const validated = assertContractsRequestMetric(metric);
+    const labels = {
+      method: validated.method,
+      route: this.boundRouteLabel(validated.route),
+      status: validated.status,
+      status_code: String(validated.statusCode),
+      error_cause: validated.errorCause,
+    };
+
+    this.contractsRequestsTotal.inc(labels);
+    this.contractsRequestDurationSeconds.observe(labels, validated.durationSeconds);
   }
 
   getMetrics(): Promise<string> {
@@ -455,6 +684,49 @@ function apiKeysOperation(method: string, routePath: unknown): string {
 
 function apiKeysRouteTemplate(routePath: unknown): string {
   return typeof routePath === 'string' ? `/api/v1${routePath}` : '/api/v1/api-keys';
+}
+
+type AuthErrorCause =
+  | 'validation_error'
+  | 'invalid_credentials'
+  | 'invalid_token'
+  | 'conflict'
+  | 'rate_limit'
+  | 'client_error'
+  | 'server_error';
+
+function authErrorCause(statusCode: number, res: Response): AuthErrorCause | null {
+  if (statusCode < 400) return null;
+
+  const explicit = res.locals?.['errorCause'];
+  if (explicit === 'validation_error') return 'validation_error';
+  if (explicit === 'invalid_credentials') return 'invalid_credentials';
+  if (explicit === 'invalid_refresh_token' || explicit === 'unauthorized') return 'invalid_token';
+  if (explicit === 'conflict') return 'conflict';
+
+  if (statusCode === 400 || statusCode === 422) return 'validation_error';
+  if (statusCode === 401 || statusCode === 403) return 'invalid_token';
+  if (statusCode === 409) return 'conflict';
+  if (statusCode === 429) return 'rate_limit';
+  if (statusCode < 500) return 'client_error';
+  return 'server_error';
+}
+
+function authOperation(method: string, routePath: unknown): string {
+  const route = typeof routePath === 'string' ? routePath : '';
+  if (method !== 'POST') return 'unknown';
+  if (route === '/login') return 'login';
+  if (route === '/register') return 'register';
+  if (route === '/refresh') return 'refresh';
+  if (route === '/logout') return 'logout';
+  return 'unknown';
+}
+
+function authRouteTemplate(routePath: unknown): string {
+  const route = typeof routePath === 'string' ? routePath : '';
+  return ['/login', '/register', '/refresh', '/logout'].includes(route)
+    ? `/api/v1/auth${route}`
+    : '/api/v1/auth';
 }
 
 /**
@@ -556,6 +828,28 @@ function resolveErrorCause(res: Response): string {
     return 'client_error';
   }
   return 'server_error';
+}
+
+function assertReputationRequestMetric(metric: ReputationRequestMetric): void {
+  if (!REPUTATION_OPERATIONS.includes(metric.operation)) {
+    throw new Error('Invalid reputation operation');
+  }
+
+  if (!REPUTATION_STATUSES.includes(metric.status)) {
+    throw new Error('Invalid reputation request status');
+  }
+
+  if (!REPUTATION_ERROR_CAUSES.includes(metric.errorCause)) {
+    throw new Error('Invalid reputation error cause');
+  }
+
+  if (!Number.isInteger(metric.statusCode) || metric.statusCode < 100 || metric.statusCode > 599) {
+    throw new Error('Invalid reputation status code');
+  }
+
+  if (!Number.isFinite(metric.durationSeconds) || metric.durationSeconds < 0) {
+    throw new Error('Invalid reputation request duration');
+  }
 }
 
 

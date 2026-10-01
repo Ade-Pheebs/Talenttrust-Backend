@@ -143,6 +143,14 @@ describe('AuditCache', () => {
   });
 
   describe('LRU eviction', () => {
+    beforeEach(() => {
+      jest.useFakeTimers();
+    });
+
+    afterEach(() => {
+      jest.useRealTimers();
+    });
+
     it('should evict oldest entry when at capacity', () => {
       registry.clear();
       cache = new AuditCache({ ttlMs: 10000, maxEntries: 3 }, registry);
@@ -153,24 +161,29 @@ describe('AuditCache', () => {
       const query4: AuditQuery = { action: 'CONTRACT_COMPLETED' };
 
       cache.set(query1, [], 'query');
+      jest.advanceTimersByTime(10);
       cache.set(query2, [], 'query');
+      jest.advanceTimersByTime(10);
       cache.set(query3, [], 'query');
+      jest.advanceTimersByTime(10);
 
       expect(cache.getStats().size).toBe(3);
 
       // Access query1 to make it recently used
       cache.get(query1, 'query');
+      jest.advanceTimersByTime(10);
 
-      // Add query4, should evict the oldest not accessed (query2 or query3)
+      // Add query4, should evict the oldest not accessed (which is query2)
       cache.set(query4, [], 'query');
 
       expect(cache.getStats().size).toBe(3);
       expect(cache.get(query1, 'query')).toEqual([]); // Still cached
       expect(cache.get(query4, 'query')).toEqual([]); // New entry
-      // One of query2 or query3 should be evicted
-      const query2Result = cache.get(query2, 'query');
-      const query3Result = cache.get(query3, 'query');
-      expect(query2Result === null || query3Result === null).toBe(true);
+      
+      // query2 should be evicted as it's the oldest not recently accessed
+      expect(cache.get(query2, 'query')).toBeNull();
+      // query3 should still be cached
+      expect(cache.get(query3, 'query')).toEqual([]);
     });
   });
 
@@ -288,6 +301,184 @@ describe('AuditCache', () => {
 
       const missMetric = registry.getMetricsAsArray().find(m => m.name === 'audit_cache_misses_total');
       expect(missMetric).toBeDefined();
+    });
+  });
+
+  describe('metric registration (repeated / concurrent construction)', () => {
+    it('is idempotent when several caches share one registry', () => {
+      const shared = new Registry();
+
+      expect(() => new AuditCache({ ttlMs: 1000, maxEntries: 10 }, shared)).not.toThrow();
+      expect(() => new AuditCache({ ttlMs: 1000, maxEntries: 10 }, shared)).not.toThrow();
+
+      const second = new AuditCache({ ttlMs: 1000, maxEntries: 10 }, shared);
+      second.set({ action: 'CONTRACT_CREATED' }, [], 'query');
+      second.get({ action: 'CONTRACT_CREATED' }, 'query');
+
+      expect(shared.getSingleMetric('audit_cache_hits_total')).toBeDefined();
+      expect(shared.getSingleMetric('audit_cache_misses_total')).toBeDefined();
+    });
+
+    it('shares a single counter across instances on the same registry', async () => {
+      const shared = new Registry();
+      const first = new AuditCache({ ttlMs: 1000, maxEntries: 10 }, shared);
+      const second = new AuditCache({ ttlMs: 1000, maxEntries: 10 }, shared);
+
+      first.get({ action: 'CONTRACT_CREATED' }, 'query');
+      second.get({ action: 'CONTRACT_UPDATED' }, 'query');
+
+      const metric = shared.getSingleMetric('audit_cache_misses_total') as { get(): Promise<{ values: Array<{ value: number }> }> };
+      const output = await metric.get();
+      expect(output.values[0].value).toBe(2);
+    });
+  });
+
+  describe('concurrent / interleaved access', () => {
+    it('keeps the size invariant under interleaved set/get/evict cycles', () => {
+      const local = new AuditCache({ ttlMs: 60_000, maxEntries: 3 }, new Registry());
+
+      for (let i = 0; i < 200; i++) {
+        local.set({ action: `A${i}` }, [], 'query');
+        local.get({ action: `A${i - 1}` }, 'query');
+        expect(local.getStats().size).toBeLessThanOrEqual(3);
+      }
+    });
+
+    it('resolves concurrent misses without corrupting or duplicating state', async () => {
+      const local = new AuditCache({ ttlMs: 60_000, maxEntries: 5 }, new Registry());
+
+      const results = await Promise.all(
+        Array.from({ length: 20 }, (_, i) =>
+          Promise.resolve().then(() => {
+            const query: AuditQuery = { action: `A${i % 4}` };
+            const cached = local.get(query, 'query');
+            if (cached) {
+              return 'hit';
+            }
+            local.set(query, [], 'query');
+            return 'miss';
+          }),
+        ),
+      );
+
+      expect(results).toHaveLength(20);
+      expect(local.getStats().size).toBeLessThanOrEqual(5);
+      for (const action of ['A0', 'A1', 'A2', 'A3']) {
+        expect(local.get({ action }, 'query')).toEqual([]);
+      }
+    });
+  });
+
+  describe('deterministic cache keys', () => {
+    it('treats queries with reordered keys as the same entry', () => {
+      const local = new AuditCache({ ttlMs: 60_000, maxEntries: 10 }, new Registry());
+
+      local.set({ action: 'CONTRACT_CREATED', resourceId: 'r1' }, [], 'query');
+
+      expect(local.get({ resourceId: 'r1', action: 'CONTRACT_CREATED' }, 'query')).toEqual([]);
+      expect(local.getStats()).toEqual({ size: 1, hits: 1, misses: 0 });
+    });
+
+    it('ignores undefined fields when building the key', () => {
+      const local = new AuditCache({ ttlMs: 60_000, maxEntries: 10 }, new Registry());
+
+      local.set({ action: 'CONTRACT_CREATED', actor: undefined }, [], 'query');
+
+      expect(local.get({ action: 'CONTRACT_CREATED' }, 'query')).toEqual([]);
+    });
+
+    it('degrades circular / non-serialisable queries to a miss instead of throwing', () => {
+      const local = new AuditCache({ ttlMs: 60_000, maxEntries: 10 }, new Registry());
+      const circular: AuditQuery & { self?: unknown } = { action: 'CONTRACT_CREATED' };
+      circular.self = circular;
+
+      expect(() => local.get(circular, 'query')).not.toThrow();
+      expect(local.get(circular, 'query')).toBeNull();
+
+      expect(() => local.set(circular, [], 'query')).not.toThrow();
+      expect(local.getStats().size).toBe(0);
+    });
+  });
+
+  describe('capacity and boundary handling', () => {
+    it('disables storage when maxEntries is non-positive', () => {
+      const disabled = new AuditCache({ ttlMs: 60_000, maxEntries: 0 }, new Registry());
+
+      disabled.set({ action: 'CONTRACT_CREATED' }, [], 'query');
+
+      expect(disabled.getStats().size).toBe(0);
+      expect(disabled.get({ action: 'CONTRACT_CREATED' }, 'query')).toBeNull();
+    });
+
+    it('never exceeds maxEntries after capacity is applied', () => {
+      const local = new AuditCache({ ttlMs: 60_000, maxEntries: 2 }, new Registry());
+
+      local.set({ action: 'A' }, [], 'query');
+      local.set({ action: 'B' }, [], 'query');
+      local.set({ action: 'C' }, [], 'query');
+
+      expect(local.getStats().size).toBe(2);
+    });
+
+    it('normalizes invalid TTL / maxEntries instead of throwing', () => {
+      expect(() => new AuditCache({ ttlMs: Number.NaN, maxEntries: 10 }, new Registry())).not.toThrow();
+      expect(() => new AuditCache({ ttlMs: -1, maxEntries: -5 }, new Registry())).not.toThrow();
+    });
+  });
+
+  describe('defensive copies (state integrity under repeated access)', () => {
+    it('does not let readers mutate cached data', () => {
+      const local = new AuditCache({ ttlMs: 60_000, maxEntries: 10 }, new Registry());
+      local.set({ action: 'A' }, [{ id: '1' } as AuditEntry], 'query');
+
+      const first = local.get({ action: 'A' }, 'query') as AuditEntry[];
+      first.push({ id: '2' } as AuditEntry);
+
+      const second = local.get({ action: 'A' }, 'query') as AuditEntry[];
+      expect(second).toHaveLength(1);
+    });
+
+    it('does not let the writer mutate cached data after set', () => {
+      const local = new AuditCache({ ttlMs: 60_000, maxEntries: 10 }, new Registry());
+      const data: AuditEntry[] = [{ id: '1' } as AuditEntry];
+
+      local.set({ action: 'A' }, data, 'query');
+      data.push({ id: '2' } as AuditEntry);
+
+      const stored = local.get({ action: 'A' }, 'query') as AuditEntry[];
+      expect(stored).toHaveLength(1);
+    });
+  });
+
+  describe('invalidation boundaries', () => {
+    it('ignores empty or non-string resource ids', () => {
+      const local = new AuditCache({ ttlMs: 60_000, maxEntries: 10 }, new Registry());
+      local.set({ resourceId: 'r1' }, [], 'query');
+
+      expect(() => local.invalidateByResourceId('')).not.toThrow();
+      expect(() => local.invalidateByResourceId(undefined as unknown as string)).not.toThrow();
+      expect(local.getStats().size).toBe(1);
+    });
+
+    it('only invalidates the exact resource id (no prefix collisions)', () => {
+      const local = new AuditCache({ ttlMs: 60_000, maxEntries: 10 }, new Registry());
+      local.set({ resourceId: 'resource1' }, [], 'query');
+      local.set({ resourceId: 'resource10' }, [], 'query');
+
+      local.invalidateByResourceId('resource1');
+
+      expect(local.get({ resourceId: 'resource1' }, 'query')).toBeNull();
+      expect(local.get({ resourceId: 'resource10' }, 'query')).toEqual([]);
+    });
+  });
+
+  describe('getById boundaries', () => {
+    it('does not cache getById entries without a usable id', () => {
+      const local = new AuditCache({ ttlMs: 60_000, maxEntries: 10 }, new Registry());
+      local.set({}, { id: 'x' } as AuditEntry, 'getById', '');
+
+      expect(local.getStats().size).toBe(0);
+      expect(local.get({}, 'getById', '')).toBeNull();
     });
   });
 });

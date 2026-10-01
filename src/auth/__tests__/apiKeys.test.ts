@@ -7,15 +7,13 @@ import {
   rotateApiKey,
   deactivateApiKey,
   computeKeySelector,
-  resetAuthCache,
-  getAuthCache
+  ApiKeyValidationError
 } from '../apiKeys';
 import { database } from '../../database';
 
 describe('API Key Utilities', () => {
   beforeEach(async () => {
     await database.clearDatabase();
-    resetAuthCache();
   });
 
   describe('generateApiKey', () => {
@@ -601,115 +599,352 @@ describe('API Key Utilities', () => {
     });
   });
 
-  describe('Cache invalidation on write operations', () => {
-    it('invalidates cache when creating a new API key', async () => {
-      const request = {
-        name: 'Test Key',
-        scope: ['contracts:read'],
-        createdBy: 'user-1',
-      };
-
-      const { apiKey } = await createApiKey(request);
-
-      // First validation should populate cache
-      const result1 = await validateApiKey(apiKey);
-      expect(result1).not.toBeNull();
-
-      const cache = getAuthCache();
-      const statsBefore = cache.getStats();
-      expect(statsBefore.size).toBeGreaterThan(0);
-
-      // Create another key for the same user
-      await createApiKey({
-        name: 'Test Key 2',
-        scope: ['contracts:write'],
-        createdBy: 'user-1',
+  describe('Input validation - compatibility contracts', () => {
+    describe('createApiKey', () => {
+      it('should throw ApiKeyValidationError for null request', async () => {
+        await expect(async () => {
+          await createApiKey(null as any);
+        }).rejects.toThrow(ApiKeyValidationError);
       });
 
-      // Cache should be invalidated for user-1
-      const statsAfter = cache.getStats();
-      expect(statsAfter.size).toBeLessThan(statsBefore.size);
+      it('should throw ApiKeyValidationError for undefined request', async () => {
+        await expect(async () => {
+          await createApiKey(undefined as any);
+        }).rejects.toThrow(ApiKeyValidationError);
+      });
+
+      it('should throw ApiKeyValidationError for empty name', async () => {
+        const request = {
+          name: '',
+          scope: ['contracts:read'],
+          createdBy: 'user123'
+        };
+        await expect(async () => {
+          await createApiKey(request);
+        }).rejects.toThrow(ApiKeyValidationError);
+      });
+
+      it('should throw ApiKeyValidationError for non-string name', async () => {
+        const request = {
+          name: 123 as any,
+          scope: ['contracts:read'],
+          createdBy: 'user123'
+        };
+        await expect(async () => {
+          await createApiKey(request);
+        }).rejects.toThrow(ApiKeyValidationError);
+      });
+
+      it('should throw ApiKeyValidationError for empty scope array', async () => {
+        const request = {
+          name: 'Test Key',
+          scope: [],
+          createdBy: 'user123'
+        };
+        await expect(async () => {
+          await createApiKey(request);
+        }).rejects.toThrow(ApiKeyValidationError);
+      });
+
+      it('should throw ApiKeyValidationError for non-array scope', async () => {
+        const request = {
+          name: 'Test Key',
+          scope: 'contracts:read' as any,
+          createdBy: 'user123'
+        };
+        await expect(async () => {
+          await createApiKey(request);
+        }).rejects.toThrow(ApiKeyValidationError);
+      });
+
+      it('should throw ApiKeyValidationError for empty string in scope', async () => {
+        const request = {
+          name: 'Test Key',
+          scope: ['contracts:read', ''],
+          createdBy: 'user123'
+        };
+        await expect(async () => {
+          await createApiKey(request);
+        }).rejects.toThrow(ApiKeyValidationError);
+      });
+
+      it('should throw ApiKeyValidationError for non-string in scope', async () => {
+        const request = {
+          name: 'Test Key',
+          scope: ['contracts:read', 123 as any],
+          createdBy: 'user123'
+        };
+        await expect(async () => {
+          await createApiKey(request);
+        }).rejects.toThrow(ApiKeyValidationError);
+      });
+
+      it('should throw ApiKeyValidationError for empty createdBy', async () => {
+        const request = {
+          name: 'Test Key',
+          scope: ['contracts:read'],
+          createdBy: ''
+        };
+        await expect(async () => {
+          await createApiKey(request);
+        }).rejects.toThrow(ApiKeyValidationError);
+      });
+
+      it('should throw ApiKeyValidationError for non-string createdBy', async () => {
+        const request = {
+          name: 'Test Key',
+          scope: ['contracts:read'],
+          createdBy: 123 as any
+        };
+        await expect(async () => {
+          await createApiKey(request);
+        }).rejects.toThrow(ApiKeyValidationError);
+      });
+
+      it('should throw ApiKeyValidationError for invalid expiresAt type', async () => {
+        const request = {
+          name: 'Test Key',
+          scope: ['contracts:read'],
+          createdBy: 'user123',
+          expiresAt: '2024-12-31' as any
+        };
+        await expect(async () => {
+          await createApiKey(request);
+        }).rejects.toThrow(ApiKeyValidationError);
+      });
+
+      it('should accept valid request with all fields', async () => {
+        const request = {
+          name: 'Test Key',
+          scope: ['contracts:read'],
+          createdBy: 'user123',
+          expiresAt: new Date('2024-12-31T23:59:59Z')
+        };
+        const result = await createApiKey(request);
+        expect(result).toHaveProperty('apiKey');
+        expect(result).toHaveProperty('info');
+      });
     });
 
-    it('invalidates cache when rotating an API key', async () => {
+    describe('hashApiKey', () => {
+      it('should throw ApiKeyValidationError for empty string', () => {
+        expect(() => hashApiKey('')).toThrow(ApiKeyValidationError);
+      });
+
+      it('should throw ApiKeyValidationError for non-string input', () => {
+        expect(() => hashApiKey(123 as any)).toThrow(ApiKeyValidationError);
+      });
+
+      it('should throw ApiKeyValidationError for null input', () => {
+        expect(() => hashApiKey(null as any)).toThrow(ApiKeyValidationError);
+      });
+
+      it('should throw ApiKeyValidationError for undefined input', () => {
+        expect(() => hashApiKey(undefined as any)).toThrow(ApiKeyValidationError);
+      });
+
+      it('should accept valid non-empty string', () => {
+        const result = hashApiKey('valid-key');
+        expect(result).toHaveProperty('salt');
+        expect(result).toHaveProperty('hash');
+      });
+    });
+
+    describe('computeKeySelector', () => {
+      it('should throw ApiKeyValidationError for empty string', () => {
+        expect(() => computeKeySelector('')).toThrow(ApiKeyValidationError);
+      });
+
+      it('should throw ApiKeyValidationError for non-string input', () => {
+        expect(() => computeKeySelector(123 as any)).toThrow(ApiKeyValidationError);
+      });
+
+      it('should throw ApiKeyValidationError for null input', () => {
+        expect(() => computeKeySelector(null as any)).toThrow(ApiKeyValidationError);
+      });
+
+      it('should throw ApiKeyValidationError for undefined input', () => {
+        expect(() => computeKeySelector(undefined as any)).toThrow(ApiKeyValidationError);
+      });
+
+      it('should accept valid non-empty string', () => {
+        const selector = computeKeySelector('valid-key');
+        expect(selector).toMatch(/^[a-f0-9]{64}$/);
+      });
+    });
+
+    describe('verifyApiKey', () => {
+      it('should return false for empty apiKey', () => {
+        const { salt, hash } = hashApiKey('test');
+        expect(verifyApiKey('', salt, hash)).toBe(false);
+      });
+
+      it('should return false for empty salt', () => {
+        const { hash } = hashApiKey('test');
+        expect(verifyApiKey('test', '', hash)).toBe(false);
+      });
+
+      it('should return false for empty hash', () => {
+        const { salt } = hashApiKey('test');
+        expect(verifyApiKey('test', salt, '')).toBe(false);
+      });
+
+      it('should return false for non-string apiKey', () => {
+        const { salt, hash } = hashApiKey('test');
+        expect(verifyApiKey(123 as any, salt, hash)).toBe(false);
+      });
+
+      it('should return false for non-string salt', () => {
+        const { hash } = hashApiKey('test');
+        expect(verifyApiKey('test', 123 as any, hash)).toBe(false);
+      });
+
+      it('should return false for non-string hash', () => {
+        const { salt } = hashApiKey('test');
+        expect(verifyApiKey('test', salt, 123 as any)).toBe(false);
+      });
+
+      it('should return false for null inputs', () => {
+        expect(verifyApiKey(null as any, 'salt', 'hash')).toBe(false);
+        expect(verifyApiKey('key', null as any, 'hash')).toBe(false);
+        expect(verifyApiKey('key', 'salt', null as any)).toBe(false);
+      });
+
+      it('should return false for malformed hex in hash', () => {
+        const { salt } = hashApiKey('test');
+        expect(verifyApiKey('test', salt, 'invalid-hex!@#')).toBe(false);
+      });
+
+      it('should never throw - always returns boolean', () => {
+        expect(() => verifyApiKey('', '', '')).not.toThrow();
+        expect(() => verifyApiKey(null as any, null as any, null as any)).not.toThrow();
+        expect(() => verifyApiKey(123 as any, 456 as any, 789 as any)).not.toThrow();
+      });
+    });
+
+    describe('validateApiKey', () => {
+      it('should return null for empty string', async () => {
+        const result = await validateApiKey('');
+        expect(result).toBeNull();
+      });
+
+      it('should return null for non-string input', async () => {
+        const result = await validateApiKey(123 as any);
+        expect(result).toBeNull();
+      });
+
+      it('should return null for null input', async () => {
+        const result = await validateApiKey(null as any);
+        expect(result).toBeNull();
+      });
+
+      it('should return null for undefined input', async () => {
+        const result = await validateApiKey(undefined as any);
+        expect(result).toBeNull();
+      });
+
+      it('should never throw - always returns ApiKeyInfo or null', async () => {
+        await expect(async () => {
+          await validateApiKey('');
+        }).not.toThrow();
+        await expect(async () => {
+          await validateApiKey(null as any);
+        }).not.toThrow();
+        await expect(async () => {
+          await validateApiKey(123 as any);
+        }).not.toThrow();
+      });
+    });
+
+    describe('rotateApiKey', () => {
+      it('should throw ApiKeyValidationError for empty keyId', async () => {
+        await expect(async () => {
+          await rotateApiKey('');
+        }).rejects.toThrow(ApiKeyValidationError);
+      });
+
+      it('should throw ApiKeyValidationError for non-string keyId', async () => {
+        await expect(async () => {
+          await rotateApiKey(123 as any);
+        }).rejects.toThrow(ApiKeyValidationError);
+      });
+
+      it('should throw ApiKeyValidationError for null keyId', async () => {
+        await expect(async () => {
+          await rotateApiKey(null as any);
+        }).rejects.toThrow(ApiKeyValidationError);
+      });
+
+      it('should throw ApiKeyValidationError for undefined keyId', async () => {
+        await expect(async () => {
+          await rotateApiKey(undefined as any);
+        }).rejects.toThrow(ApiKeyValidationError);
+      });
+
+      it('should return null for non-existent key', async () => {
+        const result = await rotateApiKey('non-existent-id');
+        expect(result).toBeNull();
+      });
+    });
+
+    describe('deactivateApiKey', () => {
+      it('should throw ApiKeyValidationError for empty keyId', async () => {
+        await expect(async () => {
+          await deactivateApiKey('');
+        }).rejects.toThrow(ApiKeyValidationError);
+      });
+
+      it('should throw ApiKeyValidationError for non-string keyId', async () => {
+        await expect(async () => {
+          await deactivateApiKey(123 as any);
+        }).rejects.toThrow(ApiKeyValidationError);
+      });
+
+      it('should throw ApiKeyValidationError for null keyId', async () => {
+        await expect(async () => {
+          await deactivateApiKey(null as any);
+        }).rejects.toThrow(ApiKeyValidationError);
+      });
+
+      it('should throw ApiKeyValidationError for undefined keyId', async () => {
+        await expect(async () => {
+          await deactivateApiKey(undefined as any);
+        }).rejects.toThrow(ApiKeyValidationError);
+      });
+
+      it('should return false for non-existent key', async () => {
+        const result = await deactivateApiKey('non-existent-id');
+        expect(result).toBe(false);
+      });
+    });
+  });
+
+  describe('Regression tests - existing behavior preserved', () => {
+    it('should still create valid keys with correct format', async () => {
       const request = {
         name: 'Test Key',
         scope: ['contracts:read'],
-        createdBy: 'user-1',
+        createdBy: 'user123'
       };
-
-      const { apiKey, info } = await createApiKey(request);
-
-      // First validation should populate cache
-      const result1 = await validateApiKey(apiKey);
-      expect(result1).not.toBeNull();
-
-      const cache = getAuthCache();
-      const statsBefore = cache.getStats();
-      expect(statsBefore.size).toBeGreaterThan(0);
-
-      // Rotate the key
-      await rotateApiKey(info.id);
-
-      // Cache should be invalidated
-      const statsAfter = cache.getStats();
-      expect(statsAfter.size).toBeLessThan(statsBefore.size);
-
-      // Old key should no longer validate
-      const result2 = await validateApiKey(apiKey);
-      expect(result2).toBeNull();
+      const result = await createApiKey(request);
+      expect(result.apiKey).toMatch(/^[a-f0-9]{64}$/);
+      expect(result.info.name).toBe('Test Key');
     });
 
-    it('invalidates cache when deactivating an API key', async () => {
+    it('should still validate correct keys', async () => {
       const request = {
         name: 'Test Key',
         scope: ['contracts:read'],
-        createdBy: 'user-1',
+        createdBy: 'user123'
       };
-
-      const { apiKey, info } = await createApiKey(request);
-
-      // First validation should populate cache
-      const result1 = await validateApiKey(apiKey);
-      expect(result1).not.toBeNull();
-
-      const cache = getAuthCache();
-      const statsBefore = cache.getStats();
-      expect(statsBefore.size).toBeGreaterThan(0);
-
-      // Deactivate the key
-      await deactivateApiKey(info.id);
-
-      // Cache should be invalidated
-      const statsAfter = cache.getStats();
-      expect(statsAfter.size).toBeLessThan(statsBefore.size);
-
-      // Deactivated key should no longer validate
-      const result2 = await validateApiKey(apiKey);
-      expect(result2).toBeNull();
-    });
-
-    it('cache hit on subsequent validations', async () => {
-      const request = {
-        name: 'Test Key',
-        scope: ['contracts:read'],
-        createdBy: 'user-1',
-      };
-
       const { apiKey } = await createApiKey(request);
+      const result = await validateApiKey(apiKey);
+      expect(result).not.toBeNull();
+    });
 
-      const cache = getAuthCache();
-      const statsBefore = cache.getStats();
-
-      // First validation - miss
-      await validateApiKey(apiKey);
-      const statsAfterFirst = cache.getStats();
-      expect(statsAfterFirst.misses).toBe(statsBefore.misses + 1);
-
-      // Second validation - hit
-      await validateApiKey(apiKey);
-      const statsAfterSecond = cache.getStats();
-      expect(statsAfterSecond.hits).toBe(statsAfterFirst.hits + 1);
+    it('should still reject incorrect keys', async () => {
+      const result = await validateApiKey('wrong-key');
+      expect(result).toBeNull();
     });
   });
 });

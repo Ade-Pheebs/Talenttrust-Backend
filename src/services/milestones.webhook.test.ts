@@ -63,6 +63,8 @@ describe('MilestonesService — webhook integration', () => {
         contractId: CONTRACT_ID,
         amount: 500_000,
       }),
+      undefined,
+      undefined,
     );
   });
 
@@ -88,6 +90,8 @@ describe('MilestonesService — webhook integration', () => {
     expect(mockWebhook.trigger).toHaveBeenCalledWith(
       'milestone.released',
       expect.objectContaining({ milestoneId: record.id }),
+      undefined,
+      undefined,
     );
   });
 
@@ -168,6 +172,8 @@ describe('MilestonesService — backward compatibility', () => {
       expect(triggerSpy).toHaveBeenCalledWith(
         'milestone.released',
         expect.objectContaining({ contractId: 'wired-contract' }),
+        undefined,
+        undefined,
       );
     } finally {
       triggerSpy.mockRestore();

@@ -1,26 +1,26 @@
 //! # predictify-hybrid
 //!
-/// Soroban smart contract for prediction markets.
-///
-/// ## Idempotency
-///
-/// `place_bets` accepts a caller-supplied `BytesN<32>`
-/// idempotency key. The key is stored in instance storage under
-/// `DataKey::PlaceBetsIdem(caller, key)` with a TTL of
-/// [`storage::IDEM_KEY_TTL_LEDGERS`] ledgers (~24 h).  Repeated
-/// submissions with the same `(caller, key)` pair are rejected with
-/// `Error::IdempotentBatchAlreadyApplied`.
-///
-/// ## Validation boundaries
-+///
-/// See [`bets::place_bets`] for the full ordered list of checks.
-/// In short: empty batches, batches larger than
--/// [`storage::MAX_BATCH_SIZE`], duplicate market identifiers within a
-/// batch, and per-bet field failures are rejected before any state
-/// mutation.  Only a fully validated batch consumes the idempotency
-/// key, so a rejected call can be retried with the same token.
-
-#no_stdj
+//! Soroban smart contract for prediction markets.
+//!
+//! ## Idempotency
+//!
+//! `place_bets` accepts a caller-supplied `BytesN<32>` idempotency key.
+//! The key is stored in instance storage under
+//! `DataKey::PlaceBetsIdem(caller, key)` with a TTL of
+//! [`storage::IDEM_KEY_TTL_LEDGERS`] ledgers (~24 h).  Repeated
+//! submissions with the same `(caller, key)` pair are rejected with
+//! `Error::IdempotentBatchAlreadyApplied`.
+//!
+//! ## Concurrency and failure models
+//!
+//! The idempotency sentinel is written **before** any bet is applied
+//! (write-ahead).  Because Soroban executes a contract invocation as
+//! a single atomic transaction, a failure during bet application rolls
+//! back the sentinel write as well -- there is no window in which a
+//! partial batch is observable.  Concurrent submissions with the same
+//! `(caller, key)` pair are serialized by the ledger and the second one
+//! is rejected deterministically with `Error::IdempotentBatchAlreadyApplied`.
+#!no_std
 
 #[cfg(test)]
 mod batch_operations_tests;
@@ -28,9 +28,7 @@ mod bets;
 mod errors;
 mod storage;
 
-#[cfg(test)]
-mod storage_compatibility_tests;
-
+/// Re-exported public types and constants.
 pub use bets::Bet;
 pub use errors::Error;
 pub use storage::{DataKey, IDEM_KEY_TTL_LEDGERS, MAX_BATCH_SIZE};

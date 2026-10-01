@@ -44,7 +44,7 @@ module.exports = {
     '^uuid$': require.resolve('uuid'),
   },
   transformIgnorePatterns: [
-    'node_modules/(?!(uuid)/)',
+    'node_modules/(?!(uuid|@stellar/stellar-sdk|@stellar/js-xdr)/)',
   ],
   testEnvironment: 'node',
   testTimeout: 15000,

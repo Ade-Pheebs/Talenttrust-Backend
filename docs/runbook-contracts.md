@@ -39,9 +39,21 @@ The implementation in
 [`contracts/predictify-hybrid/src/bets.rs`](../contracts/predictify-hybrid/src/bets.rs):
 
 1. requires authorization from the caller;
-2. validates the batch and individual bet data;
-3. uses instance storage for idempotency keys and bet records; and
-4. publishes a `bets_placed` event after the batch succeeds.
+2. validates the batch shape (non-empty, at most `MAX_BETS_PER_BATCH`) and
+   every bet (`market_id != 0`, `amount > 0`, `i128`-safe total) before
+   performing any write;
+3. records one idempotency receipt per `(caller, key)` pair in
+   **temporary** storage, expiring after `IDEM_KEY_TTL_LEDGERS` ledgers
+   (~24 h) and bumped on every accepted batch; and
+4. publishes a `bets_placed` event — plus the legacy `place_bets` event —
+   only after the batch succeeds.
+
+Receipts are deliberately not kept in instance or persistent storage: the
+instance entry is a single bounded ledger entry, and an archived persistent
+entry cannot be read without a paid restore, which would make an expired
+token permanently unusable rather than reusable. See
+`DataKey` in
+[`contracts/predictify-hybrid/src/storage.rs`](../contracts/predictify-hybrid/src/storage.rs).
 
 Storage keys are defined in
 [`contracts/predictify-hybrid/src/storage.rs`](../contracts/predictify-hybrid/src/storage.rs),

@@ -199,9 +199,9 @@ export class AuditService {
 
       return entry;
     } catch (err) {
-      // Repository errors may include request or credential values. Keep the
-      // signal while leaving the original error available to the caller.
-      console.error('[AuditService] Failed to persist audit entry');
+      // Persistence exceptions can contain SQL parameters or request metadata.
+      // Keep the diagnostic stable without leaking the rejected entry.
+      console.error('[AuditService] Failed to persist audit entry', { code: 'audit_persist_failed' });
       throw err;
     }
     // An append changes unfiltered, actor/action and cursor queries too.

@@ -381,6 +381,7 @@ describe('createProtectedEndpointAuditMiddleware', () => {
 
     expect(consoleSpy).toHaveBeenCalledWith(
       expect.stringContaining('[protectedEndpointAuditMiddleware]'),
+      { code: 'protected_audit_write_failed' },
     );
     expect(JSON.stringify(consoleSpy.mock.calls)).not.toContain('private-token');
     consoleSpy.mockRestore();

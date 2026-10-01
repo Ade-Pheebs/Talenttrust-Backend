@@ -9,7 +9,7 @@
  * responses are recorded on `finish`, after authentication and the handler
  * have run. Prematurely closed responses are recorded once on `close`.
  *
- * Mount this middleware **before** `authenticateMiddleware` / `requireAuth`
+ * Mount this middleware after body parsing and **before** `authenticateMiddleware` / `requireAuth`
  * on any router or route group that requires authentication.
  *
  * ## Action mapping
@@ -24,8 +24,8 @@
  *
  * ## Redaction
  *
- * All request headers and body fields are passed through the deterministic
- * redaction rules defined in `./redact` before being written to the store.
+ * Request headers, body and query are copied within explicit bounds and
+ * redacted using `./redact`. Invalid sections are replaced with `[OMITTED]`.
  * The `Authorization` header value is **never** persisted.
  *
  * ## Traceability
@@ -54,8 +54,10 @@
  * than a slightly truncated one.
  *
  * @security
- * - Audit failures produce a generic diagnostic without breaking the request.
- * - No raw bearer tokens, passwords, or PII reach the audit store.
+ * - Audit failures are silently swallowed (with a console.error) so that a
+ *   logging fault never breaks the primary request path.
+ * - Known sensitive headers and payload keys are redacted. Free-text values
+ *   still require application-specific PII policy.
  *
  * @example
  * ```ts
@@ -70,7 +72,9 @@
 
 import type { Request, Response, NextFunction, RequestHandler } from 'express';
 import type { AuditAction, AuditSeverity } from './types';
-import { buildAuditMetadata } from './redact';
+import type { AuthenticatedRequest } from '../auth/authenticate';
+import { isIP } from 'net';
+import { auditIdentifier, auditPath, auditMethod, auditPayload } from './protectedEndpointInput';
 import { auditService, AuditService } from './service';
 import { validateEnv } from '../config/env.schema';
 import { sanitizeCorrelationId, sanitizeIpAddress } from './middleware';
@@ -114,6 +118,9 @@ function resolveActor(req: Request): string {
   if (typeof user?.id === 'string' && user.id) return user.id;
   return 'anonymous';
 }
+
+// Each response/service pair owns one terminal write, even across factories.
+const registrations = new WeakMap<Response, WeakSet<AuditService>>();
 
 // ─── Internal helpers ─────────────────────────────────────────────────────────
 
@@ -163,7 +170,7 @@ function deriveSeverity(action: AuditAction, statusCode: number): AuditSeverity 
  */
 function deriveResource(path: string): string {
   const match = /^\/api\/v\d+\/([^/?#]+)/i.exec(path);
-  return match?.[1] ?? 'endpoint';
+  return auditIdentifier(match?.[1]) ?? 'endpoint';
 }
 
 /**
@@ -176,7 +183,7 @@ function deriveResource(path: string): string {
  */
 function deriveResourceId(path: string): string {
   const match = /^\/api\/v\d+\/[^/?#]+\/([^/?#]+)/i.exec(path);
-  return match?.[1] ?? '';
+  return auditIdentifier(match?.[1]) ?? '';
 }
 
 // ─── Middleware factory ───────────────────────────────────────────────────────
@@ -208,71 +215,80 @@ export function createProtectedEndpointAuditMiddleware(
       return;
     }
 
-    const auditedResponse = res as AuditedResponse;
-    if (auditedResponse[auditListenerRegistered]) {
+    let services = registrations.get(res);
+    if (services?.has(service)) {
       next();
       return;
     }
-    auditedResponse[auditListenerRegistered] = true;
+    if (!services) {
+      services = new WeakSet();
+      registrations.set(res, services);
+    }
+    services.add(service);
 
-    let attempted = false;
-    const writeAuditEntry = (aborted: boolean): void => {
-      if (attempted) return;
-      // Never retry after service.log throws: the repository may already have
-      // appended the entry before a downstream step failed.
-      attempted = true;
+    // Snapshot ingress context before mounted routers or handlers rewrite it.
+    let method = 'UNKNOWN';
+    let path = '[INVALID]';
+    let headers: ReturnType<typeof auditPayload> = { value: '[OMITTED]', rejected: true };
+    let body = headers;
+    let query = headers;
+    try {
+      method = auditMethod(req.method);
+      path = auditPath(req.originalUrl ?? req.path);
+      headers = auditPayload(req.headers, true);
+      body = auditPayload(req.body);
+      const rawQuery = req.query;
+      query = rawQuery !== null && typeof rawQuery === 'object' && !Array.isArray(rawQuery)
+        ? auditPayload(rawQuery) : { value: '[OMITTED]', rejected: true };
+      if (!query.rejected && Object.keys(query.value as object).length === 0) {
+        query = { value: null, rejected: false };
+      }
+    } catch {
+      // Even an exotic request getter must not interrupt authentication.
+    }
+
+    res.once('finish', () => {
       try {
-        const statusCode = aborted ? 499 : res.statusCode;
-        const actor = resolveActor(req);
-        const action = deriveAction(req.method, res.statusCode);
-        const severity = aborted ? 'WARNING' : deriveSeverity(action, statusCode);
-        const path = `${req.baseUrl || ''}${req.path}`;
-        const resource = deriveResource(path);
-        const resourceId = deriveResourceId(path);
+        // Authentication and the final status are resolved after next().
+        const rawActor = (req as AuthenticatedRequest).user?.userId;
+        const validActor = auditIdentifier(rawActor);
+        const actor = validActor ?? 'anonymous';
+        const statusCode = Number.isInteger(res.statusCode) && res.statusCode >= 100 &&
+          res.statusCode <= 599 ? res.statusCode : null;
+        const action = deriveAction(method, statusCode ?? 500);
         const rawRequestId = res.locals['requestId'];
-        const requestId = typeof rawRequestId === 'string' ? rawRequestId : undefined;
-        const ipAddress =
-          (req.ip ?? req.socket?.remoteAddress) as string | undefined;
-
-        let metadata: Record<string, unknown>;
-        try {
-          metadata = buildAuditMetadata(
-            req.method,
-            path,
-            req.headers as Record<string, string | string[] | undefined>,
-            req.body,
-            req.query as Record<string, unknown>,
-            statusCode,
-            requestId,
-          );
-        } catch {
-          // Malformed or cyclic request data must not erase the entire audit
-          // event. Omit untrusted fields rather than persisting them raw.
-          metadata = {
-            method: req.method,
-            path,
-            statusCode,
-            requestId: requestId ?? null,
-            metadataOmitted: true,
-          };
-          console.error('[protectedEndpointAuditMiddleware] Request metadata omitted');
-        }
-        if (aborted) metadata['aborted'] = true;
-
+        const requestId = auditIdentifier(rawRequestId);
+        const correlationId = requestId && /^[A-Za-z0-9._:-]+$/.test(requestId) ? requestId : undefined;
+        const rawIp = req.ip ?? req.socket?.remoteAddress;
+        const ipAddress = typeof rawIp === 'string' && rawIp.length <= 45 && isIP(rawIp) ? rawIp : undefined;
+        const segments = /^\/api\/v\d+\/([^/?#]+)(?:\/([^/?#]+))?/i.exec(path);
+        const rejected = [
+          ...(method === 'UNKNOWN' ? ['method'] : []),
+          ...(path === '[INVALID]' ? ['path'] : []),
+          ...(statusCode === null ? ['statusCode'] : []),
+          ...(headers.rejected ? ['headers'] : []),
+          ...(body.rejected ? ['body'] : []),
+          ...(query.rejected ? ['query'] : []),
+          ...(rawActor !== undefined && !validActor ? ['actor'] : []),
+          ...(rawRequestId !== undefined && !correlationId ? ['requestId'] : []),
+          ...(rawIp !== undefined && !ipAddress ? ['ipAddress'] : []),
+          ...(segments?.[1] && !auditIdentifier(segments[1]) ? ['resource'] : []),
+          ...(segments?.[2] && !auditIdentifier(segments[2]) ? ['resourceId'] : []),
+        ];
+        const metadata = Object.freeze({
+          method, path, statusCode, requestId: correlationId ?? null,
+          headers: headers.value, body: body.value, query: query.value,
+          ...(rejected.length ? { auditValidation: Object.freeze(rejected) } : {}),
+        });
         service.log({
-          action,
-          severity,
-          actor,
-          resource,
-          resourceId,
-          metadata,
-          ipAddress,
-          correlationId,
+          action, severity: rejected.length ? 'WARNING' : deriveSeverity(action, statusCode ?? 500), actor,
+          resource: deriveResource(path), resourceId: deriveResourceId(path),
+          metadata, ipAddress, correlationId,
         });
       } catch {
-        // Audit failures must never disrupt the request lifecycle.
-        // Error objects from stores can contain request data or credentials.
-        console.error('[protectedEndpointAuditMiddleware] Failed to write audit entry');
+        // Never include exception messages, stack traces, or request data.
+        console.error('[protectedEndpointAuditMiddleware] Failed to write audit entry',
+          { code: 'protected_audit_write_failed' });
       }
     };
 

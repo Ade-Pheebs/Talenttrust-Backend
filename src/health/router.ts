@@ -23,7 +23,7 @@
 
 import { Router, Request, Response } from "express";
 import { runHealthCheck } from "./checker";
-import { Probe, HealthResponse, ProbeResult } from "./types";
+import { Probe, HealthResponse, ProbeResult, PaginatedHealthResponse } from "./types";
 import { logger as rootLogger, Logger } from "../logger";
 import type { MetricsServiceLike } from "../observability/metrics-service";
 import { validateQuery } from "../middleware/validation";
@@ -46,16 +46,8 @@ export interface HealthRouterOptions {
   /** List of probes to run. Defaults to the built-in probe registry. */
   probes?: Probe[];
   /** Optional metrics service for recording health status gauges. */
-  metricsService?: MetricsService;
-  /** Optional logger override (defaults to the root application logger). */
-  log?: typeof rootLogger;
-}
-
-// ─── Builder ──────────────────────────────────────────────────────────────────
-
-export interface HealthRouterOptions {
-  probes?: Probe[];
   metricsService?: Pick<MetricsServiceLike, "recordHealthStatus">;
+  /** Optional logger override (defaults to the root application logger). */
   log?: Pick<Logger, "info">;
 }
 

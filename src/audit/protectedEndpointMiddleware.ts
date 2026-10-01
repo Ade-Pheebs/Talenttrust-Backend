@@ -34,6 +34,25 @@
  * `res.locals.requestId`) is used as the `correlationId` on every entry,
  * enabling end-to-end request tracing across logs.
  *
+ * ## Validation boundaries (enforced in the finish listener)
+ *
+ * | Field         | Rule                                                           |
+ * |---------------|----------------------------------------------------------------|
+ * | actor         | Truncated to {@link MAX_ACTOR_LENGTH} chars; falls back to     |
+ * |               | `'anonymous'` when absent or non-string.                       |
+ * | resource      | Truncated to {@link MAX_RESOURCE_LENGTH} chars; falls back to  |
+ * |               | `'endpoint'` when the URL yields nothing useful.               |
+ * | resourceId    | Truncated to {@link MAX_RESOURCE_ID_LENGTH} chars; falls back  |
+ * |               | to `''` when the URL contains no id segment.                   |
+ * | ipAddress     | Sanitised via {@link sanitizeIpAddress} (clamped to 45 chars). |
+ * | correlationId | Sanitised via {@link sanitizeCorrelationId} (control chars     |
+ * |               | stripped, charset-validated, discarded on violation).          |
+ *
+ * Truncation (not rejection) is deliberate for automatically-derived fields:
+ * the entry is still useful for tracing and incident response even when a
+ * path segment is unexpectedly long, while a missing entry would be worse
+ * than a slightly truncated one.
+ *
  * @security
  * - Audit failures produce a generic diagnostic without breaking the request.
  * - No raw bearer tokens, passwords, or PII reach the audit store.
@@ -54,6 +73,31 @@ import type { AuditAction, AuditSeverity } from './types';
 import { buildAuditMetadata } from './redact';
 import { auditService, AuditService } from './service';
 import { validateEnv } from '../config/env.schema';
+import { sanitizeCorrelationId, sanitizeIpAddress } from './middleware';
+
+// ─── Field-length bounds ──────────────────────────────────────────────────────
+
+/**
+ * Maximum length of the `actor` field stored in an automatically-generated
+ * audit entry.  User IDs are bounded by the authentication system, but this
+ * guard prevents an arbitrarily long value from reaching the store when the
+ * service evolves or a non-standard auth path is added.
+ */
+export const MAX_ACTOR_LENGTH = 128;
+
+/**
+ * Maximum length of the `resource` field derived from the URL path.
+ * A URL segment is at most 2048 chars in practice; 128 is generous for
+ * any real resource type name while preventing oversized store writes.
+ */
+export const MAX_RESOURCE_LENGTH = 128;
+
+/**
+ * Maximum length of the `resourceId` field derived from the URL path.
+ * UUIDs are 36 chars; slugs are typically under 64.  256 allows for all
+ * realistic IDs while bounding the field against path-injection attempts.
+ */
+export const MAX_RESOURCE_ID_LENGTH = 256;
 
 // A response can pass through the same protected router more than once. Keep
 // the guard on that response, rather than in process-wide state, so each HTTP
@@ -72,6 +116,19 @@ function resolveActor(req: Request): string {
 }
 
 // ─── Internal helpers ─────────────────────────────────────────────────────────
+
+/**
+ * Truncate a string to at most `max` characters.
+ * Returns `fallback` when the value is absent, non-string, or empty.
+ *
+ * Truncation is preferred over rejection here because this middleware
+ * emits fire-and-forget entries: an entry with a truncated field is
+ * more useful for incident response than a missing entry.
+ */
+function truncate(value: unknown, max: number, fallback: string): string {
+  if (typeof value !== 'string' || value.length === 0) return fallback;
+  return value.length <= max ? value : value.slice(0, max);
+}
 
 /**
  * Map HTTP method + final status code to an AuditAction.
@@ -132,6 +189,8 @@ function deriveResourceId(path: string): string {
  * @param service - AuditService instance to write entries to (defaults to
  *                  the application singleton).
  */
+const AUDIT_FINISH_FLAG = Symbol('protectedEndpointAudit.finishRegistered');
+
 export function createProtectedEndpointAuditMiddleware(
   service: AuditService = auditService,
 ): RequestHandler {
@@ -208,7 +267,7 @@ export function createProtectedEndpointAuditMiddleware(
           resourceId,
           metadata,
           ipAddress,
-          correlationId: requestId,
+          correlationId,
         });
       } catch {
         // Audit failures must never disrupt the request lifecycle.
@@ -220,6 +279,13 @@ export function createProtectedEndpointAuditMiddleware(
     res.once('finish', () => writeAuditEntry(false));
     res.once('close', () => {
       if (!res.writableFinished) writeAuditEntry(true);
+    });
+
+    // Ensure the flag is cleared if the response is closed without finishing
+    // (e.g. client abort) so that a subsequent request on a reused Response
+    // object (unlikely in Express, but defensive) is not silently skipped.
+    res.on('close', () => {
+      resWithFlag[AUDIT_FINISH_FLAG] = false;
     });
 
     next();

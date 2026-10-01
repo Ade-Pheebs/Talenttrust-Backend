@@ -173,7 +173,7 @@ export class MilestoneDivergenceScanner {
         : {}),
     };
 
-    log.info('Milestone divergence scan completed', summary);
+    log.info('Milestone divergence scan completed', summary as unknown as Record<string, unknown>);
     return summary;
   }
 

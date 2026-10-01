@@ -79,6 +79,21 @@ pub fn place_bets(
         return Err(Error::EmptyBatch);
     }
 
+    // Reject batches that are too large to prevent out-of-gas errors or DoS.
+    if bets.len() > 100 {
+        return Err(Error::BatchTooLarge);
+    }
+
+    // Validate each bet in the batch.
+    for bet in bets.iter() {
+        if bet.market_id == 0 {
+            return Err(Error::InvalidMarketId);
+        }
+        if bet.amount <= 0 {
+            return Err(Error::InvalidBetAmount);
+        }
+    }
+
     // ------------------------------------------------------------------
     // Idempotency check
     // ------------------------------------------------------------------

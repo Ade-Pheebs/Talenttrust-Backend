@@ -22,32 +22,29 @@
  * ## Security properties
  * - Identity is normalized via `normalizeEmail` so case-variant or
  *   whitespace-padded variants of the same email collide on the same key.
- * - Storage keys are SHA-256-hashed before insertion so raw emails never
- *   appear in heap snapshots or process memory dumps.
+ * - Storage keys are SHA-256-hashed before insertion; raw emails are not
+ *   retained as keys. Callers and audit sinks can still hold raw identities.
  * - Lockout is **per-account**, deliberately independent of IP — this is
  *   the property that defeats distributed credential stuffing. A change
  *   of IP after triggering lockout does NOT release the lockout; only
- *   time decay or a successful login does.
+ *   deadline expiry or a trusted successful-login reset does.
  * - Failures during an active lockout are a no-op. They do not extend the
  *   lockout (whose deadline is fixed at trigger time) and they do not
  *   re-emit the trigger audit. This bounds how many audit entries one
  *   attacker can generate per streak.
- * - The emission of an audit entry on every lockout TRIGGER and every
- *   lockout RELEASE is enforced by the tracker. The error response shape
+ * - Trigger and successful-login release audits are best effort; sweep
+ *   does not emit release events. The error response shape
  *   (code + message + status) is kept identical to a non-locked invalid
  *   credential so the response cannot be used to probe lockout state.
  * - Successful logins clear the record. A login that follows a previously
  *   locked streak emits `AUTH_LOCKOUT_RELEASED`; a clean login with no
  *   prior lockout emits nothing extra (the standard `AUTH_LOGIN` event is
  *   logged by the auth middleware).
- * - `assess()` and `recordFailure()` are pure synchronous state mutations
- *   over a Map — JS single-threading guarantees no torn updates even
- *   under the bursty in-flight pattern a credential-stuffing campaign
- *   produces.
- * - A periodic sweep GC (`sweep`) purges records whose lockout has
- *   expired and which have not seen activity within the decay window, so
- *   an attacker spraying random emails cannot OOM the process (issue
- *   surfaced in design review — see git blame P0 finding).
+ * - Assessment and failure transitions are synchronous within one process.
+ *   Routes must reassess after asynchronous credential checks. The Map is
+ *   neither durable nor shared across workers.
+ * - A periodic sweep (`sweep`) purges expired locks and decayed unlocked
+ *   streaks. It does not impose a hard capacity limit.
  *
  * ## Configuration
  * All knobs are env-driven via `loadAccountLockoutConfig()`, which
@@ -65,8 +62,8 @@ import { normalizeEmail } from '../repositories/userRepository';
  * @property enabled - Master switch. When false, all tracker methods are
  *   no-ops so the route can degrade gracefully in emergencies.
  * @property maxFailures - Consecutive-failure threshold that locks the
- *   account. Strict equality on the post-increment count emits exactly
- *   one trigger audit per streak.
+ *   account. Active locks reject further failures, so one trigger audit
+ *   is emitted per streak even after a threshold reduction.
  * @property decayWindowMs - Sliding window since the LAST recorded
  *   failure. If exceeded, the failure counter resets to zero. Decay is
  *   evaluated both at `assess`/`recordFailure` time and by the GC
@@ -94,7 +91,7 @@ export interface AccountLockoutConfig {
 }
 
 /** Defaults — overridden per deployment via env vars (see {@link loadAccountLockoutConfig}). */
-export const DEFAULT_ACCOUNT_LOCKOUT_CONFIG: AccountLockoutConfig = {
+export const DEFAULT_ACCOUNT_LOCKOUT_CONFIG: Readonly<AccountLockoutConfig> = Object.freeze({
   enabled: true,
   maxFailures: 5,
   decayWindowMs: 15 * 60 * 1000,
@@ -102,7 +99,7 @@ export const DEFAULT_ACCOUNT_LOCKOUT_CONFIG: AccountLockoutConfig = {
   baseDelayMs: 250,
   delayMultiplier: 2,
   maxDelayMs: 5000,
-};
+});
 
 /** Internal state per normalized identity. */
 interface FailureRecord {
@@ -190,8 +187,18 @@ export interface AccountLockoutTrackerOptions {
  * login attempt can be used to brute-force a password.
  */
 export class AccountLockoutTracker {
-  /** Public so tests can mutate `config` for speed-bounded scenarios. */
-  public config: AccountLockoutConfig;
+  private currentConfig!: Readonly<AccountLockoutConfig>;
+
+  /** Immutable policy snapshot. Replace the whole policy to reconfigure. */
+  get config(): Readonly<AccountLockoutConfig> {
+    return this.currentConfig;
+  }
+
+  set config(value: AccountLockoutConfig) {
+    // Validate/copy before publication: invalid updates leave policy and
+    // records intact; caller-owned objects cannot change thresholds later.
+    this.currentConfig = validatedConfig(value);
+  }
 
   private readonly records = new Map<string, FailureRecord>();
   private readonly audit: Pick<AuditService, 'log'>;
@@ -268,8 +275,8 @@ export class AccountLockoutTracker {
       // Lockout has elapsed — fresh streak, no live failures.
       liveFailures = 0;
     } else if (
+      !isLocked &&
       record.failed > 0 &&
-      record.lastFailureAt > 0 &&
       now - record.lastFailureAt > this.config.decayWindowMs
     ) {
       liveFailures = 0;
@@ -314,7 +321,7 @@ export class AccountLockoutTracker {
     }
 
     // Decay first so the increment always reflects the live counter.
-    this.refreshInPlace(record);
+    this.refreshInPlace(record, now);
 
     const wasLocked = record.lockedUntil > 0 && now < record.lockedUntil;
     if (wasLocked) {
@@ -329,26 +336,28 @@ export class AccountLockoutTracker {
 
     record.failed += 1;
     record.lastFailureAt = now;
-    if (record.firstFailureAt === 0) {
+    if (record.failed === 1) {
       record.firstFailureAt = now;
     }
 
-    // Strict-equality guard ensures the trigger audit fires exactly once
-    // per streak even under interleaved requests (issue surfaced in
-    // design review — see P1 finding).
+    // Active locks returned above, so >= also handles a policy update that
+    // lowers the threshold below an existing unlocked failure count.
     let triggeredLockout = false;
-    if (record.failed === this.config.maxFailures) {
+    if (record.failed >= this.config.maxFailures) {
       record.lockedUntil = now + this.config.lockoutDurationMs;
       triggeredLockout = true;
-      this.emitTriggerAudit(rawEmail, record, ctx);
     }
 
-    return {
+    const result = {
       isNowLocked: record.lockedUntil > 0 && now < record.lockedUntil,
       failures: record.failed,
       waitMs: triggeredLockout ? this.config.maxDelayMs : this.computeDelay(record.failed),
       triggeredLockout,
     };
+    // Capture the transition before calling the external audit sink; a
+    // reentrant sink must not change this operation's returned snapshot.
+    if (triggeredLockout) this.emitTriggerAudit(rawEmail, record, ctx);
+    return result;
   }
 
   /**
@@ -399,7 +408,11 @@ export class AccountLockoutTracker {
    * curve independently of the rest of the state machine.
    */
   computeDelay(failures: number): number {
-    if (failures <= 0) return 0;
+    if (
+      !Number.isSafeInteger(failures) ||
+      failures <= 0 ||
+      this.config.baseDelayMs === 0
+    ) return 0;
     const exponential =
       this.config.baseDelayMs * Math.pow(this.config.delayMultiplier, failures - 1);
     return Math.min(exponential, this.config.maxDelayMs);
@@ -423,7 +436,10 @@ export class AccountLockoutTracker {
     let removed = 0;
     for (const [key, record] of this.records) {
       const lockoutExpired = record.lockedUntil > 0 && now >= record.lockedUntil;
-      const decayed = record.failed > 0 && record.lastFailureAt < decayCutoff;
+      const decayed =
+        record.lockedUntil === 0 &&
+        record.failed > 0 &&
+        record.lastFailureAt < decayCutoff;
       if (lockoutExpired || decayed) {
         this.records.delete(key);
         removed += 1;
@@ -479,8 +495,11 @@ export class AccountLockoutTracker {
    * Important: clears `lockedUntil = 0` so a stale record cannot re-fire
    * a release audit on a future login (see P1 in design review).
    */
-  private refreshInPlace(record: FailureRecord): void {
-    const now = this.now();
+  private refreshInPlace(record: FailureRecord, now: number): void {
+    // An active fixed deadline always wins over sliding counter decay.
+    // Rejected attempts cannot shorten or extend it, even when the decay
+    // window is configured shorter than the lockout duration.
+    if (record.lockedUntil > 0 && now < record.lockedUntil) return;
 
     // Lockout has elapsed — full reset; record is fresh.
     if (record.lockedUntil > 0 && now >= record.lockedUntil) {
@@ -494,7 +513,6 @@ export class AccountLockoutTracker {
     // Decay window elapsed since last failure — counter resets.
     if (
       record.failed > 0 &&
-      record.lastFailureAt > 0 &&
       now - record.lastFailureAt > this.config.decayWindowMs
     ) {
       record.failed = 0;
@@ -531,14 +549,13 @@ export class AccountLockoutTracker {
         ...(ctx.ipAddress !== undefined && { ipAddress: ctx.ipAddress }),
         ...(ctx.correlationId !== undefined && { correlationId: ctx.correlationId }),
       });
-    } catch (err) {
+    } catch {
       // Audit failures must not break the auth flow. Surface for ops
       // visibility on stderr so they can correlate the auth response
       // with the missing audit entry during incident review.
       // eslint-disable-next-line no-console
       console.error(
         '[accountLockout] failed to write AUTH_LOCKOUT_TRIGGERED audit entry',
-        err,
       );
     }
   }
@@ -565,11 +582,10 @@ export class AccountLockoutTracker {
         ...(ctx.ipAddress !== undefined && { ipAddress: ctx.ipAddress }),
         ...(ctx.correlationId !== undefined && { correlationId: ctx.correlationId }),
       });
-    } catch (err) {
+    } catch {
       // eslint-disable-next-line no-console
       console.error(
         '[accountLockout] failed to write AUTH_LOCKOUT_RELEASED audit entry',
-        err,
       );
     }
   }
@@ -589,22 +605,67 @@ function defaultSleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+const MAX_TIMER_MS = 2_147_483_647;
+
+const NUMERIC_CONFIG_BOUNDS = {
+  maxFailures: [1, Number.MAX_SAFE_INTEGER],
+  decayWindowMs: [1, MAX_TIMER_MS],
+  lockoutDurationMs: [1, MAX_TIMER_MS],
+  baseDelayMs: [0, MAX_TIMER_MS],
+  delayMultiplier: [1, 16],
+  maxDelayMs: [0, MAX_TIMER_MS],
+} as const;
+
+function validatedConfig(
+  config: AccountLockoutConfig,
+): Readonly<AccountLockoutConfig> {
+  const snapshot = { ...config };
+  if (!config || typeof snapshot.enabled !== 'boolean') {
+    throw new RangeError('Invalid account lockout configuration: enabled');
+  }
+  const fields = Object.keys(NUMERIC_CONFIG_BOUNDS) as Array<
+    keyof typeof NUMERIC_CONFIG_BOUNDS
+  >;
+  for (const field of fields) {
+    const [min, max] = NUMERIC_CONFIG_BOUNDS[field];
+    const value = snapshot[field];
+    if (!Number.isSafeInteger(value) || value < min || value > max) {
+      throw new RangeError(`Invalid account lockout configuration: ${field}`);
+    }
+  }
+  return Object.freeze(snapshot);
+}
+
+function warnInvalid(field: string, fallback: number | boolean): void {
+  // Setting names are fixed by the parser; never echo untrusted values.
+  console.warn(`[accountLockout] Invalid ${field}; using fallback ${fallback}`);
+}
+
 function toBool(value: string | undefined, fallback: boolean): boolean {
   if (value === undefined) return fallback;
-  const lower = value.toLowerCase();
+  const lower = value.trim().toLowerCase();
   if (lower === 'true' || lower === '1' || lower === 'yes') return true;
   if (lower === 'false' || lower === '0' || lower === 'no') return false;
+  warnInvalid('AUTH_LOCKOUT_ENABLED', fallback);
   return fallback;
 }
 
-function toCount(value: string | undefined, fallback: number): number {
+function toCount(
+  value: string | undefined,
+  fallback: number,
+  field: string,
+  min: number,
+  max: number,
+): number {
   if (value === undefined) return fallback;
-  const parsed = Math.floor(Number(value));
-  if (!Number.isFinite(parsed) || parsed < 0) {
-    // eslint-disable-next-line no-console
-    console.warn(
-      `[accountLockout] Invalid env value "${value}", using fallback ${fallback}`,
-    );
+  const parsed = Number(value.trim());
+  if (
+    !/^\d+$/.test(value.trim()) ||
+    !Number.isSafeInteger(parsed) ||
+    parsed < min ||
+    parsed > max
+  ) {
+    warnInvalid(field, fallback);
     return fallback;
   }
   return parsed;
@@ -619,40 +680,43 @@ function toCount(value: string | undefined, fallback: number): number {
 export function loadAccountLockoutConfig(
   env: NodeJS.ProcessEnv = process.env,
 ): AccountLockoutConfig {
-  const maxFailures = Math.max(
-    1,
-    toCount(env.AUTH_LOCKOUT_MAX_FAILURES, DEFAULT_ACCOUNT_LOCKOUT_CONFIG.maxFailures),
-  );
-  const delayMultiplier = toCount(
-    env.AUTH_LOCKOUT_DELAY_MULTIPLIER,
-    DEFAULT_ACCOUNT_LOCKOUT_CONFIG.delayMultiplier,
-  );
-  // Cap delayMultiplier at 16 — anything larger would let `computeDelay`
-  // overflow to Infinity at modest failure counts.
-  const safeMultiplier =
-    delayMultiplier >= 1 && delayMultiplier <= 16
-      ? delayMultiplier
-      : DEFAULT_ACCOUNT_LOCKOUT_CONFIG.delayMultiplier;
-
   return {
     enabled: toBool(env.AUTH_LOCKOUT_ENABLED, true),
-    maxFailures,
-    decayWindowMs: toMs(
+    maxFailures: toCount(
+      env.AUTH_LOCKOUT_MAX_FAILURES,
+      DEFAULT_ACCOUNT_LOCKOUT_CONFIG.maxFailures,
+      'AUTH_LOCKOUT_MAX_FAILURES',
+      ...NUMERIC_CONFIG_BOUNDS.maxFailures,
+    ),
+    decayWindowMs: toCount(
       env.AUTH_LOCKOUT_DECAY_WINDOW_MS,
       DEFAULT_ACCOUNT_LOCKOUT_CONFIG.decayWindowMs,
+      'AUTH_LOCKOUT_DECAY_WINDOW_MS',
+      ...NUMERIC_CONFIG_BOUNDS.decayWindowMs,
     ),
-    lockoutDurationMs: toMs(
+    lockoutDurationMs: toCount(
       env.AUTH_LOCKOUT_LOCKOUT_DURATION_MS,
       DEFAULT_ACCOUNT_LOCKOUT_CONFIG.lockoutDurationMs,
+      'AUTH_LOCKOUT_LOCKOUT_DURATION_MS',
+      ...NUMERIC_CONFIG_BOUNDS.lockoutDurationMs,
     ),
-    baseDelayMs: toMs(
+    baseDelayMs: toCount(
       env.AUTH_LOCKOUT_BASE_DELAY_MS,
       DEFAULT_ACCOUNT_LOCKOUT_CONFIG.baseDelayMs,
+      'AUTH_LOCKOUT_BASE_DELAY_MS',
+      ...NUMERIC_CONFIG_BOUNDS.baseDelayMs,
     ),
-    delayMultiplier: safeMultiplier,
-    maxDelayMs: toMs(
+    delayMultiplier: toCount(
+      env.AUTH_LOCKOUT_DELAY_MULTIPLIER,
+      DEFAULT_ACCOUNT_LOCKOUT_CONFIG.delayMultiplier,
+      'AUTH_LOCKOUT_DELAY_MULTIPLIER',
+      ...NUMERIC_CONFIG_BOUNDS.delayMultiplier,
+    ),
+    maxDelayMs: toCount(
       env.AUTH_LOCKOUT_MAX_DELAY_MS,
       DEFAULT_ACCOUNT_LOCKOUT_CONFIG.maxDelayMs,
+      'AUTH_LOCKOUT_MAX_DELAY_MS',
+      ...NUMERIC_CONFIG_BOUNDS.maxDelayMs,
     ),
   };
 }
@@ -666,25 +730,10 @@ export function loadAccountLockoutConfig(
  * audits can be captured per case.
  *
  * (Note: tests that need to override `config` or reset state can
- * mutate `accountLockout.config` / call `accountLockout.reset()` —
+ * replace `accountLockout.config` / call `accountLockout.reset()` —
  * both are exposed for test-time use, but production code should not
  * touch them.)
  */
 export const accountLockout: AccountLockoutTracker = new AccountLockoutTracker(
   loadAccountLockoutConfig(),
 );
-
-// Internal helper for `loadAccountLockoutConfig`. Mirrors `toCount` so
-// the ms-typed env vars parse consistently.
-function toMs(value: string | undefined, fallback: number): number {
-  if (value === undefined) return fallback;
-  const parsed = Math.floor(Number(value));
-  if (!Number.isFinite(parsed) || parsed < 0) {
-    // eslint-disable-next-line no-console
-    console.warn(
-      `[accountLockout] Invalid env value "${value}", using fallback ${fallback}`,
-    );
-    return fallback;
-  }
-  return parsed;
-}

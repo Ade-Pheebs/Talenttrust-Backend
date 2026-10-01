@@ -17,9 +17,12 @@ mod bets;
 mod errors;
 mod storage;
 
+#[cfg(test)]
+mod batch_operations_tests;
+
 pub use bets::Bet;
 pub use errors::Error;
-pub use storage::{DataKey, IDEM_KEY_TTL_LEDGERS};
+pub use storage::{DataKey, IDEM_KEY_TTL_LEDGERS, MAX_BATCH_SIZE};
 
 use soroban_sdk::{contract, contractimpl, Address, BytesN, Env, Vec};
 

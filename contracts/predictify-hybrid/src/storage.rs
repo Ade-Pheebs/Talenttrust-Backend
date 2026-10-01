@@ -9,6 +9,24 @@ use soroban_sdk::{contracttype, Address, BytesN};
 /// If you need a longer window, increase this constant and redeploy.
 pub const IDEM_KEY_TTL_LEDGERS: u32 = 17_280; // ~24 h at 5 s/ledger
 
+/// Maximum number of [`Bet`] entries allowed in a single `place_bets` call.
+///
+/// This bound protects the contract against accidental or adversarial
+/// resource exhaustion.  A batch that exceeds this limit is rejected with
+/// [`crate::errors::Error::BatchTooLarge`] before any state mutation, so
+/// the call is atomic: either the full (valid) batch is applied or nothing
+/// is written.
+///
+/// Callers that need to submit more than `MAX_BATCH_SIZE` bets must split
+/// the work into multiple invocations, each with a distinct idempotency key.
+///
+/// The value 50 was chosen to stay well within Soroban's per-invocation
+/// CPU and memory limits while still accommodating realistic batch sizes.
+/// Increase with care and validate against the current Soroban host limits.
+///
+/// [`Bet`]: crate::bets::Bet
+pub const MAX_BATCH_SIZE: u32 = 50;
+
 /// Storage keys used by the contract.
 ///
 /// `PlaceBetsIdem(user, key)` stores a sentinel `true` value once a

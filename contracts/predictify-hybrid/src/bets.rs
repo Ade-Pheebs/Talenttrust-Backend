@@ -1,8 +1,8 @@
-use soroban_sdk::{Address, BytesN, Env, Vec};
+use soroban_sdk::{Address, BytesN, Env, Symbol, Vec};
 
 use crate::{
     errors::Error,
-    storage::{DataKey, IDEM_KEY_TTL_LEDGERS},
+    storage::{DataKey, IDEM_KEY_TTL_LEDGERS, MAX_BATCH_SIZE},
 };
 
 /// A single bet submitted inside a batch.
@@ -12,8 +12,14 @@ use crate::{
 #[derive(Clone)]
 pub struct Bet {
     /// Identifier of the prediction market being bet on.
+    ///
+    /// Must be non-zero.  `market_id = 0` is the reserved "null" sentinel
+    /// and is always rejected with [`Error::MarketIdInvalid`].
     pub market_id: u64,
     /// Amount of the base asset staked, in stroops.
+    ///
+    /// Must be strictly positive (> 0).  Zero or negative values are
+    /// rejected with [`Error::AmountMustBePositive`].
     pub amount: i128,
 }
 
@@ -24,7 +30,7 @@ pub struct Bet {
 /// * `env`             – Soroban host environment.
 /// * `caller`          – Address of the submitting account; `require_auth` is
 ///                       called to authenticate the caller.
-/// * `bets`            – Non-empty vector of [`Bet`] entries.
+/// * `bets`            – Non-empty, bounded vector of [`Bet`] entries.
 /// * `idempotency_key` – 32-byte caller-generated token that makes this
 ///                       submission unique.  The key is bound to `caller` so
 ///                       the same token may be used by different callers
@@ -32,9 +38,21 @@ pub struct Bet {
 ///
 /// # Errors
 ///
-/// * [`Error::EmptyBatch`]                   – `bets` is empty.
-/// * [`Error::IdempotentBatchAlreadyApplied`] – the `(caller, idempotency_key)`
-///                                              pair has already been consumed.
+/// | Error                            | Condition                                    |
+/// |----------------------------------|----------------------------------------------|
+/// | [`Error::EmptyBatch`]            | `bets` is empty                              |
+/// | [`Error::BatchTooLarge`]         | `bets.len() > MAX_BATCH_SIZE`                |
+/// | [`Error::AmountMustBePositive`]  | any bet has `amount ≤ 0`                     |
+/// | [`Error::MarketIdInvalid`]       | any bet has `market_id == 0`                 |
+/// | [`Error::IdempotentBatchAlreadyApplied`] | `(caller, key)` pair already consumed |
+///
+/// # Validation order
+///
+/// Validation is intentionally ordered so the cheapest structural checks
+/// (`EmptyBatch`, `BatchTooLarge`) run before the per-element scan
+/// (`AmountMustBePositive`, `MarketIdInvalid`) and the storage read
+/// (`IdempotentBatchAlreadyApplied`).  No state is mutated until all
+/// validations pass, keeping the function atomic.
 ///
 /// # Idempotency semantics
 ///
@@ -60,13 +78,37 @@ pub fn place_bets(
     // Authenticate the caller.
     caller.require_auth();
 
-    // Reject empty batches early.
+    // ------------------------------------------------------------------
+    // Structural validation — cheapest checks first, no storage reads.
+    // ------------------------------------------------------------------
+
+    // Reject empty batches.
     if bets.is_empty() {
         return Err(Error::EmptyBatch);
     }
 
+    // Reject over-sized batches before iterating over the entries.
+    if bets.len() > MAX_BATCH_SIZE {
+        return Err(Error::BatchTooLarge);
+    }
+
     // ------------------------------------------------------------------
-    // Idempotency check
+    // Per-element validation — O(n) scan; still before any storage write.
+    // ------------------------------------------------------------------
+    for bet in bets.iter() {
+        // A non-positive amount is never a valid stake.
+        if bet.amount <= 0 {
+            return Err(Error::AmountMustBePositive);
+        }
+
+        // market_id == 0 is the reserved null sentinel; always invalid.
+        if bet.market_id == 0 {
+            return Err(Error::MarketIdInvalid);
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Idempotency check — one storage read, after all validation passes.
     // ------------------------------------------------------------------
     // A zero key opts out of deduplication (deprecated backward compat).
     let zero_key: BytesN<32> = BytesN::from_array(env, &[0u8; 32]);
@@ -96,6 +138,3 @@ pub fn place_bets(
 
     Ok(())
 }
-
-// Symbol is used above; import it here to keep the use-site clean.
-use soroban_sdk::Symbol;

@@ -49,6 +49,7 @@ import { createLogger } from '../logger';
 import { DownloadTokenService, DownloadTokenError } from './downloadTokenService';
 import { SqliteDownloadTokenStore } from './downloadTokenStore';
 import { getDb } from '../db/database';
+import { z as zod } from 'zod';
 
 const routerLogger = createLogger({ module: 'audit.router' });
 
@@ -113,19 +114,57 @@ function buildValidationErrorResponse(requestId: string, correlationId: string |
 }
 
 /**
- * Errors surfaced by `AuditService` / the repository that represent *client*
- * input problems, as opposed to infrastructure failures.
+ * Validation boundaries for the `:token` path parameter on
+ * `GET /export/download/:token`.
  *
- * This is deliberately an explicit allow-list of message prefixes instead of
- * a blanket `catch -> 400`: reporting a database outage as `400` tells the
- * caller to fix a request they cannot fix, and hides the outage from
- * observability. Anything not matching here is treated as a server error.
+ * The download token is a compact JWS (three base64url segments separated by
+ * `.`). We validate the *shape* here — before touching the token service or
+ * the database — so that malformed, oversized, or duplicate submissions are
+ * rejected deterministically with a structured 400 and never reach the
+ * cryptographic verification path. This keeps the boundary explicit and
+ * prevents unbounded input from being parsed.
  *
- * The recognised prefixes mirror the validators in `audit/service.ts`
- * (`Invalid action/severity/limit/offset/from/to timestamp/cursor format`),
- * the write path's missing-field guard, and the repository's cursor/filter
- * drift guard. They are asserted by `router.contract.test.ts` so the two
- * cannot silently drift apart.
+ * Invariants enforced:
+ *   - non-empty after trimming (rejects `""` and whitespace-only);
+ *   - at most `MAX_TOKEN_LENGTH` characters (rejects oversized payloads);
+ *   - exactly three dot-separated segments (JWS compact serialization);
+ *   - each segment is non-empty and base64url-safe (`[A-Za-z0-9_-]+`).
+ *
+ * These are *structural* checks only. Signature, expiry, tenant, and
+ * one-time-use are still enforced by `DownloadTokenService.consume`.
+ */
+export const MAX_TOKEN_LENGTH = 4096;
+
+const downloadTokenParamSchema = zod
+  .string()
+  .trim()
+  .min(1, { message: 'Download token is required' })
+  .max(MAX_TOKEN_LENGTH, { message: 'Download token is malformed' })
+  .refine(
+    (value) => {
+      const segments = value.split('.');
+      if (segments.length !== 3) return false;
+      return segments.every((segment) => /^[A-Za-z0-9_-]+$/.test(segment));
+    },
+    { message: 'Download token is malformed' },
+  );
+
+/**
+ * Parses the raw `:token` path parameter against the download token boundary.
+ * Returns the normalized token on success, or `undefined` on failure so the
+ * caller can emit a single structured 400 response. Never throws.
+ */
+export function parseDownloadTokenParam(raw: unknown): string | undefined {
+  const result = downloadTokenParamSchema.safeParse(raw);
+  return result.success ? result.data : undefined;
+}
+
+/**
+ * Parses and validates query filters against the audit query schema and, on
+ * failure, writes the shared structured 400 validation response directly
+ * instead of throwing. Used by every handler below that accepts query
+ * filters, so the "parse, then reject" preamble lives in one place instead
+ * of being repeated per-route.
  */
 function isClientInputError(error: unknown): boolean {
   const message = error instanceof Error ? error.message : String(error);
@@ -441,12 +480,12 @@ export function createAuditRouter(options: AuditRouterOptions = {}): Router {
       let tokenConsumed = false;
 
       try {
-        const rawToken = req.params['token'];
-        if (!rawToken) {
+        const rawToken = parseDownloadTokenParam(req.params['token']);
+        if (rawToken === undefined) {
           res.status(400).json({
             error: {
-              code: 'token_missing',
-              message: 'Download token is required',
+              code: 'token_invalid',
+              message: 'Download token is malformed',
               requestId,
               ...(correlationId !== undefined && { correlationId }),
             },
@@ -522,6 +561,7 @@ export function createAuditRouter(options: AuditRouterOptions = {}): Router {
             tenant_mismatch: 403,
             token_reused: 410,
             token_revoked: 410,
+            token_invalid: 401,
           };
           const status = statusMap[error.code] ?? 401;
 

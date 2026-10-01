@@ -33,7 +33,16 @@ export interface AuditServiceOptions {
   idempotency?: IdempotencyStoreOptions;
 }
 
-export const VALID_ACTIONS = new Set<AuditAction>(AUDIT_ACTIONS);
+export const VALID_ACTIONS = new Set<AuditAction>(['CONTRACT_CREATED', 'CONTRACT_UPDATED', 'CONTRACT_CANCELLED', 'CONTRACT_COMPLETED',
+  'PAYMENT_INITIATED', 'PAYMENT_RELEASED', 'PAYMENT_DISPUTED',
+  'REPUTATION_UPDATED',
+  'REPUTATION_CORRECTED',
+  'USER_CREATED', 'USER_UPDATED', 'USER_DELETED',
+  'AUTH_LOGIN', 'AUTH_LOGOUT', 'AUTH_FAILED',
+  'AUTH_LOCKOUT_TRIGGERED', 'AUTH_LOCKOUT_RELEASED',
+  'ADMIN_ACTION',
+  'ENDPOINT_ACCESS', 'ENDPOINT_MUTATION',
+]);
 
 export const VALID_SEVERITIES = new Set<AuditSeverity>(AUDIT_SEVERITIES);
 
@@ -475,29 +484,7 @@ export class AuditService {
     metadata: Record<string, unknown> = {},
     context: { ipAddress?: string; correlationId?: string } = {},
   ): AuditEntry {
-    return this.logSync({
-      action,
-      severity: 'INFO',
-      actor,
-      resource: 'contract',
-      resourceId: contractId,
-      metadata,
-      ...context,
-    });
-  }
-
-  /**
-   * Async variant of {@link logContractEvent} that serialises concurrent
-   * writes for the same contractId.
-   */
-  async logContractEventAsync(
-    action: Extract<AuditAction, `CONTRACT_${string}`>,
-    actor: string,
-    contractId: string,
-    metadata: Record<string, unknown> = {},
-    context: { ipAddress?: string; correlationId?: string } = {},
-  ): Promise<AuditEntry> {
-    return this.logAsync({
+    return this.log( {
       action,
       severity: 'INFO',
       actor,
@@ -574,29 +561,7 @@ export class AuditService {
     metadata: Record<string, unknown> = {},
     context: { ipAddress?: string; correlationId?: string } = {},
   ): AuditEntry {
-    return this.logSync({
-      action,
-      severity: 'CRITICAL',
-      actor,
-      resource: 'payment',
-      resourceId: paymentId,
-      metadata,
-      ...context,
-    });
-  }
-
-  /**
-   * Async variant of {@link logPaymentEvent} that serialises concurrent
-   * writes for the same paymentId.
-   */
-  async logPaymentEventAsync(
-    action: Extract<AuditAction, `PAYMENT_${string}`>,
-    actor: string,
-    paymentId: string,
-    metadata: Record<string, unknown> = {},
-    context: { ipAddress?: string; correlationId?: string } = {},
-  ): Promise<AuditEntry> {
-    return this.logAsync({
+    return this.log( {
       action,
       severity: 'CRITICAL',
       actor,
@@ -630,143 +595,31 @@ export class AuditService {
   }
 
   /**
-   * Async variant of {@link logAuthEvent} that serialises concurrent writes
-   * for the same actor.
+   * Queries the underlying repository with the given filters.
    */
-  async logAuthEventAsync(
-    action: Extract<AuditAction, `AUTH_${string}`>,
-    actor: string,
-    metadata: Record<string, unknown> = {},
-    context: { ipAddress?: string; correlationId?: string } = {},
-  ): Promise<AuditEntry> {
-    const severity: AuditSeverity = action === 'AUTH_FAILED' ? 'WARNING' : 'INFO';
-    return this.logAsync({
-      action,
-      severity,
-      actor,
-      resource: 'auth',
-      resourceId: actor,
-      metadata,
-      ...context,
-    });
-  }
-
-  /**
-   * Retrieves a single audit entry by ID.
-   */
-  logUserEvent(
-    action: Extract<AuditAction, `USER_${string}`>,
-    actor: string,
-    targetUserId: string,
-    metadata: Record<string, unknown> = {},
-    context: { ipAddress?: string; correlationId?: string } = {},
-  ): AuditEntry {
-    const severity: AuditSeverity = action === 'USER_DELETED' ? 'WARNING' : 'INFO';
-    return this.logSync({
-      action,
-      severity,
-      actor,
-      resource: 'user',
-      resourceId: targetUserId,
-      metadata,
-      ...context,
-    });
-  }
-
-  /**
-   * Async variant of {@link logUserEvent} that serialises concurrent writes
-   * for the same targetUserId.
-   */
-  async logUserEventAsync(
-    action: Extract<AuditAction, `USER_${string}`>,
-    actor: string,
-    targetUserId: string,
-    metadata: Record<string, unknown> = {},
-    context: { ipAddress?: string; correlationId?: string } = {},
-  ): Promise<AuditEntry> {
-    const severity: AuditSeverity = action === 'USER_DELETED' ? 'WARNING' : 'INFO';
-    return this.logAsync({
-      action,
-      severity,
-      actor,
-      resource: 'user',
-      resourceId: targetUserId,
-      metadata,
-      ...context,
-    });
-  }
-
-  /**
-   * Returns all audit entries.
-   */
-  logDisputeEvent(
-    action: Extract<AuditAction, `DISPUTE_${string}`>,
-    actor: string,
-    disputeId: string,
-    metadata: Record<string, unknown> = {},
-    context: { ipAddress?: string; correlationId?: string } = {},
-  ): AuditEntry {
-    const severity: AuditSeverity = action === 'DISPUTE_UPDATED' ? 'WARNING' : 'INFO';
-    return this.logSync({
-      action,
-      severity,
-      actor,
-      resource: 'dispute',
-      resourceId: disputeId,
-      metadata,
-      ...context,
-    });
-  }
-
-  /**
-   * Async variant of {@link logDisputeEvent} that serialises concurrent
-   * writes for the same disputeId.
-   */
-  async logDisputeEventAsync(
-    action: Extract<AuditAction, `DISPUTE_${string}`>,
-    actor: string,
-    disputeId: string,
-    metadata: Record<string, unknown> = {},
-    context: { ipAddress?: string; correlationId?: string } = {},
-  ): Promise<AuditEntry> {
-    const severity: AuditSeverity = action === 'DISPUTE_UPDATED' ? 'WARNING' : 'INFO';
-    return this.logAsync({
-      action,
-      severity,
-      actor,
-      resource: 'dispute',
-      resourceId: disputeId,
-      metadata,
-      ...context,
-    });
-  }
-
-  /**
-   * Queries the audit log with optional filters.
-   */
-  query(query: AuditQuery = {}): AuditEntry[] {
+  query(query: AuditQuery): AuditEntry[] {
     return this.repository.query(query);
   }
 
   /**
-   * Queries the audit log with cursor-based pagination.
-   */
-  queryWithCursor(query: AuditQuery = {}): AuditQueryResult {
-    return this.repository.queryWithCursor(query);
-  }
-
-  /**
-   * Verifies the integrity of the audit hash chain.
+   * Queries with cursor-based pagination.
    */
   queryWithCursor(query: AuditQuery): AuditQueryResult {
     return this.repository.queryWithCursor(query);
   }
 
   /**
-   * Returns the number of audit entries.
+   * Returns an integrity report for the audit log.
    */
-  count(): number {
-    return this.repository.count();
+  verifyIntegrity(): IntegrityReport {
+    return this.repository.verifyIntegrity();
+  }
+
+  /**
+   * Returns the cache instance, if configured.
+   */
+  getCache(): AuditCache | null {
+    return this.cache;
   }
 }
 

@@ -73,6 +73,8 @@ function prepareInput(input: RequestAuditInput): RequestAuditInput {
   }
 }
 
+import { auditCache } from './auditCache';
+
 /** Helper attached to res.locals for route-level audit logging. */
 export interface RequestAuditHelper {
   /**
@@ -104,6 +106,48 @@ declare global {
       audit: RequestAuditHelper;
     }
   }
+}
+
+/**
+ * Maximum length of a correlation ID accepted from the incoming request.
+ * Longer values are truncated to avoid unbounded memory/storage use.
+ */
+const MAX_CORRELATION_ID_LENGTH = 256;
+
+/**
+ * Allowed characters for a correlation ID. Restricting this prevents
+ * log-injection and header-smuggling vectors from being persisted into
+ * audit metadata.
+ */
+const CORRELATION_ID_PATTERN = /^[A-Za-z0-9._:/]+$/;
+
+/**
+ * Normalises a correlation ID header value.
+ *
+ * Headers may arrive as a string, an array of strings, or undefined.
+ * Only the first value is considered; invalid or overly long values are
+ * dropped (returning `undefined`) rather than being persisted.
+ */
+function normaliseCorrelationId(raw: unknown): string | undefined {
+  if (raw === undefined || raw === null) return undefined;
+  const value = Array.isArray(raw) ? raw[0] : raw;
+  if (typeof value !== 'string') return undefined;
+  const trimmed = value.trim();
+  if (trimmed.length === 0 || trimmed.length > MAX_CORRELATION_ID_LENGTH) return undefined;
+  if (!CORRELATION_ID_PATTERN.test(trimmed)) return undefined;
+  return trimmed;
+}
+
+/**
+ * Extracts the client IP address from the request, falling back to the
+ * raw socket address when `req.ip` is not available. Returns `undefined`
+ * when no valid string address can be derived.
+ */
+function extractIpAddress(req: Request): string | undefined {
+  const candidate = req.ip ?? req.socket?.remoteAddress;
+  if (typeof candidate !== 'string') return undefined;
+  const trimmed = candidate.trim();
+  return trimmed.length > 0 ? trimmed : undefined;
 }
 
 /**
@@ -144,8 +188,13 @@ export function auditMiddleware(req: Request, res: Response, next: NextFunction)
     return;
   }
 
-  const ipAddress = (req.ip ?? req.socket?.remoteAddress) as string | undefined;
-  const correlationId = sanitizeCorrelationId(req.headers['x-correlation-id']);
+  const ipAddress = extractIpAddress(req);
+  const correlationId = normaliseCorrelationId(req.headers['x-correlation-id']);
+
+  // Cache the normalised request context once so every log() call from this
+  // request uses the same validated ipAddress/correlationId pair, even if
+  // the underlying req object is mutated later in the request lifecycle.
+  const requestContext = Object.freeze({ ipAddress, correlationId });
 
   // Capture the request-scoped context in closure so the helper cannot be
   // affected by later mutation of `req` headers or by concurrent requests.
@@ -153,9 +202,16 @@ export function auditMiddleware(req: Request, res: Response, next: NextFunction)
   // the service's hash-chain / serialisation invariants.
   res.locals.audit = {
     log(input: Omit<CreateAuditEntryInput, 'ipAddress' | 'correlationId'>): AuditEntry {
-      return auditService.log({ ...prepareInput(input), ipAddress, correlationId });
+      return auditService.log({ ...input, ...requestContext });
     },
   } satisfies RequestAuditHelper;
+
+  // Ensure the audit cache is bounded for this request lifecycle. This is
+  // idempotent and safe to call concurrently; it only evicts expired or
+  // over-capacity entries and never throws.
+  if (typeof auditCache.prune === 'function') {
+    auditCache.prune();
+  }
 
   next();
 }

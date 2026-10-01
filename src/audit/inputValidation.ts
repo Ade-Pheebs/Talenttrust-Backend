@@ -485,6 +485,74 @@ export function computeDepth(value: unknown, seen: WeakSet<object> = new WeakSet
 // ── Body schema ───────────────────────────────────────────────────────────────
 
 /**
+ * Per-field schemas for an audit entry.
+ *
+ * Exported so that every validator in the module composes the *same* instances
+ * (see `CreateAuditEntrySchema` here and `createAuditEntryBodySchema` in
+ * `./schemas`). Before this extraction each call site re-declared its own
+ * `z.string().min(1)` equivalent, which let the two write paths drift: the
+ * route wired to `./schemas` accepted unbounded `metadata` and unchecked
+ * identifiers while this module rejected them. Sharing the instances makes that
+ * class of drift impossible to reintroduce.
+ *
+ * The bounds themselves are unchanged — see the `MAX_*` constants above.
+ */
+
+/** `action`: a member of the public write registry. */
+export const auditActionSchema = enumSchema('action', AUDIT_ACTIONS);
+
+/** `severity`: a member of the fixed severity set. */
+export const auditSeveritySchema = enumSchema('severity', AUDIT_SEVERITIES);
+
+/** `actor`: a required, bounded, single-line identifier. */
+export const auditActorSchema = identifierSchema('actor', MAX_ID_LENGTH);
+
+/** `resource`: a required, bounded, single-line identifier. */
+export const auditResourceSchema = identifierSchema('resource', MAX_ID_LENGTH);
+
+/** `resourceId`: a required, bounded, single-line identifier. */
+export const auditResourceIdSchema = identifierSchema('resourceId', MAX_ID_LENGTH);
+
+/**
+ * `metadata`: any JSON object within the structural and size bounds.
+ *
+ * Absent or `undefined` metadata becomes `{}` rather than `undefined`, so
+ * downstream code never has to distinguish "no metadata" from "empty
+ * metadata" when hashing an entry.
+ */
+export const auditMetadataSchema = z
+  .unknown()
+  .superRefine((value, ctx) => {
+    for (const issue of validateMetadata(value)) {
+      addIssue(ctx, issue.code, issue.message, issue.path);
+    }
+  })
+  .transform((value) => value as Record<string, unknown>)
+  .optional()
+  .default({});
+
+/** `ipAddress`: an optional, bounded, syntactically valid IPv4/IPv6 address. */
+export const auditIpAddressSchema = z
+  .string({ invalid_type_error: 'ipAddress must be a string' })
+  .max(MAX_IP_LENGTH, `ipAddress must be at most ${MAX_IP_LENGTH} characters`)
+  .ip({ message: 'ipAddress must be a valid IPv4 or IPv6 address' })
+  .optional();
+
+/** `correlationId`: an optional, bounded, charset-restricted trace identifier. */
+export const auditCorrelationIdSchema = z
+  .string({ invalid_type_error: 'correlationId must be a string' })
+  .min(1, 'correlationId must not be empty')
+  .max(
+    MAX_CORRELATION_ID_LENGTH,
+    `correlationId must be at most ${MAX_CORRELATION_ID_LENGTH} characters`,
+  )
+  .regex(
+    CORRELATION_ID_PATTERN,
+    'correlationId must contain only letters, digits, dot, colon, underscore or hyphen',
+  )
+  .optional();
+
+/**
  * Strict schema for the POST /api/v1/audit request body.
  *
  * `metadata` defaults to `{}` so callers with nothing to attach may omit it;
@@ -492,38 +560,14 @@ export function computeDepth(value: unknown, seen: WeakSet<object> = new WeakSet
  */
 export const CreateAuditEntrySchema = z
   .object({
-    action: enumSchema('action', AUDIT_ACTIONS),
-    severity: enumSchema('severity', AUDIT_SEVERITIES),
-    actor: identifierSchema('actor', MAX_ID_LENGTH),
-    resource: identifierSchema('resource', MAX_ID_LENGTH),
-    resourceId: identifierSchema('resourceId', MAX_ID_LENGTH),
-    metadata: z
-      .unknown()
-      .superRefine((value, ctx) => {
-        for (const issue of validateMetadata(value)) {
-          addIssue(ctx, issue.code, issue.message, issue.path);
-        }
-      })
-      .transform((value) => value as Record<string, unknown>)
-      .optional()
-      .default({}),
-    ipAddress: z
-      .string({ invalid_type_error: 'ipAddress must be a string' })
-      .max(MAX_IP_LENGTH, `ipAddress must be at most ${MAX_IP_LENGTH} characters`)
-      .ip({ message: 'ipAddress must be a valid IPv4 or IPv6 address' })
-      .optional(),
-    correlationId: z
-      .string({ invalid_type_error: 'correlationId must be a string' })
-      .min(1, 'correlationId must not be empty')
-      .max(
-        MAX_CORRELATION_ID_LENGTH,
-        `correlationId must be at most ${MAX_CORRELATION_ID_LENGTH} characters`,
-      )
-      .regex(
-        CORRELATION_ID_PATTERN,
-        'correlationId must contain only letters, digits, dot, colon, underscore or hyphen',
-      )
-      .optional(),
+    action: auditActionSchema,
+    severity: auditSeveritySchema,
+    actor: auditActorSchema,
+    resource: auditResourceSchema,
+    resourceId: auditResourceIdSchema,
+    metadata: auditMetadataSchema,
+    ipAddress: auditIpAddressSchema,
+    correlationId: auditCorrelationIdSchema,
   })
   .strict();
 

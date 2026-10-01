@@ -78,7 +78,7 @@ pub const MAX_BETS_PER_BATCH: u32 = 100;
 /// Any new field is covered by I5: it must be validated in
 /// [`validate_bets`] before the first write.
 #[soroban_sdk::contracttype]
-#[derive(Clone)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Bet {
     /// Identifier of the prediction market being bet on.
     ///
@@ -237,6 +237,15 @@ pub fn place_bets(
             IDEM_KEY_TTL_LEDGERS,
         );
     }
+    env.storage()
+        .instance()
+        .extend_ttl(IDEM_KEY_TTL_LEDGERS, IDEM_KEY_TTL_LEDGERS);
+
+    // Keep the instance (and any legacy keys in it) alive well beyond the
+    // key window so replay protection can't lapse with an idle contract.
+    env.storage()
+        .instance()
+        .extend_ttl(INSTANCE_TTL_LEDGERS / 2, INSTANCE_TTL_LEDGERS);
 
     // Keep the contract itself reachable. The instance/code entry has its
     // own TTL that no per-key receipt bump renews, so an accepted batch

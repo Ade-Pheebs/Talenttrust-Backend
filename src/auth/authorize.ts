@@ -24,7 +24,36 @@
  *     concurrent callers.
  */
 
-import { Role, Resource, Action, ACCESS_CONTROL_MATRIX } from './roles';
+import {
+  Role,
+  Resource,
+  Action,
+  ACCESS_CONTROL_MATRIX,
+  VALID_ROLES,
+  VALID_RESOURCES,
+  VALID_ACTIONS,
+} from './roles';
+
+/**
+ * The set of identifiers that are considered valid for each dimension.
+ *
+ * These are derived from the canonical definitions in `roles.ts` so the
+ * validation boundaries cannot drift away from the access control matrix.
+ */
+const VALID_ROLE_SET: ReadonlySet<string> = new Set(VALID_ROLES);
+const VALID_RESOURCE_SET: ReadonlySet<string> = new Set(VALID_RESOURCES);
+const VALID_ACTION_SET: ReadonlySet<string> = new Set(VALID_ACTIONS);
+
+/**
+ * Returns true only when the value is a non-empty string.
+ *
+ * This is the first validation boundary: runtime callers may pass null,
+ * undefined, numbers, objects, or empty strings despite the TypeScript
+ * types. The authorization function must not throw on such inputs.
+ */
+function isNonEmptyString(value: unknown): value is string {
+  return typeof value === 'string' && value.length > 0;
+}
 
 /**
  * Deep-freeze a value and recursively all of its own enumerable properties.

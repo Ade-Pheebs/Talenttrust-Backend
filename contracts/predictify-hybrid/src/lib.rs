@@ -1,38 +1,26 @@
 //! # predictify-hybrid
 //!
-//! Soroban smart contract for prediction markets.
-//!
-//! ## Idempotency
-//!
-//! `place_bets` accepts a caller-supplied `BytesN<32>` idempotency key.
-//! The key is stored in **temporary** storage under
-//! `DataKey::PlaceBetsIdem(caller, key)` as a
-//! [`bets::BatchReceipt`], with a TTL of
-//! [`storage::IDEM_KEY_TTL_LEDGERS`] ledgers (~24 h).  Repeated
-//! submissions with the same `(caller, key)` pair are rejected: with
-//! `Error::IdempotentBatchAlreadyApplied` when the batch matches the one
-//! the token was spent on, and with
-//! `Error::IdempotencyKeyReusedWithDifferentBatch` when it does not, so
-//! a client can distinguish a harmless duplicate from a token collision.
-//! Once the receipt has expired the network has deleted it, so the token
-//! may be reused as a fresh batch.
-//!
-//! Temporary rather than instance storage is deliberate: the contract
-//! instance is a single bounded ledger entry, so accumulating one
-//! receipt per batch there would eventually exceed `max_entry_size` and
-//! disable the contract for every caller.  Persistent storage is avoided
-//! because deduplication must *read* the receipt, and an archived
-//! persistent entry cannot be read without a paid restore — which would
-//! make an expired token permanently unusable instead of reusable.  See
-//! [`storage::DataKey`].
-//!
-//! ## State invariants
-//!
-//! [`bets`] documents the authorization, validation and state-transition
-//! invariants this entry point owns, together with the failure modes
-//! that preserve them.
+/// Soroban smart contract for prediction markets.
+///
+/// ## Idempotency
+///
+/// `place_bets` accepts a caller-supplied `BytesN<32>`
+/// idempotency key. The key is stored in instance storage under
+/// `DataKey::PlaceBetsIdem(caller, key)` with a TTL of
+/// [`storage::IDEM_KEY_TTL_LEDGERS`] ledgers (~24 h).  Repeated
+/// submissions with the same `(caller, key)` pair are rejected with
+/// `Error::IdempotentBatchAlreadyApplied`.
+///
+/// ## Validation boundaries
++///
+/// See [`bets::place_bets`] for the full ordered list of checks.
+/// In short: empty batches, batches larger than
+-/// [`storage::MAX_BATCH_SIZE`], duplicate market identifiers within a
+/// batch, and per-bet field failures are rejected before any state
+/// mutation.  Only a fully validated batch consumes the idempotency
+/// key, so a rejected call can be retried with the same token.
 
-#[no_std]
+#no_stdj
 
 #[cfg(test)]
 mod batch_operations_tests;
@@ -45,7 +33,7 @@ mod storage_compatibility_tests;
 
 pub use bets::Bet;
 pub use errors::Error;
-pub use storage::{DataKey, IDEM_KEY_TTL_LEDGERS};
+pub use storage::{DataKey, IDEM_KEY_TTL_LEDGERS, MAX_BATCH_SIZE};
 
 pub use bets::{BatchReceipt, Bet, MAX_BETS_PER_BATCH};
 pub use errors::Error;
@@ -67,10 +55,9 @@ pub struct PredictifyHybrid;
 #[contractimpl]
 impl PredictifyHybrid {
     /// Submit a batch of bets atomically.
-///
-    /// See [`bets::place_bets`] for full documentation. The
-    /// validation boundaries are documented at the crate root and
-/// enforced in ``bets::place_bets``.
+    ///
+    /// See [`bets::place_bets`] for full documentation of the
+    /// validation boundaries and failure modes.
     pub fn place_bets(
         env: Env,
         caller: Address,

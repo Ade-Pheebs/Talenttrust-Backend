@@ -33,7 +33,15 @@ pub enum Error {
     /// The idempotency key is not consumed in this case.
     EmptyBatch = 2,
 
-    /// The saved idempotency marker is not the supported boolean `true`.
-    /// Fail closed without repairing state or exposing its contents.
-    InvalidIdempotencyState = 4,
+    /// The `bets` vector exceeded [`storage::MAX_BATCH_SIZE`].
+    /// Split the work into smaller batches with fresh idempotency keys.
+    BatchTooLarge = 3,
+
+    /// A bet in the batch failed validation (e.g. zero amount,
+    /// duplicate market identifier, or malformed payload).
+    InvalidBet = 4,
+
+    /// The same market identifier appears more than once within a
+    /// single batch.  Duplicates would make the applied state ambiguous.
+    DuplicateBet = 5,
 }

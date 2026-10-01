@@ -137,7 +137,9 @@ use soroban_sdk::{Address, Bytes, BytesN, Env, Symbol, Vec};
 
 use crate::{
     errors::Error,
-    storage::{is_idempotency_key_consumed, DataKey, IDEM_KEY_TTL_LEDGERS},
+    storage::{
+        DataKey, IDEM_KEY_TTL_LEDGERS, MAX_BATCH_SIZE, MAX_BET_AMOUNT, MIN_BET_AMOUNT,
+    },
 };
 
 /// Maximum number of bets accepted in a single [`place_bets`] call.
@@ -172,41 +174,48 @@ pub struct Bet {
     pub amount: i128,
 }
 
-/// Validate every entry of `bets` against the contract's input boundaries.
+/// Validate a single [`Bet`] entry against the storage-layer boundaries.
 ///
-/// # Rules (evaluated in this order, first failure wins)
+/// # Invariants
 ///
-/// 1. `bets.len() <= MAX_BATCH_SIZE`  – otherwise [`Error::BatchTooLarge`].
-/// 2. `bet.market_id != 0`            – otherwise [`Error::InvalidMarketId`].
-/// 3. `bet.amount > 0`                – otherwise [`Error::InvalidBetAmount`].
+/// * `market_id` must be non-zero (zero is reserved as an invalid sentinel).
+/// * `amount` must satisfy `MIN_BET_AMOUNT <= amount <= MAX_BET_AMOUNT`.
 ///
-/// Rules are applied per entry, scanning from index `0`, so the returned
-/// error is deterministic for a given payload.  Duplicate `market_id` values
-/// inside one batch are **allowed**: a caller may legitimately place several
-/// independent stakes on the same market, and each entry is applied in the
-/// order supplied.
+/// The function is pure and deterministic: identical inputs always yield
+/// identical results, and it performs no storage reads or writes.
+fn validate_bet(bet: &Bet) -> Result<(), Error> {
+    if bet.market_id == 0 {
+        return Err(Error::InvalidMarketId);
+    }
+    if bet.amount < MIN_BET_AMOUNT {
+        return Err(Error::BetAmountTooSmall);
+    }
+    if bet.amount > MAX_BET_AMOUNT {
+        return Err(Error::BetAmountTooLarge);
+    }
+    Ok(())
+}
+
+/// Validate the whole batch before any state mutation occurs.
 ///
-/// # Invariant: rejected input never consumes the idempotency key
+/// # Invariants
 ///
-/// This function is always called *before* the `(caller, idempotency_key)`
-/// sentinel is written, so a payload rejected here leaves the key untouched
-/// and the caller can correct the payload and retry with the same token.
-/// Any future change that moves validation after the sentinel write would
-/// silently burn keys and must be treated as a breaking change.
-fn validate_bets(bets: &Vec<Bet>) -> Result<(), Error> {
+/// * The batch is non-empty.
+/// * The batch size does not exceed [`MAX_BATCH_SIZE`].
+/// * Every entry passes [`validate_bet`].
+///
+/// Validation is performed in a single pass up-front so that a rejected
+/// batch never partially mutates storage (all-or-nothing semantics).
+fn validate_batch(bets: &Vec<Bet>) -> Result<(), Error> {
+    if bets.is_empty() {
+        return Err(Error::EmptyBatch);
+    }
     if bets.len() > MAX_BATCH_SIZE {
         return Err(Error::BatchTooLarge);
     }
-
     for bet in bets.iter() {
-        if bet.market_id == 0 {
-            return Err(Error::InvalidMarketId);
-        }
-        if bet.amount <= 0 {
-            return Err(Error::InvalidBetAmount);
-        }
+        validate_bet(&bet)?;
     }
-
     Ok(())
 }
 
@@ -224,7 +233,11 @@ fn validate_bets(bets: &Vec<Bet>) -> Result<(), Error> {
 ///
 /// # Errors
 ///
-/// * [`Error::EmptyBatch`] – `bets` is empty.
+/// * [`Error::EmptyBatch`]                   – `bets` is empty.
+/// * [`Error::BatchTooLarge`]                – `bets` exceeds [`MAX_BATCH_SIZE`].
+/// * [`Error::InvalidMarketId`]              – a bet has `market_id == 0`.
+/// * [`Error::BetAmountTooSmall`]            – a bet amount is below [`MIN_BET_AMOUNT`].
+/// * [`Error::BetAmountTooLarge`]            – a bet amount is above [`MAX_BET_AMOUNT`].
 /// * [`Error::IdempotentBatchAlreadyApplied`] – the `(caller, idempotency_key)`
 ///   pair has already been consumed.
 /// * [`Error::InvalidIdempotencyState`]       – the saved marker is malformed;
@@ -274,29 +287,10 @@ pub fn place_bets(
     // cannot authorize must not be able to burn its own token.
     caller.require_auth();
 
-    // ------------------------------------------------------------------
-    // Shape validation (I6)
-    // ------------------------------------------------------------------
-    // Bound the batch before any per-bet work, so the cost of a rejected
-    // oversized batch is O(1).
-    let bet_count = bets.len();
-    if bet_count == 0 {
-        return Err(Error::EmptyBatch);
-    }
-    if bet_count > MAX_BETS_PER_BATCH {
-        return Err(Error::BatchTooLarge);
-    }
-
-    // Validate bet amounts.
-    for bet in bets.iter() {
-        if bet.amount <= 0 {
-            return Err(Error::InvalidBetAmount);
-        }
-    }
-
-    // Enforce input boundaries before touching any state so that a rejected
-    // payload cannot consume the caller's idempotency key.
-    validate_bets(&bets)?;
+    // Validate the entire batch up-front.  This rejects empty batches,
+    // oversized batches, and any individual bet that violates the
+    // storage-layer boundaries before any state is mutated.
+    validate_batch(&bets)?;
 
     // ------------------------------------------------------------------
     // Content validation (I5), completing before the first write (I4)

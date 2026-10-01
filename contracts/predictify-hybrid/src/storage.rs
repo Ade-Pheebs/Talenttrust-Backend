@@ -1,4 +1,4 @@
-use soroban_sdk::{contracttype, Address, BytesN, Env, TryFromVal, Val};
+use soroban_sdk::{contracttype, Address, BytesN, Env};
 
 use crate::errors::Error;
 
@@ -28,16 +28,14 @@ use crate::errors::Error;
 /// plan, because that would allow a replay of an already-applied batch.
 pub const IDEM_KEY_TTL_LEDGERS: u32 = 17_280; // ~24 h at 5 s/ledger
 
-/// TTL applied to the contract instance whenever a batch is accepted.
+/// Maximum number of bets in a single `place_bets` batch.
 ///
-/// Soroban instance storage shares a single ledger entry — and therefore a
-/// single `liveUntilLedger` — with the contract instance itself, so the
-/// replay window cannot outlive the contract.  The instance is extended to
-/// twice [`IDEM_KEY_TTL_LEDGERS`] so it stays invokable for a full extra
-/// window after the newest key expires; without that headroom, advancing the
-/// ledger past the replay window would archive the contract and it could no
-/// longer be called to observe the expiry at all.
-pub const INSTANCE_TTL_LEDGERS: u32 = IDEM_KEY_TTL_LEDGERS * 2; // ~48 h
+/// This bound is enforced before any state mutation so that an
+/// oversized batch is rejected atomically without consuming the
+/// caller's idempotency key. The value is deliberately small enough
+/// to keep the batch and its emitted events well within the network'
+/// transaction resource limits, and large enough for realistic use.
+pub const MAX_BATCH_SIZE: u32 = 100;
 
 /// Storage keys used by the contract.
 ///
@@ -45,20 +43,7 @@ pub const INSTANCE_TTL_LEDGERS: u32 = IDEM_KEY_TTL_LEDGERS * 2; // ~48 h
 /// `place_bets` batch has been accepted.  The composite key binds the
 /// token to the submitting address so two different callers may reuse the
 /// same 32-byte token independently without conflict.
-///
-/// `PlaceBetsIdemLedger(user, key)` records the ledger sequence at which
-/// that sentinel was written, which is what makes the replay window
-/// enforceable (see [`IDEM_KEY_TTL_LEDGERS`]).
-///
-/// # Compatibility
-///
-/// The ledger variant is **appended** after the sentinel variant so the
-/// discriminant of `PlaceBetsIdem` is unchanged and previously written
-/// keys keep decoding.  A sentinel with no matching ledger entry is a key
-/// written by an earlier version of the contract and is treated as a
-/// durable (non-expiring) replay guard, so upgrading can never make a
-/// previously consumed token replayable.
-#[contracttype]
+[contracttype]
 #[derive(Clone)]
 pub enum DataKey {
     /// Idempotency receipt for a `place_bets` call.
@@ -90,4 +75,30 @@ pub(crate) fn is_idempotency_key_consumed(env: &Env, key: &DataKey) -> Result<bo
             _ => Err(Error::InvalidIdempotencyState),
         },
     }
+}
+
+/// Returns `true` if the idempotency key has already been consumed by
+/// a successful batch from the same caller.
+pub fn is_idempotency_key_consumed(env: &Env, caller: &Address, key: &BytesN<32>) -> bool {
+    env.storage()
+        .instance()
+        .has(&DataKey::PlaceBetsIdem(caller.clone(), key.clone()))
+}
+
+/// Marks the idempotency key as consumed and extends its TT\.
+///
+/// This function is the only place that writes the sentinel, so the
+/// invariant "consumed implies batch applied" holds by construction.
+/// It must be called after all validation and state mutations succeed.
+pub fn consume_idempotency_key(env: &Env, caller: &Address, key: &BytesN<32>) {
+    let storage = env.storage().instance();
+    storage.set(
+        &DataKey::PlaceBetsIdem(caller.clone(), key.clone()),
+        &true,
+    );
+    storage.extend_ttl(
+        &DataKey::PlaceBetsIdem(caller.clone(), key.clone()),
+        IDEM_KEY_TTL_LEDGERS,
+        IDEM_KEY_TTL_LEDGERS,
+    );
 }

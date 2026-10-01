@@ -122,7 +122,7 @@ describe('ContractEventIndexer Integration (Replay & Cursor Pagination)', () => 
       expect(result.processedCount).toBe(0);
       expect(result.duplicateCount).toBe(0);
       expect(result.errors).toHaveLength(0);
-      expect(result.newCursor).toBeUndefined();
+      expect(result.newCursor).toBeNull();
     });
 
     it('handles all-duplicate batch correctly', async () => {
@@ -197,8 +197,8 @@ describe('ContractEventIndexer Integration (Replay & Cursor Pagination)', () => 
       const result = await indexer.indexBatch(networkSourceId, events);
 
       expect(result.errors).toHaveLength(1);
-      expect(result.errors[0]).toContain('simulated write failure');
-      expect(result.newCursor).toBeUndefined();
+      expect(result.errors[0].reason).toContain('simulated write failure');
+      expect(result.newCursor).toBeNull();
 
       const stored = await cursorRepository.getCursor(networkSourceId);
       expect(stored).toBeNull();

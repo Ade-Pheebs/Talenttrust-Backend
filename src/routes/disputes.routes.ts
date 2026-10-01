@@ -171,7 +171,13 @@ export function createDisputesObservabilityMiddleware(options: DisputesRouterOpt
 
       // Record metrics if service is available
       if (options.metricsService && options.metricsService.recordDisputesRequest) {
-        options.metricsService.recordDisputesRequest(duration);
+        options.metricsService.recordDisputesRequest({
+          method: req.method,
+          route: req.route?.path ?? req.path ?? 'unknown',
+          statusCode,
+          errorCause: statusCode >= 500 ? '5xx_server_error' : statusCode >= 400 ? '4xx_client_error' : 'success',
+          durationSeconds: duration / 1000,
+        });
       }
 
       // Log request completion

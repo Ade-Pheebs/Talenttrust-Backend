@@ -31,7 +31,7 @@ export interface RequestAuditHelper {
    * callers do not need to supply those fields manually.
    *
    * When `AUDIT_ENABLED=false` this is a **no-op**: it returns a stub
-   * `AuditEntry` with empty `id`/`hash` fields and does **not** write
+   * `AuditEntry` with empty `id/`hash` fields and does **not** write
    * anything to the underlying store.
    *
    * @param input - Audit event details, excluding `ipAddress` and

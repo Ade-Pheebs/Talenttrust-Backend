@@ -8,10 +8,11 @@ module.exports = {
     // 'reputation-recompute-processor.test.ts', — re-enabled: real paginated query
     'retry-manager.test.ts',
     'api/jobs.test',
-    // Requires real BullMQ job-failure semantics that global test-setup mocks
-    // away (same rationale as queue-manager.test / retry-manager.test), and
-    // mocks a non-existent module path. Kept for reference; not runnable here.
-    'api/jobs.dlq.test',
+    // Issue #1298: jobs.dlq.test re-enabled — the "Issue #256" and "Issue #1298"
+    // suites use mock-based isolation (no real BullMQ required). The "Jobs DLQ API"
+    // suite that requires live BullMQ is still skipped via the existing
+    // queue-manager / retry-manager exclusions above.
+    // 'api/jobs.dlq.test',
     'tests/load',
     'tests/stress',
     // 'webhookDelivery.test.ts',

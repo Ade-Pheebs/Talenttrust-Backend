@@ -1,113 +1,84 @@
 /**
  * @module audit/sqliteRepository
- * @description Durable, tamper-evident SQLite audit repository.
+ * @description Durable SQLite-backed audit log repository.
  *
- * ## Failure-recovery invariants
+ * ## Validation boundaries
  *
- * Recovery in this module is **deterministic**: for a given failure the exact
- * same bounded sequence of actions is taken on every run — there is no random
- * jitter, no unbounded retry loop, and no dependence on wall-clock ordering.
+ * This module is the last line of defence before untrusted data is written to
+ * the immutable, hash-chained audit log. Because entries can never be removed
+ * or edited, a malformed entry is permanent. All public write and read paths
+ * therefore enforce strict input bounds independent of the HTTP layer:
  *
- * 1. **Atomic writes.** The previous-hash read and the `INSERT` run inside a
- *    single `better-sqlite3` transaction. Any thrown error rolls the whole
- *    transaction back, so a failure never leaves a partial row or a
- *    half-linked hash chain.
- * 2. **Bounded retry for transient conflicts.** Only *serialization* failures
- *    (`SQLITE_BUSY` / `SQLITE_LOCKED`) are retried, capped at
- *    {@link MAX_WRITE_ATTEMPTS} with a fixed backoff. The transaction re-reads
- *    the chain tail on every attempt, so a retry can never fork or
- *    double-append the chain.
- * 3. **Schema self-repair.** A write failing because the schema is missing
- *    (`no such table` / `no such column`, e.g. after a partial migration or an
- *    out-of-band `DROP`) triggers exactly one idempotent `initSchema()` repair
- *    and one retry. If the repair itself fails, the original error propagates.
- * 4. **Non-retryable errors surface.** Constraint violations, disk-full,
- *    malformed input and any other deterministic error are thrown immediately;
- *    the retry loop never masks a real bug.
- * 5. **Observable, never sensitive.** Each recovery attempt is logged with the
- *    operation name, attempt number and error code only. Entry payloads and
- *    metadata are never logged.
- * 6. **Integrity checks never throw.** `verifyIntegrity()` converts an
- *    unparseable row into a deterministic `{ valid: false }` report instead of
- *    crashing the monitoring job that depends on it.
+ * | Method              | What is validated                                                  |
+ * |---------------------|--------------------------------------------------------------------|
+ * | `append()`          | Full payload via `validateCreateAuditEntryInput` (single source)   |
+ * | `getById()`         | `id` must be a non-blank string within `MAX_ID_LENGTH` chars       |
+ * | `query()`           | Enum filters, ISO-8601 dates, limit/offset clamping                |
+ * | `queryWithCursor()` | Same as `query()` plus cursor integrity; limit clamped [1, 100]    |
+ * | `stream()`          | Same filter rules as `query()`                                     |
+ *
+ * Failed validation throws `RepositoryValidationError` (a subclass of `Error`)
+ * so callers can distinguish invalid input from transient storage errors.
+ *
+ * ## Resilience
+ *
+ * `toAuditEntry()` wraps `JSON.parse` in a try/catch. A row with corrupted
+ * `metadata_json` is surfaced as an error rather than crashing the process —
+ * callers see a `RepositoryCorruptedRowError` describing which row is affected.
  */
 
 import { randomUUID } from 'crypto';
 import Database from "../db/betterSqlite3";
 import { computeEntryHash, GENESIS_HASH, CURSOR_FILTER_MISMATCH_MESSAGE } from './store';
 import type { AuditEntry, AuditQuery, CreateAuditEntryInput, IntegrityReport, AuditQueryResult, CursorData } from './types';
-import { encodeCursor, decodeCursor } from './types';
+import { AUDIT_ACTIONS, AUDIT_SEVERITIES, encodeCursor, decodeCursor } from './types';
 import type { AuditLogRepository } from './repository';
-import { createLogger } from '../logger';
+import {
+  validateCreateAuditEntryInput,
+  MAX_ID_LENGTH,
+} from './inputValidation';
 
-const log = createLogger({ service: 'sqlite-audit-repository' });
-
-/**
- * Maximum number of write attempts (the first attempt plus retries) for a
- * single logical write. Bounded so a persistent conflict can never spin
- * forever; after this many attempts the last error is rethrown.
- */
-export const MAX_WRITE_ATTEMPTS = 3;
-
-/** Fixed base backoff between retries (ms). Deterministic — no jitter. */
-const RETRY_BACKOFF_MS = 10;
-
-/** SQLite extended result codes that represent a transient serialization conflict. */
-const SERIALIZATION_CODES = new Set<number>([5, 6, 262, 517]); // BUSY, LOCKED, LOCKED_SHAREDCACHE, BUSY_SNAPSHOT
-const SERIALIZATION_MESSAGE_PATTERN =
-  /SQLITE_BUSY|SQLITE_LOCKED|database is locked|database table is locked/i;
-
-/** Error text emitted by SQLite when a referenced schema object is absent. */
-const MISSING_SCHEMA_PATTERN = /no such (table|column|index)/i;
+// ── Error types ───────────────────────────────────────────────────────────────
 
 /**
- * Returns true only for transient serialization conflicts (lock contention)
- * that are safe to retry. Numeric extended codes and string messages are both
- * checked so the predicate works with every `better-sqlite3` error shape.
+ * Thrown when an argument to a repository method violates its validation
+ * contract. Callers should treat this as a client-side error (HTTP 400).
  *
- * Exported so the retry policy can be unit-tested independently of a live DB.
+ * The `field` property names the argument or sub-field that failed so that
+ * error handlers can surface a precise message without leaking internals.
  */
-export function isSerializationError(error: unknown): boolean {
-  if (typeof error !== 'object' || error === null) {
-    return false;
-  }
-  const { code, rawCode, message } = error as {
-    code?: unknown;
-    rawCode?: unknown;
-    message?: unknown;
-  };
-  if (typeof code === 'number' && SERIALIZATION_CODES.has(code)) return true;
-  if (typeof rawCode === 'number' && SERIALIZATION_CODES.has(rawCode)) return true;
-  return typeof message === 'string' && SERIALIZATION_MESSAGE_PATTERN.test(message);
-}
-
-/**
- * Returns true when the failure is caused by a missing schema object (table,
- * column or index) — the one class of failure this repository can repair
- * in-process by re-running its idempotent `initSchema()` bootstrap.
- *
- * Exported so the repair trigger can be unit-tested independently of a live DB.
- */
-export function isMissingSchemaError(error: unknown): boolean {
-  return (
-    typeof error === 'object' &&
-    error !== null &&
-    typeof (error as { message?: unknown }).message === 'string' &&
-    MISSING_SCHEMA_PATTERN.test((error as { message: string }).message)
-  );
-}
-
-/**
- * Synchronous backoff. `better-sqlite3` is synchronous, and this only runs
- * after a bounded, already-waited busy conflict, so blocking is deliberately
- * kept tiny ({@link RETRY_BACKOFF_MS} per attempt).
- */
-function sleepSync(ms: number): void {
-  const deadline = Date.now() + ms;
-  while (Date.now() < deadline) {
-    // Busy-wait: only reached on a bounded retry path.
+export class RepositoryValidationError extends Error {
+  constructor(
+    message: string,
+    public readonly field?: string,
+  ) {
+    super(message);
+    this.name = 'RepositoryValidationError';
+    // Maintain the correct prototype chain on transpiled ES5 targets.
+    Object.setPrototypeOf(this, RepositoryValidationError.prototype);
   }
 }
+
+/**
+ * Thrown when a row retrieved from the database contains data that cannot
+ * be safely deserialised (e.g. corrupted `metadata_json`). The `rowId`
+ * property identifies the affected entry for operator investigation.
+ *
+ * This is a storage-layer error, not a validation error: the offending data
+ * was already persisted when the fault occurred.
+ */
+export class RepositoryCorruptedRowError extends Error {
+  constructor(
+    message: string,
+    public readonly rowId: string,
+  ) {
+    super(message);
+    this.name = 'RepositoryCorruptedRowError';
+    Object.setPrototypeOf(this, RepositoryCorruptedRowError.prototype);
+  }
+}
+
+// ── Internal types ────────────────────────────────────────────────────────────
 
 interface AuditRow {
   id: string;
@@ -124,60 +95,37 @@ interface AuditRow {
   previous_hash: string;
 }
 
-/**
- * Recursively deep-freezes a plain object so that nested metadata objects
- * returned from the DB cannot be mutated by callers.
- *
- * Only plain objects and arrays are frozen; primitives, null, functions,
- * and class instances are returned as-is so we don't accidentally freeze
- * host objects or break prototypes.
- */
-function deepFreeze<T>(value: T): T {
-  if (value === null || typeof value !== 'object') {
-    return value;
-  }
-  // Freeze children first (depth-first), then freeze the container.
-  for (const key of Object.keys(value as object)) {
-    deepFreeze((value as Record<string, unknown>)[key]);
-  }
-  return Object.freeze(value);
-}
+// ── Constants ─────────────────────────────────────────────────────────────────
+
+/** Maximum limit value accepted by `query()` / `stream()`. Prevents unbounded full-table scans. */
+const MAX_QUERY_LIMIT = 10_000;
+
+/** Control characters (C0, C1, DEL) are disallowed in identifier fields. */
+const CONTROL_CHARACTERS = /[\u0000-\u001F\u007F-\u009F]/;
+
+// ── Row deserialisation ───────────────────────────────────────────────────────
 
 /**
- * Safely parses a JSON string.  Returns an empty object `{}` instead of
- * throwing when the stored value is malformed, so a corrupted `metadata_json`
- * column can never crash the caller.
+ * Converts a raw database row to a frozen `AuditEntry`.
  *
- * @invariant The returned value is always a plain object (never null/undefined).
- */
-function safeParseMetadata(raw: string): Record<string, unknown> {
-  try {
-    const parsed = JSON.parse(raw) as unknown;
-    // Guard: must be a non-null object so the AuditEntry type is satisfied.
-    if (parsed !== null && typeof parsed === 'object' && !Array.isArray(parsed)) {
-      return parsed as Record<string, unknown>;
-    }
-    return {};
-  } catch {
-    // Malformed JSON — return a safe, empty metadata object rather than
-    // propagating the SyntaxError to the caller.
-    return {};
-  }
-}
-
-/**
- * Converts a raw SQLite row to a fully frozen AuditEntry.
- *
- * Invariants enforced:
- * - The top-level entry object is frozen.
- * - The `metadata` object is deep-frozen so nested values cannot be mutated
- *   after a read.
- * - Malformed `metadata_json` is silently replaced with `{}` (logged nowhere
- *   because this is a low-level mapping function; callers and the integrity
- *   check are responsible for surfacing data-quality issues).
+ * @throws {RepositoryCorruptedRowError} when `metadata_json` cannot be parsed.
  */
 function toAuditEntry(row: AuditRow): AuditEntry {
-  const rawMetadata = safeParseMetadata(row.metadata_json);
+  let parsedMetadata: Record<string, unknown>;
+  try {
+    const raw = JSON.parse(row.metadata_json) as unknown;
+    if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) {
+      throw new TypeError(`metadata_json is not a JSON object for row ${row.id}`);
+    }
+    parsedMetadata = raw as Record<string, unknown>;
+  } catch (cause) {
+    throw new RepositoryCorruptedRowError(
+      `Audit row ${row.id} has corrupted metadata_json and cannot be deserialised. ` +
+      `Cause: ${cause instanceof Error ? cause.message : String(cause)}`,
+      row.id,
+    );
+  }
+
   return Object.freeze({
     id: row.id,
     timestamp: row.timestamp,
@@ -186,8 +134,7 @@ function toAuditEntry(row: AuditRow): AuditEntry {
     actor: row.actor,
     resource: row.resource,
     resourceId: row.resource_id,
-    // Deep-freeze so nested objects cannot be mutated post-read.
-    metadata: deepFreeze(rawMetadata) as Readonly<Record<string, unknown>>,
+    metadata: Object.freeze(parsedMetadata),
     ipAddress: row.ip_address ?? undefined,
     correlationId: row.correlation_id ?? undefined,
     hash: row.hash,
@@ -195,81 +142,182 @@ function toAuditEntry(row: AuditRow): AuditEntry {
   });
 }
 
+// ── Validation helpers ────────────────────────────────────────────────────────
+
 /**
- * Validates required string fields of `CreateAuditEntryInput`.
- *
- * @throws {Error} with a descriptive message when any required field is
- *   absent (null/undefined) or is an empty/whitespace-only string.  The
- *   check happens before any DB interaction so invalid data never reaches
- *   the insert statement.
- *
- * Invariant: every audit entry persisted to the DB has non-blank required
- * fields; this is the single enforcement point.
+ * Validates a required identifier string (actor, resource, resourceId, id).
+ * Throws `RepositoryValidationError` if the value is invalid.
  */
-function validateAppendInput(input: CreateAuditEntryInput): void {
-  const required: Array<keyof Pick<CreateAuditEntryInput, 'action' | 'severity' | 'actor' | 'resource' | 'resourceId'>> =
-    ['action', 'severity', 'actor', 'resource', 'resourceId'];
-
-  for (const field of required) {
-    const value = input[field];
-    if (value === null || value === undefined) {
-      throw new Error(`audit append: required field '${field}' is missing`);
-    }
-    if (typeof value === 'string' && value.trim() === '') {
-      throw new Error(`audit append: required field '${field}' must not be empty`);
-    }
+function validateIdentifier(
+  value: unknown,
+  fieldName: string,
+  maxLength: number = MAX_ID_LENGTH,
+): asserts value is string {
+  if (typeof value !== 'string') {
+    throw new RepositoryValidationError(
+      `${fieldName} must be a string, received ${value === null ? 'null' : typeof value}`,
+      fieldName,
+    );
   }
-
-  // metadata must be a non-null object (arrays and primitives are invalid).
-  if (
-    input.metadata === null ||
-    input.metadata === undefined ||
-    typeof input.metadata !== 'object' ||
-    Array.isArray(input.metadata)
-  ) {
-    throw new Error("audit append: 'metadata' must be a plain object");
+  if (value.length === 0 || value.trim().length === 0) {
+    throw new RepositoryValidationError(
+      `${fieldName} must not be blank`,
+      fieldName,
+    );
+  }
+  if (value.length > maxLength) {
+    throw new RepositoryValidationError(
+      `${fieldName} must be at most ${maxLength} characters, received ${value.length}`,
+      fieldName,
+    );
+  }
+  if (CONTROL_CHARACTERS.test(value)) {
+    throw new RepositoryValidationError(
+      `${fieldName} must not contain control characters`,
+      fieldName,
+    );
   }
 }
 
-export class SqliteAuditRepository implements AuditLogRepository {
-  /**
-   * Re-entrancy guard for `append()`.
-   *
-   * better-sqlite3 transactions are synchronous and non-reentrant: calling
-   * `append()` from within an `append()` transaction (e.g. from a callback
-   * triggered by the INSERT) would attempt to start a nested transaction and
-   * corrupt the hash-chain state.  This flag detects that scenario and throws
-   * a clear error rather than producing silent data-integrity violations.
-   */
-  private _appendInProgress = false;
+/**
+ * Validates that a date string is a parseable ISO-8601 timestamp.
+ * Throws `RepositoryValidationError` if it is not.
+ */
+function validateIsoDate(value: string, fieldName: string): void {
+  if (Number.isNaN(Date.parse(value))) {
+    throw new RepositoryValidationError(
+      `${fieldName} must be a valid ISO-8601 date string, received: ${JSON.stringify(value)}`,
+      fieldName,
+    );
+  }
+}
 
+/**
+ * Validates query filter fields shared by `query()`, `queryWithCursor()`, and
+ * `stream()`. Does NOT throw on an absent optional field.
+ */
+function validateQueryFilters(query: AuditQuery): void {
+  if (query.action !== undefined) {
+    if (!(AUDIT_ACTIONS as readonly string[]).includes(query.action)) {
+      throw new RepositoryValidationError(
+        `action must be one of: ${AUDIT_ACTIONS.join(', ')}`,
+        'action',
+      );
+    }
+  }
+
+  if (query.severity !== undefined) {
+    if (!(AUDIT_SEVERITIES as readonly string[]).includes(query.severity)) {
+      throw new RepositoryValidationError(
+        `severity must be one of: ${AUDIT_SEVERITIES.join(', ')}`,
+        'severity',
+      );
+    }
+  }
+
+  if (query.from !== undefined) {
+    validateIsoDate(query.from, 'from');
+  }
+
+  if (query.to !== undefined) {
+    validateIsoDate(query.to, 'to');
+  }
+
+  if (query.from !== undefined && query.to !== undefined) {
+    if (query.from > query.to) {
+      throw new RepositoryValidationError(
+        `from (${query.from}) must not be after to (${query.to})`,
+        'from',
+      );
+    }
+  }
+
+  if (query.limit !== undefined) {
+    if (!Number.isFinite(query.limit) || !Number.isInteger(query.limit)) {
+      throw new RepositoryValidationError(
+        `limit must be a finite integer, received ${query.limit}`,
+        'limit',
+      );
+    }
+    // Negative values are clamped to 0 downstream; not an error but we cap the
+    // upper bound to prevent accidental full-table scans through the public API.
+    if (query.limit > MAX_QUERY_LIMIT) {
+      throw new RepositoryValidationError(
+        `limit must be at most ${MAX_QUERY_LIMIT}, received ${query.limit}`,
+        'limit',
+      );
+    }
+  }
+
+  if (query.offset !== undefined) {
+    if (!Number.isFinite(query.offset) || !Number.isInteger(query.offset)) {
+      throw new RepositoryValidationError(
+        `offset must be a finite integer, received ${query.offset}`,
+        'offset',
+      );
+    }
+    // Negative values are clamped to 0 downstream.
+  }
+}
+
+// ── Repository ────────────────────────────────────────────────────────────────
+
+export class SqliteAuditRepository implements AuditLogRepository {
   constructor(private readonly db: ReturnType<typeof Database>) {
     this.initSchema();
-    this.applyConnectionPragmas();
   }
 
   /**
-   * Appends a new, tamper-evident audit entry to the log.
+   * Validates and appends a new audit entry to the hash chain.
    *
-   * Invariants enforced:
-   * 1. Required fields are validated before any DB interaction.
-   * 2. Re-entrancy is detected and rejected — concurrent nested calls would
-   *    break the hash chain.
-   * 3. The entire write (SELECT previous hash + INSERT) is wrapped in a
-   *    single serialisable SQLite transaction, so a crash or error leaves
-   *    zero partial state.
-   * 4. The returned entry is deep-frozen.
+   * Validation uses the same rules as the HTTP layer
+   * (`validateCreateAuditEntryInput`) so the repository enforces the same
+   * invariants regardless of the call-site.
    *
-   * @throws {Error} on re-entrancy, validation failure, or DB error.
+   * @throws {RepositoryValidationError} on any invalid field.
+   * @throws {Error} on a transient storage failure (transaction rolls back).
    */
   append(input: CreateAuditEntryInput): AuditEntry {
-    // --- Invariant 1: validate required fields before touching the DB ---
-    validateAppendInput(input);
-
-    // --- Invariant 2: re-entrancy guard ---
-    if (this._appendInProgress) {
-      throw new Error('SqliteAuditRepository.append() re-entrancy detected: nested call would corrupt the hash chain');
+    // --- Validation boundary ---
+    // Reuse the single-source-of-truth validator from inputValidation.ts.
+    // This covers: required fields, enum membership, identifier lengths,
+    // control-character rejection, metadata structure/depth/size, ipAddress
+    // format, correlationId charset.
+    const validationResult = validateCreateAuditEntryInput(input);
+    if (!validationResult.ok) {
+      const first = validationResult.issues[0];
+      throw new RepositoryValidationError(
+        `Invalid audit entry input: ${first?.message ?? 'validation failed'}` +
+        (validationResult.issues.length > 1
+          ? ` (and ${validationResult.issues.length - 1} more issue(s))`
+          : ''),
+        first?.field,
+      );
     }
+
+    // Use the validated (and normalised) data from here on.
+    const payload = validationResult.data;
+
+    const insert = this.db.transaction((p: CreateAuditEntryInput): AuditEntry => {
+      const previousHashRow = this.db
+        .prepare<[], { hash: string }>(
+          'SELECT hash FROM audit_log_entries ORDER BY seq DESC LIMIT 1'
+        )
+        .get();
+
+      const partial: Omit<AuditEntry, 'hash'> = {
+        id: randomUUID(),
+        timestamp: new Date().toISOString(),
+        action: p.action,
+        severity: p.severity,
+        actor: p.actor,
+        resource: p.resource,
+        resourceId: p.resourceId,
+        metadata: Object.freeze({ ...p.metadata }),
+        ipAddress: p.ipAddress,
+        correlationId: p.correlationId,
+        previousHash: previousHashRow?.hash ?? GENESIS_HASH,
+      };
 
     this._appendInProgress = true;
     try {
@@ -356,13 +404,20 @@ export class SqliteAuditRepository implements AuditLogRepository {
       return entry;
     });
 
-    const immediate = (insert as typeof insert & {
-      immediate?: (payload: CreateAuditEntryInput) => AuditEntry;
-    }).immediate;
-    return immediate ? immediate(input) : insert(input);
+    return insert(payload);
   }
 
+  /**
+   * Retrieves a single audit entry by its UUID.
+   *
+   * @param id - Must be a non-blank string within {@link MAX_ID_LENGTH} chars.
+   * @throws {RepositoryValidationError} when `id` fails validation.
+   * @throws {RepositoryCorruptedRowError} when the matching row has corrupted metadata.
+   */
   getById(id: string): AuditEntry | undefined {
+    // --- Validation boundary ---
+    validateIdentifier(id, 'id', MAX_ID_LENGTH);
+
     const row = this.db
       .prepare<[string], AuditRow>(
         `SELECT id, timestamp, action, severity, actor, resource, resource_id, metadata_json, ip_address, correlation_id, hash, previous_hash
@@ -374,22 +429,46 @@ export class SqliteAuditRepository implements AuditLogRepository {
     return row ? toAuditEntry(row) : undefined;
   }
 
+  /**
+   * Queries audit entries with optional filters and offset pagination.
+   *
+   * @throws {RepositoryValidationError} on invalid filter values.
+   * @throws {RepositoryCorruptedRowError} when any returned row has corrupted metadata.
+   */
   query(query: AuditQuery = {}): AuditEntry[] {
+    // --- Validation boundary ---
+    validateQueryFilters(query);
+
     const { sql, params } = this.buildQuerySql(query);
     const rows = this.db.prepare<typeof params, AuditRow>(sql).all(...params);
     return rows.map(toAuditEntry);
   }
 
+  /**
+   * Queries audit entries with cursor-based pagination.
+   *
+   * @throws {RepositoryValidationError} on invalid filter values or a
+   *   cursor that does not match the supplied filters.
+   * @throws {RepositoryCorruptedRowError} when any returned row has corrupted metadata.
+   */
   queryWithCursor(query: AuditQuery = {}): AuditQueryResult {
+    // --- Validation boundary ---
+    validateQueryFilters(query);
+
     const limit = Math.min(Math.max(query.limit ?? 50, 1), 100);
     
     let startIndex = 0;
     
     // Decode cursor if provided
-    if (query.cursor) {
-      // Decode cursor first — if the format is invalid this will throw
-      // 'Invalid cursor format', which we catch below.
-      let cursorData: CursorData;
+    if (query.cursor !== undefined) {
+      // Validate cursor format: must be a non-blank string
+      if (typeof query.cursor !== 'string' || query.cursor.trim().length === 0) {
+        throw new RepositoryValidationError(
+          'cursor must be a non-blank string',
+          'cursor',
+        );
+      }
+
       try {
         cursorData = decodeCursor(query.cursor);
       } catch {
@@ -434,11 +513,14 @@ export class SqliteAuditRepository implements AuditLogRepository {
             cursorData.filters.resourceId !== query.resourceId ||
             cursorData.filters.from !== query.from ||
             cursorData.filters.to !== query.to) {
-          throw new Error(CURSOR_FILTER_MISMATCH_MESSAGE);
+          throw new RepositoryValidationError(
+            'Cursor filters do not match query filters',
+            'cursor',
+          );
         }
       } catch (error) {
-        // Re-throw filter mismatch errors, but handle invalid cursor format gracefully
-        if (error instanceof Error && error.message === CURSOR_FILTER_MISMATCH_MESSAGE) {
+        // Re-throw our own validation errors (filter mismatch, blank cursor)
+        if (error instanceof RepositoryValidationError) {
           throw error;
         }
         // If cursor is invalid (format error), start from beginning
@@ -484,7 +566,16 @@ export class SqliteAuditRepository implements AuditLogRepository {
     };
   }
 
+  /**
+   * Streams audit entries without materialising the full result set.
+   *
+   * @throws {RepositoryValidationError} on invalid filter values.
+   * @throws {RepositoryCorruptedRowError} when a yielded row has corrupted metadata.
+   */
   *stream(query: AuditQuery = {}): IterableIterator<AuditEntry> {
+    // --- Validation boundary ---
+    validateQueryFilters(query);
+
     const { sql, params } = this.buildQuerySql(query);
     const cursor = this.db.prepare<typeof params, AuditRow>(sql).iterate(...params);
     for (const row of cursor) {
@@ -538,6 +629,7 @@ export class SqliteAuditRepository implements AuditLogRepository {
       try {
         entry = toAuditEntry(rows[index]);
       } catch {
+        // A corrupted row means the chain cannot be verified from this point.
         return {
           valid: false,
           totalEntries: rows.length,
@@ -739,8 +831,10 @@ export class SqliteAuditRepository implements AuditLogRepository {
 
     let paginationClause = '';
     if (query.limit !== undefined) {
+      // Clamp limit to [0, MAX_QUERY_LIMIT]. A limit of 0 returns no rows.
+      const clampedLimit = Math.max(Math.min(query.limit, MAX_QUERY_LIMIT), 0);
       paginationClause = 'LIMIT ? OFFSET ?';
-      params.push(Math.max(query.limit, 0), offset);
+      params.push(clampedLimit, offset);
     } else if (offset > 0) {
       paginationClause = 'LIMIT -1 OFFSET ?';
       params.push(offset);

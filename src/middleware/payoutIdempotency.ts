@@ -61,7 +61,7 @@ function buildPayoutScopeKey(
   idempotencyKey: string,
 ): string {
   return createHash("sha256")
-    .update(`${tenantId}::::${method}::::${path}::::${milestoneId}::::${idempotencyKey}`)
+    .update(`${tenantId}:${method}:${path}:${milestoneId}:${idempotencyKey}`)
     .digest("hex");
 }
 
@@ -187,4 +187,3 @@ export function createPayoutIdempotencyMiddleware(
 }
 
 export const payoutIdempotencyMiddleware = createPayoutIdempotencyMiddleware;
-

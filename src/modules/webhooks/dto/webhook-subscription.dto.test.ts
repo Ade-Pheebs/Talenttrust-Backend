@@ -33,7 +33,7 @@ describe('webhook subscription boundary DTO mappings', () => {
 
     expect(toCreateWebhookSubscriptionDto(request)).toEqual({
       ...request,
-      tenantId: 'default', // Default tenant ID is added when not provided
+      tenantId: 'default',
     });
   });
 

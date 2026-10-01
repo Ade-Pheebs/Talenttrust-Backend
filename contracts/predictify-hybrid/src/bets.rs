@@ -134,14 +134,12 @@ pub const MAX_BATCH_SIZE: u32 = 100;
 ///
 /// # Idempotency semantics
 ///
-/// The key is consumed (a [`BatchReceipt`] is written to temporary storage)
-/// only after the whole batch has been validated. If a previous call with
-/// the same key succeeded, the function returns
-/// [`Error::IdempotentBatchAlreadyApplied`] without re-applying the batch —
-/// also when the payload differs (compare `batch_hash` from
-/// [`batch_receipt`] to tell the cases apart). The key and its receipt
-/// expire after [`IDEM_KEY_TTL_LEDGERS`] ledgers; after expiry a new
-/// submission with the same token is accepted as a fresh batch.
+/// The key is written to temporary storage **before** processing the bets.
+/// If a previous call with the same key succeeded, the function returns
+/// [`Error::IdempotentBatchAlreadyApplied`] immediately without re-applying
+/// the batch.  Once written, the key expires after [`IDEM_KEY_TTL_LEDGERS`]
+/// ledgers; after expiry a new submission with the same token is accepted as
+/// a fresh batch.
 ///
 /// # Deprecation note — zero-key backward path
 ///
@@ -225,39 +223,24 @@ pub fn place_bets(
     // Idempotency check
     // ------------------------------------------------------------------
     // A zero key opts out of deduplication (deprecated backward compat).
-    // 3. Idempotency: a key seen in either tier (current temporary receipt
-    //    or legacy instance sentinel) is rejected with code 1.
-    let dedupe = idempotency_key != zero_key(env);
-    let hash = batch_hash(env, &bets);
-    if dedupe {
-        if batch_receipt(env, caller.clone(), idempotency_key.clone()).is_some() {
+    let zero_key: BytesN<32> = BytesN::from_array(env, &[0u8; 32]);
+    if idempotency_key != zero_key {
+        let idem_key = DataKey::PlaceBetsIdem(caller.clone(), idempotency_key.clone());
+
+        if env.storage().temporary().has(&idem_key) {
             return Err(Error::IdempotentBatchAlreadyApplied);
         }
 
         // Mark the key as consumed before applying the batch so that
         // concurrent invocations on the same ledger also fail fast.
-        //
-        // Invariant: the idempotency marker MUST be written and its TTL
-        // extended atomically with respect to the batch application.  We
-        // write the marker first, then extend TTL, then apply the batch.
-        // If the batch application panics or returns an error, the marker
-        // remains set, which is the safe (fail-closed) behavior: a retry
-        // with the same key will be rejected rather than re-applying a
-        // partially-applied batch.  Callers that need to retry after a
-        // failure must generate a fresh idempotency key.
-        env.storage().instance().set(&idem_key, &true);
+        env.storage().temporary().set(&idem_key, &true);
         env.storage()
-            .instance()
-            .extend_ttl(IDEM_KEY_TTL_LEDGERS, IDEM_KEY_TTL_LEDGERS);
-
-        // Re-read the marker to confirm it is durably visible before we
-        // mutate any market state.  This guards against a storage backend
-        // that silently drops writes and ensures the idempotency invariant
-        // holds even under adverse conditions.
-        if !env.storage().instance().has(&idem_key) {
-            return Err(Error::IdempotentBatchAlreadyApplied);
-        }
+            .temporary()
+            .extend_ttl(&idem_key, IDEM_KEY_TTL_LEDGERS, IDEM_KEY_TTL_LEDGERS);
     }
+    env.storage()
+        .instance()
+        .extend_ttl(IDEM_KEY_TTL_LEDGERS, IDEM_KEY_TTL_LEDGERS);
 
     // Keep the instance (and any legacy keys in it) alive well beyond the
     // key window so replay protection can't lapse with an idle contract.

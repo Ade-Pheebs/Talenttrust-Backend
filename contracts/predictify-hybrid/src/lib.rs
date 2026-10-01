@@ -1,44 +1,15 @@
 //! # predictify-hybrid
-///
-/// Soroban smart contract for prediction markets.
-///
-/// ## Idempotency
-///
-/// `place_bets` accepts a caller-supplied `BytesN<32>` idempotency key.
-/// The key is stored in instance storage under
-/// `DataKey::PlaceBetsIdem(caller, key)` with a TTL of
-/// [`storage::IDEM_KEY_TTL_LEDGERS`] ledgers (~24 h).  Repeated
-/// submissions with the same `(caller, key)` pair are rejected with
-/// `Error::IdempotentBatchAlreadyApplied`.
-///
-/// ## Validation boundaries
-+///
-/// This crate defines the authoritative validation boundaries for the
-/// `place_bets` entry point. The boundaries are enforced in a fixed
-/// order so that rejection is deterministic regardless of the caller:
-///
-/// 1. Authorization — the caller must have authorized the
-///    invocation. This is checked first because it is the only
-///    security boundary that cannot be recovered from.
-/// 2. Batch shape — the batch must be non-empty and must not
-///    exceed [`MAX_BATCH_SIZE`]. This bounds work and prevents
-///    unrecoverable gas exhaustion.
-/// 3. Per-bet fields — each bet must carry a positive amount and a
-///    non-empty outcome.
-/// 4. Deduplication — the caller must not have already applied
-///    the same idempotency key.
-///
-/// ## Invariants
-+///
-/// - The idempotency record is written only after all validation
-///   passes, and is written before any state mutation so that a
-///   partial failure never leaves a batch half-applied.
-/// - Rejection order is fixed: auth → shape → fields → duplicate.
-///   Two invocations with the same inputs always produce the
-///   same result.
-/// - All rejections are expressed as a typed [`Error`] and never
-///   as a panic, except for the authorization check which is
-///   delegated to Soroban's `Address::require_auth`.
+//!
+//! Soroban smart contract for prediction markets.
+//!
+//! ## Idempotency
+//!
+//! `place_bets` accepts a caller-supplied `BytesN<32>` idempotency key.
+//! The key is stored in temporary storage under
+//! `DataKey::PlaceBetsIdem(caller, key)` with a TTL of
+//! [`storage::IDEM_KEY_TTL_LEDGERS`] ledgers (~24 h).  Repeated
+//! submissions with the same `(caller, key)` pair are rejected with
+//! `Error::IdempotentBatchAlreadyApplied`.
 
 #[no_std]
 
@@ -79,3 +50,6 @@ impl PredictifyHybrid {
         bets::place_bets(&env, caller, bets, idempotency_key)
     }
 }
+
+#[cfg(test)]
+mod batch_operations_tests;

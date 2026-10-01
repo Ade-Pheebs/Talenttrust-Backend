@@ -37,6 +37,16 @@ const mockedAuthenticateMiddleware = authenticateMiddleware as jest.MockedFuncti
   typeof authenticateMiddleware
 >;
 
+/**
+ * A canonical API key: 64 lowercase hex characters, exactly the shape
+ * `generateApiKey()` issues. The boundary rules in `apiKeyMiddleware`
+ * refuse anything else before it reaches `validateApiKey`, so fixtures that
+ * were previously accepted only because validation was mocked
+ * (`'valid-key-value'`, `'any-key'`) would now be rejected for a reason that
+ * has nothing to do with what each test is asserting.
+ */
+const VALID_KEY = '4f2b'.repeat(16);
+
 /** Builds a minimal API key info object for scope tests. */
 function mockApiKeyInfo(scope: string[]): ApiKeyInfo {
   return {
@@ -134,7 +144,7 @@ describe('authenticateApiKey', () => {
   it('populates req.apiKey and calls next for a valid key', async () => {
     const keyInfo = mockApiKeyInfo(['contracts:read']);
     mockedValidateApiKey.mockResolvedValue(keyInfo);
-    const req = mockReq({ 'x-api-key': 'valid-key-value' });
+    const req = mockReq({ 'x-api-key': VALID_KEY });
     const res = mockRes();
     const next = mockNext();
 
@@ -148,7 +158,7 @@ describe('authenticateApiKey', () => {
 
   it('returns 500 without leaking validation errors when validateApiKey throws', async () => {
     mockedValidateApiKey.mockRejectedValue(new Error('database connection lost'));
-    const req = mockReq({ 'x-api-key': 'any-key' });
+    const req = mockReq({ 'x-api-key': VALID_KEY });
     const res = mockRes();
     const next = mockNext();
     const consoleSpy = jest.spyOn(console, 'error').mockImplementation(() => {});
@@ -256,7 +266,7 @@ describe('authenticateEither', () => {
     const keyInfo = mockApiKeyInfo(['reputation:read']);
     mockedValidateApiKey.mockResolvedValue(keyInfo);
 
-    const req = mockReq({ 'x-api-key': 'service-key-abc' });
+    const req = mockReq({ 'x-api-key': VALID_KEY });
     const res = mockRes();
     const next = mockNext();
 
@@ -264,7 +274,7 @@ describe('authenticateEither', () => {
     await flushAsync();
 
     expect(mockedAuthenticateMiddleware).not.toHaveBeenCalled();
-    expect(mockedValidateApiKey).toHaveBeenCalledWith('service-key-abc');
+    expect(mockedValidateApiKey).toHaveBeenCalledWith(VALID_KEY);
     expect((req as ApiKeyAuthenticatedRequest).apiKey).toEqual(keyInfo);
     expect(next).toHaveBeenCalled();
   });

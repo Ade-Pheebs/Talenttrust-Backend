@@ -54,29 +54,27 @@ authentication mechanisms and a shared RBAC authorization layer.
 | API Key | `src/auth/apiKeyMiddleware.ts` | `X-API-Key: <key>` | Service-to-service, internal automation |
 | Legacy Bearer | `src/auth/authenticate.ts` | `Authorization: Bearer <base64>` | Demo/test only |
 
-> **⚠️ The legacy bearer path is not a security boundary.** Its tokens are
-> structurally validated but never signed and never expire, so anyone who can
-> base64-encode `{"userId":"x","role":"admin"}` can mint an administrator.
-> Production traffic is authenticated by `requireAuth`
-> (`src/middleware/authorization.ts`). The validation boundaries below exist to
-> make the legacy path's accepted input deterministic and to stop a malformed
-> header from being silently accepted as an alias for a valid credential — not
-> to make it trustworthy. Do not add new consumers.
->
-> **Accepted input** (`src/auth/authenticate.ts`):
+> **Accepted input** (`src/auth/apiKeyMiddleware.ts`):
 >
 > | Boundary | Rule |
 > |----------|------|
-> | Header grammar | Exactly `Bearer ` + one non-space credential, nothing after it. Comma-joined duplicates (RFC 7230 §3.2.2), CRLF, and extra whitespace are rejected |
-> | Encoding | Standard base64 (RFC 4648 §4, **not** base64url), length a multiple of 4, padding only as trailing `=`/`==`, and an exact decode/encode round-trip |
-> | Size | Credential ≤ `MAX_TOKEN_LENGTH` (4096) chars, checked before any decode |
-> | Payload | A JSON object (not array/number/string/null); `userId` and `role` read as own properties only |
-> | `userId` | 1–`MAX_USER_ID_LENGTH` (128) printable ASCII (`A-Za-z0-9._:@-`) — no whitespace or control characters |
-> | `role` | Member of `VALID_ROLES` |
+> | Header type | Exactly one `X-API-Key` header, delivered as a single string. A repeated header (array, or comma-joined per RFC 7230 §3.2.2) is refused, not cast |
+> | Credential shape | Exactly `MAX_API_KEY_LENGTH` (64) characters of `[0-9a-f]`. This is the length and alphabet `generateApiKey()` issues — it is the only key-generation path in the codebase. Uppercase is refused: the issuer never produces it and the lookup selector is case-sensitive, so a case-variant could never match |
+> | Size | Refused on length alone, before any hashing — a malformed header never reaches SHA-256 or the 10k-iteration PBKDF2 fallback |
+> | Whitespace | Never trimmed, and whitespace-only is reported separately as `key_blank` |
+> | Scope list | `req.apiKey.scope` must be a JSON array of strings; anything else denies with 403 rather than throwing |
+> | Scope grammar | A stored scope grants a `resource:action` requirement only if it is `*`, or splits on `:` into exactly two segments each equal to the requirement or to `*`. Three-segment scopes grant nothing |
+> | Route requirement | `requireApiKeyScope(resource, action)` throws `TypeError` at mount time unless both arguments are non-empty `[a-z-]` segments, so a misconfigured route fails at boot instead of widening access |
 >
-> Rejections are logged as `auth_legacy_bearer_rejected` with a stable `reason`
-> (see §3.1.1). The 401 response bodies are unchanged from before this change.
-
+> Refusals are logged as `auth_api_key_rejected` and scope denials as
+> `auth_api_key_scope_denied` (see §3.1.1). **Response bodies are unchanged**
+> from before this change: clients still see `Missing X-API-Key header`,
+> `Invalid API key`, or `Internal server error`. The client learns *that* the
+> credential was refused; the operator learns *why* from the log.
+>
+> `src/middleware/adminAuthGuard.ts` calls `validateApiKey` directly and does
+> **not** go through this module, so it does not get these boundaries. Treat
+> the two paths separately when triaging.
 
 **Key middleware entry points:**
 
@@ -191,33 +189,36 @@ fail closed on malformed data.
 | `authorization_deny_unresolved_resource` | `warn` | Resource not in `PERMISSION_MATRIX` — possible misconfigured route or unsanitised input |
 | `authorization_deny_unresolved_action` | `warn` | Action not in matrix |
 | `authorization_deny_unresolved_role` | `warn` | Role not in matrix for that resource+action cell |
-| `auth_legacy_bearer_rejected` | `debug` / `warn` | Legacy bearer path refused a credential. Carries a stable `reason` (see §3.1.1) and `path`; never the credential itself. `warn` reasons indicate a structurally valid credential whose claims were refused — treat a spike as a forgery attempt |
+| `auth_api_key_rejected` | `debug` / `warn` | API key path refused a credential. Carries a stable `reason` (see §3.1.1) and `path`; never the credential. `warn` reasons indicate a forgery attempt rather than a missing or misconfigured key |
+| `auth_api_key_scope_denied` | `warn` | An authenticated key lacked the required `resource:action`, or its stored `scope` is unreadable. Carries `reason` (`scope_mismatch` / `scope_unreadable`) and `required`; never key material |
 | `"invalid token"` / `"Token has expired"` | `warn` | Expected on expiry; spikes indicate clock-skew or widespread expired sessions |
 | `"Invalid or expired JWT token."` | (response) | JWT rejected by `adminAuthGuard` |
-| `"API key validation error:"` | `error` (console) | `validateApiKey` threw — database error or crypto failure |
+| `"API key validation error:"` | `error` (console) | `validateApiKey` threw — database error or crypto failure. Unchanged by #1391, so the §5.2 alert still matches |
 | `isAuthorized denied:` | `info` (console) | Permission denied with structured context |
 
-#### 3.1.1 `auth_legacy_bearer_rejected` reason codes
+#### 3.1.1 `auth_api_key_rejected` reason codes
 
-Emitted only by the legacy `src/auth/authenticate.ts` path. Grouped by severity:
+Emitted by `src/auth/apiKeyMiddleware.ts` for every refused credential. The
+credential itself is never logged.
 
 | Reason | Level | Meaning |
 |--------|-------|---------|
-| `missing_header` | `debug` | No `Authorization` header |
-| `malformed_header` | `debug` | Scheme not `Bearer `, extra/missing space, comma-joined duplicate credential, or a non-string header |
-| `empty_token` | `debug` | `Bearer ` with no credential |
-| `token_too_long` | `debug` | Credential exceeds `MAX_TOKEN_LENGTH` (4096) — refused on length alone, before any decode |
-| `token_not_object` | `warn` | Decoded JSON was an array, number, string, or `null` |
-| `user_id_invalid` | `warn` | `userId` empty, non-string, over `MAX_USER_ID_LENGTH` (128), or containing whitespace/control characters (CR, LF, NUL, ESC) |
-| `role_invalid` | `warn` | `role` present but outside `VALID_ROLES` |
+| `missing_header` | `debug` | No `X-API-Key` header |
+| `key_empty` | `debug` | `X-API-Key` present but empty |
+| `key_blank` | `debug` | `X-API-Key` is whitespace only — a misconfigured client (empty env var, stray space in a config file). Correlate with deploys before treating it as an attack |
+| `header_not_string` | `warn` | Header arrived as something other than a single string (e.g. a repeated `X-API-Key`). Now a 401; previously reached `crypto` and produced a 500 |
+| `key_too_long` | `warn` | Longer than `MAX_API_KEY_LENGTH` (64). Refused on length alone, before any hashing — no PBKDF2 is performed |
+| `key_not_canonical` | `warn` | Not exactly 64 lowercase hex characters. Covers whitespace padding, CR/LF, non-ASCII, and **uppercase** — a key has exactly one accepted spelling, so a case-variant is rejected here rather than silently failing the hash comparison |
+| `key_rejected` | `warn` | Well-formed key that did not authenticate: unknown, wrong, expired, deactivated, or a malformed stored hash |
 
-`token_not_base64` (non-alphabet characters, bad length, bad padding) and
-`token_not_json` (decoded bytes are not JSON) are `warn`-level only when the
-value was structurally sound enough to decode; otherwise `debug`.
+A sustained `key_rejected` rate from a single `path` is the brute-force
+signal. A spike in `key_not_canonical` is usually a client that has
+whitespace or a `Bearer ` prefix baked into its key config.
 
-A sustained `role_invalid` or `user_id_invalid` rate from a single `path` is
-worth investigating — it means well-formed credentials carrying claims this
-service refuses.
+Note that `key_too_long`, `key_not_canonical`, and `key_rejected` return
+**faster** than a well-formed key, because the refusal happens before
+PBKDF2. That is not a usable oracle — it reveals only whether the caller's
+own input was well-formed, and nothing about any stored key.
 
 ### 3.2 HTTP response codes
 
@@ -335,6 +336,24 @@ curl -H "X-API-Key: <key>" http://localhost:3001/api/v1/contracts
 ```
 
 **Root causes:**
+
+0. **The credential never reached the key store** (new in #1391 — check
+   first, it is now decided before any database access, and the `reason` in
+   the `auth_api_key_rejected` log record names it exactly):
+   - `key_not_canonical` — the value is not exactly 64 lowercase hex
+     characters. Almost always a client bug: a `Bearer ` prefix, surrounding
+     quotes, a trailing `\n` from a `$(cat key.txt)`, or a shell that
+     uppercased the key. Verify with
+     `printf '%s' "$KEY" | wc -c` (expect `64`) and
+     `printf '%s' "$KEY" | grep -qE '^[0-9a-f]{64}$' && echo ok`.
+   - `key_too_long` — longer than 64 characters; a repeated header arrives
+     comma-joined, so two `X-API-Key` values on one request looks like this.
+   - `key_blank` — whitespace only. Check the env var or secret mount the
+     client reads the key from.
+   - `header_not_string` — the request carried more than one `X-API-Key`
+     header, or a proxy rewrote it. Inspect the raw request at the edge.
+   - Only if the reason is `key_rejected` is the key itself at fault — see
+     the causes below.
 
 1. **Key was rotated or deactivated.**
    - Check `SELECT id, name, is_active, expires_at, last_used_at FROM api_keys WHERE id = '<key-id>';`
@@ -771,6 +790,9 @@ src/auth/
   apiKeys.ts            — API key gen, hash, verify, rotate, deactivate
   apiKeyMiddleware.ts   — API key auth middleware + scope enforcement
   apiKeyMiddleware.test.ts — Tests for API key middleware
+  apiKeyMiddleware.validation-boundaries.test.ts
+                         — Accepted / rejected / duplicate / boundary /
+                           regression tests for the API key path (issue #1391)
   index.ts              — Re-exports
 
 src/middleware/

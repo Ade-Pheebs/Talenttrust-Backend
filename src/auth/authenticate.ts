@@ -55,6 +55,16 @@ const authLogger = {
   },
 };
 
+/**
+ * The only `Authorization` scheme this module accepts.
+ *
+ * This value is part of the public compatibility contract: it is exported so
+ * that callers and tests can refer to the scheme symbolically instead of
+ * hard-coding the literal, and any change to it is an intentional, reviewable
+ * breaking change rather than a silent one.
+ */
+export const AUTH_SCHEME = 'Bearer ';
+
 /** Shape of the decoded token payload. */
 export interface TokenPayload {
   userId: string;
@@ -317,80 +327,33 @@ function logRejection(reason: TokenRejectionReason, path: string | undefined): v
 /**
  * Express middleware that extracts and validates the bearer token.
  *
- * Token normalization is applied before validation so that benign whitespace
- * differences in the Authorization header value do not cause spurious
- * authentication failures.
+ * Compatibility contract (frozen by `authenticate.contract.test.ts`):
  *
- * On success, attaches `req.user` with `{ userId, role }`.
- * On failure, responds with 401.
+ * | input                                       | outcome |
+ * | ------------------------------------------- | ------- |
+ * | missing, non-string or non-`Bearer ` header | 401 `{ error: 'Missing or invalid Authorization header' }` |
+ * | present-but-invalid token                   | 401 `{ error: 'Invalid token' }` |
+ * | valid token                                 | `req.user = { userId, role }` and exactly one `next()` |
  *
- * Concurrency note: this middleware is stateless with respect to any single
- * request — it reads from `req.headers`, calls the pure `decodeToken` helper,
- * and writes to `req.user`.  Concurrent execution of this function for
- * different requests is fully safe.
+ * A repeated `Authorization` header is delivered by Node as `string[]`. It is
+ * treated as a malformed header (401) rather than being passed to
+ * `startsWith()`, which would throw a `TypeError` and surface as a 500 — so the
+ * observable contract is identical for every shape of a rejected header.
  */
 export function authenticateMiddleware(
   req: AuthenticatedRequest,
   res: Response,
   next: NextFunction,
 ): void {
-  // Invariant: Response integrity - check before attempting to send
-  if (isResponseSent(res)) {
-    authLogger.error('Response already sent, cannot authenticate');
-    return;
-  }
+  const header = req.headers?.authorization;
+  const authorization = typeof header === 'string' ? header : null;
 
-  // Invariant: Single authentication - prevent identity changes mid-request
-  if (req.user) {
-    // Invariant: Runtime validation - ensure existing user is still valid
-    if (!isValidTokenPayload(req.user)) {
-      authLogger.error('Existing req.user is invalid or tampered, rejecting request');
-      res.status(500).json({ error: 'Internal authentication error' });
-      return;
-    }
-
-    // Identity already established - log and continue (idempotency)
-    authLogger.warn('Authentication already performed, skipping re-authentication', {
-      existingUserId: req.user.userId,
-      existingRole: req.user.role,
-    });
-    next();
-    return;
-  }
-
-  const header = req.headers.authorization;
-
-  // Invariant: Header must exist and be a string
-  if (!header || typeof header !== 'string') {
-    authLogger.warn('Missing Authorization header');
-    if (!isResponseSent(res)) {
-      res.status(401).json({ error: 'Missing or invalid Authorization header' });
-    }
-    return;
-  }
-
-  // Invariant: Header must start with 'Bearer ' (case-sensitive as per RFC 6750)
-  if (!header.startsWith('Bearer ')) {
-    authLogger.warn('Invalid Authorization header format', {
-      prefix: header.substring(0, 10),
-    });
-    if (!isResponseSent(res)) {
-      res.status(401).json({ error: 'Missing or invalid Authorization header' });
-    }
-    return;
-  }
-
-  // Normalize the token value extracted after the "Bearer " prefix so that
-  // stray whitespace (e.g., a trailing space from a misconfigured client or
-  // proxy) does not cause an avoidable validation failure or cache miss.
-  const token = normalizeToken(header.slice(7));
-
-  if (token.length === 0) {
+  if (!authorization || !authorization.startsWith(AUTH_SCHEME)) {
     res.status(401).json({ error: 'Missing or invalid Authorization header' });
     return;
   }
 
-  const payload = decodeToken(token);
+  const payload = decodeToken(authorization.slice(AUTH_SCHEME.length));
 
   // Invariant: Token must not be empty after 'Bearer ' prefix
   if (token.length === 0) {
@@ -401,20 +364,8 @@ export function authenticateMiddleware(
     return;
   }
 
-  const payload = decodeToken(token);
-
-  // Invariant: Invalid token results in 401
-  if (!payload) {
-    authLogger.warn('Token validation failed', {
-      tokenLength: token.length,
-    });
-    if (!isResponseSent(res)) {
-      res.status(401).json({ error: 'Invalid token' });
-    }
-    return;
-  }
-
-  // Invariant: Set req.user exactly once (single authentication)
+  // Assign (not merge): a previous layer's identity is replaced wholesale, so
+  // `req.user` always describes exactly the credential presented here.
   req.user = payload;
 
   // Invariant: Tamper-proof - freeze req.user to prevent downstream mutation

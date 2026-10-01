@@ -18,6 +18,7 @@ export enum JobType {
   REPUTATION_RECOMPUTE = 'reputation-recompute',
   BLOCKCHAIN_SYNC = 'blockchain-sync',
   MILESTONE_DIVERGENCE_SCAN = 'milestone-divergence-scan',
+  RAW_EVENT_RETENTION = 'raw-event-retention',
 }
 
 /**
@@ -77,7 +78,7 @@ export interface BlockchainSyncPayload {
   requestId?: string;
 }
 
-export type { RawEventRetentionJobPayload };
+export type { RawEventRetentionJobPayload } from '../events/rawEventRetention.types';
 
 /**
  * Milestone divergence scan job payload.

@@ -370,7 +370,7 @@ export class AuditService {
       
       return entry;
     } catch (err) {
-      console.error('[AuditService] Failed to persist audit entry:', err);
+      log.error('[AuditService] Failed to persist audit entry', { err: err as Error });
       throw err;
     }
   }

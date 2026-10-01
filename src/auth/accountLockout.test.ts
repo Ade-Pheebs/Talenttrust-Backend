@@ -530,6 +530,142 @@ describe('AccountLockoutTracker — audit sink resilience', () => {
     expect(() => tracker.recordSuccess('a@example.com')).not.toThrow();
     consoleSpy.mockRestore();
   });
+
+  it('recovers state transitions even when audit sink throws on every emit', () => {
+    const { tracker } = makeTracker(FAST_CONFIG, { audit: 'throwing' });
+    const consoleSpy = jest.spyOn(console, 'error').mockImplementation(() => {});
+
+    // Trigger lockout — audit throws, but state must still lock.
+    for (let i = 0; i < 5; i += 1) {
+      tracker.recordFailure('a@example.com');
+    }
+    expect(tracker.assess('a@example.com').isLocked).toBe(true);
+    expect(tracker.assess('a@example.com').failures).toBe(5);
+
+    // Release — audit throws, but state must still clear.
+    const release = tracker.recordSuccess('a@example.com');
+    expect(release.releasedLockout).toBe(true);
+    expect(release.previousFailures).toBe(5);
+    expect(tracker.size).toBe(0);
+    expect(tracker.assess('a@example.com').failures).toBe(0);
+
+    consoleSpy.mockRestore();
+  });
+
+  it('retry after audit failure produces identical state as successful audit', () => {
+    const consoleSpy = jest.spyOn(console, 'error').mockImplementation(() => {});
+    const throwing = makeTracker(FAST_CONFIG, { audit: 'throwing' });
+    const healthy = makeTracker(FAST_CONFIG, { audit: 'mock' });
+
+    for (let i = 0; i < 5; i += 1) {
+      throwing.tracker.recordFailure('a@example.com');
+      healthy.tracker.recordFailure('a@example.com');
+    }
+
+    expect(throwing.tracker.assess('a@example.com')).toEqual(
+      healthy.tracker.assess('a@example.com'),
+    );
+
+    const tRelease = throwing.tracker.recordSuccess('a@example.com');
+    const hRelease = healthy.tracker.recordSuccess('a@example.com');
+    expect(tRelease.releasedLockout).toBe(hRelease.releasedLockout);
+    expect(tRelease.previousFailures).toBe(hRelease.previousFailures);
+    expect(throwing.tracker.size).toBe(healthy.tracker.size);
+
+    consoleSpy.mockRestore();
+  });
+});
+
+describe('AccountLockoutTracker — determinism & concurrency safety', () => {
+  it('produces identical results for identical input sequences', () => {
+    const run = () => {
+      const { tracker, auditCalls } = makeTracker();
+      const results: Array<ReturnType<typeof tracker.recordFailure>> = [];
+      for (let i = 0; i < 7; i += 1) {
+        results.push(tracker.recordFailure('a@example.com'));
+      }
+      const success = tracker.recordSuccess('a@example.com');
+      return { results, success, auditCount: auditCalls.length };
+    };
+
+    const first = run();
+    const second = run();
+    expect(first.results).toEqual(second.results);
+    expect(first.success).toEqual(second.success);
+    expect(first.auditCount).toBe(second.auditCount);
+  });
+
+  it('interleaved failures for distinct identities do not cross-contaminate', () => {
+    const { tracker } = makeTracker();
+    tracker.recordFailure('a@example.com');
+    tracker.recordFailure('b@example.com');
+    tracker.recordFailure('a@example.com');
+    tracker.recordFailure('b@example.com');
+    tracker.recordFailure('a@example.com');
+
+    expect(tracker.assess('a@example.com').failures).toBe(3);
+    expect(tracker.assess('b@example.com').failures).toBe(2);
+    expect(tracker.size).toBe(2);
+  });
+
+  it('re-entrant assess during recordFailure does not mutate state', () => {
+    const { tracker } = makeTracker();
+    tracker.recordFailure('a@example.com');
+    const before = tracker.assess('a@example.com');
+    // Multiple read-only assessments must not change anything.
+    tracker.assess('a@example.com');
+    tracker.assess('a@example.com');
+    const after = tracker.assess('a@example.com');
+    expect(after).toEqual(before);
+    expect(tracker.size).toBe(1);
+  });
+
+  it('sweep is idempotent — repeated sweeps return 0 after first removal', () => {
+    const { tracker, advance } = makeTracker();
+    tracker.recordFailure('a@example.com');
+    advance(FAST_CONFIG.decayWindowMs + 1);
+    expect(tracker.sweep()).toBe(1);
+    expect(tracker.sweep()).toBe(0);
+    expect(tracker.sweep()).toBe(0);
+    expect(tracker.size).toBe(0);
+  });
+});
+
+describe('AccountLockoutTracker — boundary conditions', () => {
+  it('does not trigger at exactly threshold - 1 failures', () => {
+    const { tracker, auditCalls } = makeTracker();
+    for (let i = 0; i < FAST_CONFIG.maxFailures - 1; i += 1) {
+      const r = tracker.recordFailure('a@example.com');
+      expect(r.triggeredLockout).toBe(false);
+      expect(r.isNowLocked).toBe(false);
+    }
+    expect(auditCalls.filter((c) => c.action === 'AUTH_LOCKOUT_TRIGGERED')).toHaveLength(0);
+  });
+
+  it('keeps the record alive at exactly the decay window boundary', () => {
+    const { tracker, advance } = makeTracker();
+    tracker.recordFailure('a@example.com');
+    advance(FAST_CONFIG.decayWindowMs);
+    // At exactly the boundary the record is still present (not yet expired).
+    expect(tracker.size).toBe(1);
+  });
+
+  it('expires the record one millisecond past the decay window', () => {
+    const { tracker, advance } = makeTracker();
+    tracker.recordFailure('a@example.com');
+    advance(FAST_CONFIG.decayWindowMs + 1);
+    expect(tracker.assess('a@example.com').failures).toBe(0);
+  });
+
+  it('keeps the lockout active at exactly the lockout duration boundary', () => {
+    const { tracker, advance } = makeTracker();
+    for (let i = 0; i < FAST_CONFIG.maxFailures; i += 1) {
+      tracker.recordFailure('a@example.com');
+    }
+    advance(FAST_CONFIG.lockoutDurationMs);
+    // At exactly the boundary the lockout is still considered active.
+    expect(tracker.assess('a@example.com').isLocked).toBe(true);
+  });
 });
 
 describe('AccountLockoutTracker — tiny config quick smoke', () => {

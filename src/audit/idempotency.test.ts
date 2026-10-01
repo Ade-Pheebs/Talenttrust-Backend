@@ -74,13 +74,16 @@ describe('IdempotencyStore', () => {
       expect(store.get('key-2')!.response.actor).toBe('bob');
     });
 
-    it('overwrites an existing key on re-set', () => {
+    it('rejects conflicting reuse and permits replacement after explicit deletion', () => {
       const input1 = makeInput({ actor: 'alice' });
       const input2 = makeInput({ actor: 'bob' });
       const entry1 = makeEntry('entry-1', input1);
       const entry2 = makeEntry('entry-2', input2);
 
       store.set('key-1', input1, entry1);
+      expect(() => store.set('key-1', input2, entry2)).toThrow('already bound');
+      expect(store.get('key-1')!.response.actor).toBe('alice');
+      store.delete('key-1');
       store.set('key-1', input2, entry2);
 
       expect(store.get('key-1')!.response.actor).toBe('bob');

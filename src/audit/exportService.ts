@@ -379,49 +379,52 @@ export class AuditExportService {
     const exportDir = await fsp.mkdtemp(path.join(this.exportRoot, 'audit-export-'));
     this.assertPathWithinRoot(exportDir);
 
-    const fileName = `audit-log-${new Date().toISOString().replace(/[:.]/g, '-')}-${randomUUID()}.ndjson`;
-    const filePath = path.join(exportDir, fileName);
-    this.assertPathWithinRoot(filePath);
-
     const cleanup = async (): Promise<void> => {
       await fsp.rm(exportDir, { recursive: true, force: true }).catch(() => {});
     };
 
-    const { recordCount, bytesWritten } = await this.runWithRetry(
-      'ndjson',
-      filePath,
-      async () => {
-        const writer = createWriteStream(filePath, { encoding: 'utf8', flags: 'wx' });
-        let count = 0;
+    try {
+      const fileName = `audit-log-${new Date().toISOString().replace(/[:.]/g, '-')}.ndjson`;
+      const filePath = path.join(exportDir, fileName);
+      this.assertPathWithinRoot(filePath);
 
-        const query: AuditQuery = { ...filters };
-        const cursor = this.service.stream(query);
+      let recordCount = 0;
 
-        async function* generateLines(): AsyncGenerator<string> {
-          for (const entry of cursor) {
-            const redacted = redactBody(entry as unknown as Record<string, unknown>) as AuditEntry;
-            count += 1;
-            yield `${JSON.stringify(redacted)}\n`;
-          }
+      const query: AuditQuery = { ...filters };
+      const cursor = this.service.stream(query);
+      // Acquire the iterator before opening a writer so synchronous repository
+      // failure cannot leave an unmanaged stream behind. Pipeline closes streams
+      // on iteration/write failure before the catch removes the partial artifact.
+      const writer = createWriteStream(filePath, { encoding: 'utf8', flags: 'wx' });
+
+      async function* generateLines(): AsyncGenerator<string> {
+        for (const entry of cursor) {
+          const redacted = redactBody(entry as unknown as Record<string, unknown>) as AuditEntry;
+          recordCount += 1;
+          yield `${JSON.stringify(redacted)}\n`;
         }
+      }
 
-        const source = Readable.from(generateLines());
-        await pipeline(source, writer);
-        return { recordCount: count, bytesWritten: writer.bytesWritten };
-      },
-      cleanup,
-    );
+      const source = Readable.from(generateLines());
+      await pipeline(source, writer);
 
-    return {
-      filePath,
-      fileName,
-      bytesWritten,
-      recordCount,
-      openReadStream: () => createReadStream(filePath),
-      cleanup,
-      committed: true,
-    };
-    });
+      return {
+        filePath,
+        fileName,
+        bytesWritten: writer.bytesWritten,
+        recordCount,
+        openReadStream: () => createReadStream(filePath),
+        cleanup,
+      };
+    } catch (error) {
+      try {
+        await cleanup();
+      } catch {
+        // Do not expose file paths or replace the original generation error.
+        try { console.error('[AuditExportService] Failed to clean up incomplete NDJSON export'); } catch { /* Preserve the original error. */ }
+      }
+      throw error;
+    }
   }
 
   // ─── CSV export ────────────────────────────────────────────────────────────

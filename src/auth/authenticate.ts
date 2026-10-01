@@ -1,11 +1,8 @@
 /**
  * @module authenticate
- * @description Authentication middleware and helpers for TalentTrust.
+ * @description Legacy bearer-token authentication middleware for TalentTrust.
  *
- * Uses a simple Bearer-token scheme backed by a shared secret (for demo /
- * test purposes). In production this would be replaced with JWT / OAuth2.
- *
- * Tokens are expected in the `Authorization` header:
+ * Tokens are supplied in the `Authorization` header:
  *   Authorization: Bearer <token>
  *
  * The token payload is a base64-encoded JSON string:
@@ -31,6 +28,7 @@
 
 import { Request, Response, NextFunction } from 'express';
 import { Role, VALID_ROLES } from './roles';
+import { logger } from '../logger';
 
 /**
  * Logger for authentication events.
@@ -111,7 +109,8 @@ function isResponseSent(res: Response): boolean {
  *   - Deterministic: same input always produces same output
  *
  * @param token - The raw base64-encoded token.
- * @returns The decoded payload, or `null` if invalid.
+ * @returns The decoded payload, or `null` if invalid. Never throws; see
+ *   {@link validateToken} for the specific reason.
  */
 export function decodeToken(token: string): TokenPayload | null {
   // Invariant: Empty or whitespace-only tokens are invalid
@@ -169,6 +168,7 @@ export function decodeToken(token: string): TokenPayload | null {
  * @param userId - User identifier.
  * @param role   - Role to encode.
  * @returns Base64-encoded token string.
+ * @throws {TypeError} If `userId` or `role` falls outside the accepted set.
  */
 export function createToken(userId: string, role: Role): string {
   // Invariant: Validate inputs before encoding
@@ -180,6 +180,21 @@ export function createToken(userId: string, role: Role): string {
   }
   
   return Buffer.from(JSON.stringify({ userId: userId.trim(), role })).toString('base64');
+}
+
+/**
+ * Report a refusal through the structured logger.
+ *
+ * The record carries the reason and the path being protected, never the
+ * credential or any part of it. `suspicious` refusals are raised to `warn` so
+ * a forged claim is visible without turning routine 401 noise into warnings.
+ */
+function logRejection(reason: TokenRejectionReason, path: string | undefined): void {
+  const level = SUSPICIOUS_REASONS.has(reason) ? 'warn' : 'debug';
+  logger[level]('auth_legacy_bearer_rejected', {
+    reason,
+    path: path ?? 'unknown',
+  });
 }
 
 /**

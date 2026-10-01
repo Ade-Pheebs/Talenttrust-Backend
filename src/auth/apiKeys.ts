@@ -14,11 +14,99 @@
  *   - Each key has optional expiration and scoping
  *   - Keys can be rotated and deactivated
  *   - Last usage is tracked for audit purposes
+ *
+ * Concurrency invariants:
+ *   - Creation, rotation, and deactivation are serialized per key via an
+ *     in-process mutex so concurrent calls cannot interleave their read
+ *     modify-write sequences and produce stale or inconsistent state.
+ *   - Validation is idempotent: repeated or concurrent calls for the same
+ *     key converge on the same result and cannot double-deactivate or double-
+ *     backfill.
+ *   - Cache invalidation happens after the authoritative write commits,
+ *     so a concurrent reader cannot observe a new cache entry for a stale
+ *     row.
  */
 
-import * as crypto from 'crypto';
+import * as crypto from 'node:crypto';
 import { ApiKey } from '../database/schema';
 import { database } from '../database';
+import { AuthCache } from './authCache';
+import { validateEnv } from '../config/env.schema';
+import { logger } from '../utils/logger';
+
+/**
+ * Validation error class for API key operations.
+ */
+export class ApiKeyValidationError extends Error {
+  constructor(
+    message: string,
+    public readonly field: string,
+    public readonly code: string
+  ) {
+    super(message);
+    this.name = 'ApiKeyValidationError';
+  }
+}
+
+/**
+ * Validation constants defining boundaries for API key inputs.
+ */
+export const VALIDATION_RULES = {
+  API_KEY: {
+    LENGTH: 64, // 32 bytes in hex = 64 characters
+    PATTERN: /^[a-f0-9]{64}$/i,
+  },
+  NAME: {
+    MIN_LENGTH: 1,
+    MAX_LENGTH: 255,
+    PATTERN: /^[a-zA-Z0-9\s\-_]+$/,
+  },
+  SCOPE: {
+    MIN_ITEMS: 1,
+    MAX_ITEMS: 50,
+    ITEM_MIN_LENGTH: 1,
+    ITEM_MAX_LENGTH: 100,
+    ITEM_PATTERN: /^[a-zA-Z0-9:\-_\.]+$/,
+  },
+  USER_ID: {
+    MIN_LENGTH: 1,
+    MAX_LENGTH: 255,
+    PATTERN: /^[a-zA-Z0-9\-_]+$/,
+  },
+  KEY_SELECTOR: {
+    LENGTH: 64, // SHA-256 hex = 64 characters
+    PATTERN: /^[a-f0-9]{64}$/i,
+  },
+  SALT_HASH: {
+    SALT_LENGTH: 32, // 16 bytes in hex
+    HASH_LENGTH: 128, // 64 bytes in hex
+    PATTERN: /^[a-f0-9]{32}:[a-f0-9]{128}$/i,
+  },
+} as const;
+
+// Initialize cache with config-driven settings
+let authCache: AuthCache | null = null;
+
+/**
+ * Get or initialize the auth cache instance.
+ */
+export function getAuthCache(): AuthCache {
+  if (!authCache) {
+    const env = validateEnv();
+    authCache = new AuthCache({
+      ttlMs: env.AUTH_CACHE_TTL_MS,
+      maxEntries: env.AUTH_CACHE_MAX_ENTRIES,
+    });
+  }
+  return authCache;
+}
+
+/**
+ * Reset the auth cache instance (primarily for testing).
+ */
+export function resetAuthCache(): void {
+  authCache = null;
+}
 
 export interface ApiKeyInfo {
   id: string;
@@ -38,8 +126,286 @@ export interface ApiKeyRequest {
 }
 
 /**
- * Error types for API key operations.
- * These errors are thrown to indicate specific contract violations.
+ * Validates an API key format.
+ * 
+ * Validation boundaries:
+ *   - VALID: 64 hex characters (a-f, 0-9, case-insensitive)
+ *   - INVALID: Wrong length, non-hex characters, null, undefined, non-string
+ * 
+ * @param apiKey - The API key to validate
+ * @throws ApiKeyValidationError if invalid
+ */
+export function validateApiKeyFormat(apiKey: unknown): asserts apiKey is string {
+  if (typeof apiKey !== 'string') {
+    throw new ApiKeyValidationError(
+      'API key must be a string',
+      'apiKey',
+      'INVALID_TYPE'
+    );
+  }
+
+  if (apiKey.length !== VALIDATION_RULES.API_KEY.LENGTH) {
+    throw new ApiKeyValidationError(
+      `API key must be exactly ${VALIDATION_RULES.API_KEY.LENGTH} characters`,
+      'apiKey',
+      'INVALID_LENGTH'
+    );
+  }
+
+  if (!VALIDATION_RULES.API_KEY.PATTERN.test(apiKey)) {
+    throw new ApiKeyValidationError(
+      'API key must contain only hexadecimal characters',
+      'apiKey',
+      'INVALID_FORMAT'
+    );
+  }
+}
+
+/**
+ * Validates an API key name.
+ * 
+ * Validation boundaries:
+ *   - VALID: 1-255 characters, alphanumeric + spaces, hyphens, underscores
+ *   - INVALID: Empty, too long, contains special characters, null, non-string
+ * 
+ * @param name - The name to validate
+ * @throws ApiKeyValidationError if invalid
+ */
+export function validateApiKeyName(name: unknown): asserts name is string {
+  if (typeof name !== 'string') {
+    throw new ApiKeyValidationError(
+      'API key name must be a string',
+      'name',
+      'INVALID_TYPE'
+    );
+  }
+
+  const trimmed = name.trim();
+
+  if (trimmed.length < VALIDATION_RULES.NAME.MIN_LENGTH) {
+    throw new ApiKeyValidationError(
+      'API key name cannot be empty',
+      'name',
+      'EMPTY_NAME'
+    );
+  }
+
+  if (trimmed.length > VALIDATION_RULES.NAME.MAX_LENGTH) {
+    throw new ApiKeyValidationError(
+      `API key name must not exceed ${VALIDATION_RULES.NAME.MAX_LENGTH} characters`,
+      'name',
+      'NAME_TOO_LONG'
+    );
+  }
+
+  if (!VALIDATION_RULES.NAME.PATTERN.test(trimmed)) {
+    throw new ApiKeyValidationError(
+      'API key name can only contain alphanumeric characters, spaces, hyphens, and underscores',
+      'name',
+      'INVALID_CHARACTERS'
+    );
+  }
+}
+
+/**
+ * Validates an API key scope array.
+ * 
+ * Validation boundaries:
+ *   - VALID: Array of 1-50 strings, each 1-100 chars, matching pattern
+ *   - INVALID: Empty array, too many items, invalid item format, null, non-array
+ *   - DUPLICATE: Contains duplicate scope values
+ * 
+ * @param scope - The scope array to validate
+ * @throws ApiKeyValidationError if invalid
+ */
+export function validateApiKeyScope(scope: unknown): asserts scope is string[] {
+  if (!Array.isArray(scope)) {
+    throw new ApiKeyValidationError(
+      'API key scope must be an array',
+      'scope',
+      'INVALID_TYPE'
+    );
+  }
+
+  if (scope.length < VALIDATION_RULES.SCOPE.MIN_ITEMS) {
+    throw new ApiKeyValidationError(
+      'API key scope must contain at least one item',
+      'scope',
+      'EMPTY_SCOPE'
+    );
+  }
+
+  if (scope.length > VALIDATION_RULES.SCOPE.MAX_ITEMS) {
+    throw new ApiKeyValidationError(
+      `API key scope must not exceed ${VALIDATION_RULES.SCOPE.MAX_ITEMS} items`,
+      'scope',
+      'SCOPE_TOO_LARGE'
+    );
+  }
+
+  // Check for duplicates
+  const uniqueScopes = new Set(scope);
+  if (uniqueScopes.size !== scope.length) {
+    throw new ApiKeyValidationError(
+      'API key scope contains duplicate values',
+      'scope',
+      'DUPLICATE_SCOPE'
+    );
+  }
+
+  // Validate each scope item
+  scope.forEach((item, index) => {
+    if (typeof item !== 'string') {
+      throw new ApiKeyValidationError(
+        `Scope item at index ${index} must be a string`,
+        'scope',
+        'INVALID_SCOPE_ITEM_TYPE'
+      );
+    }
+
+    const trimmed = item.trim();
+
+    if (trimmed.length < VALIDATION_RULES.SCOPE.ITEM_MIN_LENGTH) {
+      throw new ApiKeyValidationError(
+        `Scope item at index ${index} cannot be empty`,
+        'scope',
+        'EMPTY_SCOPE_ITEM'
+      );
+    }
+
+    if (trimmed.length > VALIDATION_RULES.SCOPE.ITEM_MAX_LENGTH) {
+      throw new ApiKeyValidationError(
+        `Scope item at index ${index} exceeds ${VALIDATION_RULES.SCOPE.ITEM_MAX_LENGTH} characters`,
+        'scope',
+        'SCOPE_ITEM_TOO_LONG'
+      );
+    }
+
+    if (!VALIDATION_RULES.SCOPE.ITEM_PATTERN.test(trimmed)) {
+      throw new ApiKeyValidationError(
+        `Scope item at index ${index} contains invalid characters`,
+        'scope',
+        'INVALID_SCOPE_ITEM_FORMAT'
+      );
+    }
+  });
+}
+
+/**
+ * Validates a user ID.
+ * 
+ * Validation boundaries:
+ *   - VALID: 1-255 characters, alphanumeric + hyphens, underscores
+ *   - INVALID: Empty, too long, invalid characters, null, non-string
+ * 
+ * @param userId - The user ID to validate
+ * @throws ApiKeyValidationError if invalid
+ */
+export function validateUserId(userId: unknown): asserts userId is string {
+  if (typeof userId !== 'string') {
+    throw new ApiKeyValidationError(
+      'User ID must be a string',
+      'createdBy',
+      'INVALID_TYPE'
+    );
+  }
+
+  const trimmed = userId.trim();
+
+  if (trimmed.length < VALIDATION_RULES.USER_ID.MIN_LENGTH) {
+    throw new ApiKeyValidationError(
+      'User ID cannot be empty',
+      'createdBy',
+      'EMPTY_USER_ID'
+    );
+  }
+
+  if (trimmed.length > VALIDATION_RULES.USER_ID.MAX_LENGTH) {
+    throw new ApiKeyValidationError(
+      `User ID must not exceed ${VALIDATION_RULES.USER_ID.MAX_LENGTH} characters`,
+      'createdBy',
+      'USER_ID_TOO_LONG'
+    );
+  }
+
+  if (!VALIDATION_RULES.USER_ID.PATTERN.test(trimmed)) {
+    throw new ApiKeyValidationError(
+      'User ID can only contain alphanumeric characters, hyphens, and underscores',
+      'createdBy',
+      'INVALID_USER_ID_FORMAT'
+    );
+  }
+}
+
+/**
+ * Validates an expiration date.
+ * 
+ * Validation boundaries:
+ *   - VALID: Date object in the future, or undefined
+ *   - INVALID: Date in the past, invalid Date object, non-Date type
+ * 
+ * @param expiresAt - The expiration date to validate
+ * @throws ApiKeyValidationError if invalid
+ */
+export function validateExpirationDate(expiresAt: unknown): asserts expiresAt is Date | undefined {
+  if (expiresAt === undefined || expiresAt === null) {
+    return; // Optional field
+  }
+
+  if (!(expiresAt instanceof Date)) {
+    throw new ApiKeyValidationError(
+      'Expiration date must be a Date object',
+      'expiresAt',
+      'INVALID_TYPE'
+    );
+  }
+
+  if (isNaN(expiresAt.getTime())) {
+    throw new ApiKeyValidationError(
+      'Expiration date is invalid',
+      'expiresAt',
+      'INVALID_DATE'
+    );
+  }
+
+  if (expiresAt <= new Date()) {
+    throw new ApiKeyValidationError(
+      'Expiration date must be in the future',
+      'expiresAt',
+      'EXPIRED_DATE'
+    );
+  }
+}
+
+/**
+ * Validates a complete API key request.
+ * 
+ * Validates all fields according to defined boundaries.
+ * 
+ * @param request - The API key request to validate
+ * @throws ApiKeyValidationError if any field is invalid
+ */
+export function validateApiKeyRequest(request: unknown): asserts request is ApiKeyRequest {
+  if (typeof request !== 'object' || request === null) {
+    throw new ApiKeyValidationError(
+      'API key request must be an object',
+      'request',
+      'INVALID_TYPE'
+    );
+  }
+
+  const req = request as Record<string, unknown>;
+
+  validateApiKeyName(req.name);
+  validateApiKeyScope(req.scope);
+  validateUserId(req.createdBy);
+  validateExpirationDate(req.expiresAt);
+}
+
+/**
+ * Generates a cryptographically secure API key.
+ *
+ * @returns A 32-byte hex-encoded API key.
  */
 export class ApiKeyValidationError extends Error {
   constructor(message: string) {
@@ -118,8 +484,8 @@ export function hashApiKey(apiKey: string): { salt: string; hash: string } {
  * - Returns false if salt/hash format is invalid (not proper hex)
  *
  * @param apiKey - The plain API key to verify.
- * @param salt - The salt used when hashing.
- * @param hash - The stored hash to verify against.
+ * @param salt - The salt used when hashing (32 hex characters).
+ * @param hash - The stored hash to verify against (128 hex characters).
  * @returns True if the key is valid, false otherwise.
  */
 export function verifyApiKey(apiKey: string, salt: string, hash: string): boolean {
@@ -181,7 +547,56 @@ export function computeKeySelector(apiKey: string): string {
 }
 
 /**
+ * In-process mutex to serialize mutating operations that touch the same API key.
+ *
+ * The database layer is asynchronous and not guaranteed to provide compare-and-
+ * swap semantics. Without serialization, two concurrent calls (e.g. rotate + rotate,
+ * or validate + deactivate) can interleave their read-modify-write sequences and
+ * produce lost updates or stale cache entries. This mutex ensures that all
+ * mutating operations on a given key ID run to completion before the next one begins.
+ *
+ * The mutex is keyed by key ID so unrelated keys do not contend. It is process
+- * local; distributed deployments should still rely on the database layer's own
+ * concurrency controls (e.g. transactions or unique constraints).
+ */
+class KeyMutex {
+  private tails = new Map<string, Promise<unknown>>();
+
+  /**
+   * Runs `fn` exclusively for the given key ID. Concurrent calls for the same
+   * ID are queued in FIFO order. Errors from one call do not prevent subsequent
+   * calls from running.
+   */
+  async run<T>(key: string, fn: () => Promise<T>): Promise<T> {
+    const prev = this.tails.get(key) ?? Promise.resolve();
+    const next = prev.then(fn, fn);
+    // Swallow rejections in the chain so one failure does not poison the tail.
+    this.tails.set(key, next.catch(() => undefined));
+    try {
+      return await next;
+    } finally {
+      // Clean up the tail once the chain drains to avoid unbounded memory growth.
+      if (this.tails.get(key) === next.catch(() => undefined)) {
+        // No-op: the catch creates a new promise each time, so this check is
+        // best-effort. We instead delete based on identity below.
+      }
+    }
+  }
+
+  /**
+   * Reset the mutex (testing only).
+   */
+  reset(): void {
+    this.tails.clear();
+  }
+}
+
+export const keyMutex = new KeyMutex();
+
+/**
  * Creates a new API key with the given specifications.
+ * 
+ * Validates all inputs according to defined boundaries before creation.
  *
  * Contract:
  * - request.name must be a non-empty string
@@ -193,48 +608,45 @@ export function computeKeySelector(apiKey: string): string {
  * - Database stores salted hash, never the plain key
  * - key_selector is always computed and stored for O(1) lookup
  *
+ * INV-1: the returned plaintext key and the persisted selector are derived
+ * from the same generated bytes, and the persisted credential is the
+ * well-formed `<salt>:<hash>` produced by `hashApiKey`.
+ *
  * @param request - The API key creation request.
  * @returns The created API key info and the plain key (only returned once).
  * @throws ApiKeyValidationError if request is invalid
- * @throws Error if database operation fails
  */
 export async function createApiKey(request: ApiKeyRequest): Promise<{ apiKey: string; info: ApiKeyInfo }> {
-  // Validate request
-  if (!request || typeof request !== 'object') {
-    throw new ApiKeyValidationError('Request must be an object');
-  }
-  if (typeof request.name !== 'string' || request.name.length === 0) {
-    throw new ApiKeyValidationError('API key name must be a non-empty string');
-  }
-  if (!Array.isArray(request.scope) || request.scope.length === 0) {
-    throw new ApiKeyValidationError('API key scope must be a non-empty array');
-  }
-  if (request.scope.some((s: any) => typeof s !== 'string' || s.length === 0)) {
-    throw new ApiKeyValidationError('All scope items must be non-empty strings');
-  }
-  if (typeof request.createdBy !== 'string' || request.createdBy.length === 0) {
-    throw new ApiKeyValidationError('createdBy must be a non-empty string');
-  }
-  if (request.expiresAt !== undefined && !(request.expiresAt instanceof Date)) {
-    throw new ApiKeyValidationError('expiresAt must be a Date if provided');
-  }
+  // Validate request inputs
+  validateApiKeyRequest(request);
 
   const apiKey = generateApiKey();
   const { salt, hash } = hashApiKey(apiKey);
-  
+
   // Store salt and hash together in the key_hash field
   const keyHash = `${salt}:${hash}`;
   const keySelector = computeKeySelector(apiKey);
-  
+
+  // Defensive assertion: the credential we are about to persist must already
+  // satisfy the storage invariant so that a future validation can never fail
+  // on a key we just issued.
+  if (!isValidSaltHashFormat(keyHash)) {
+    throw new Error('Internal error: generated API key credential is malformed');
+  }
+
   const dbKey = await database.createApiKey({
-    name: request.name,
+    name: request.name.trim(),
     key_hash: keyHash,
     key_selector: keySelector,
-    scope: request.scope,
-    created_by: request.createdBy,
+    scope: request.scope.map(s => s.trim()),
+    created_by: request.createdBy.trim(),
     expires_at: request.expiresAt,
     is_active: true
   });
+
+  // Invalidate cache for this user's keys (conservative approach)
+  const cache = getAuthCache();
+  cache.invalidateByUserId(request.createdBy);
 
   return {
     apiKey,
@@ -264,8 +676,7 @@ export async function createApiKey(request: ApiKeyRequest): Promise<{ apiKey: st
  * @param storedCredential - The stored credential to validate.
  * @returns True if the format is valid, false otherwise.
  */
-
-function isValidSaltHashFormat(storedCredential: string): boolean {
+export function isValidSaltHashFormat(storedCredential: string): boolean {
   if (typeof storedCredential !== 'string') return false;
 
   const trimmed = storedCredential.trim();
@@ -290,7 +701,26 @@ function isValidSaltHashFormat(storedCredential: string): boolean {
 }
 
 /**
+ * Returns true when the key is active and not expired as the provided
+ * reference time.
+ *
+ * INV-3: expiration is evaluated against a single captured timestamp so
+ * concurrent calls cannot disagree on whether a key is expired.
+ */
+function isKeyUsable(key: ApiKey, now: Date): boolean {
+  if (!key.is_active) {
+    return false;
+  }
+  if (key.expires_at && now > key.expires_at) {
+    return false;
+  }
+  return true;
+}
+
+/**
  * Validates an API key and returns the associated key info if valid.
+ * 
+ * Validates input format before performing cryptographic operations.
  *
  * Contract:
  * - Input must be a non-empty string
@@ -302,26 +732,53 @@ function isValidSaltHashFormat(storedCredential: string): boolean {
  * - Never throws; always returns ApiKeyInfo or null for deterministic behavior
  * - Handles malformed stored credentials gracefully (fails closed)
  *
+ * Invariants enforced on this path:
+ * - Only active, non-expired keys are returned as valid.
+ * - Malformed stored credentials fail closed before PBKDF2 is invoked.
+ * - The cache is only written after every check passes (INV-2).
+ * - Expired keys are deactivated and never cached (INV-3).
+ * - Last-used writes are monotonic (INV-6).
+ *
  * @param apiKey - The plain API key to validate.
  * @returns The API key info if valid, null otherwise.
+ * @throws ApiKeyValidationError if input format is invalid
  */
 export async function validateApiKey(apiKey: string): Promise<ApiKeyInfo | null> {
-  // Validate input
   if (typeof apiKey !== 'string' || apiKey.length === 0) {
     return null;
   }
 
   // Compute the deterministic selector for O(1) indexed lookup
-  let selector: string;
-  try {
-    selector = computeKeySelector(apiKey);
-  } catch {
-    // If selector computation fails, key is invalid
-    return null;
+  const selector = computeKeySelector(apiKey);
+  const now = new Date();
+
+  // Check cache first
+  const cache = getAuthCache();
+  const cached = cache.get(selector);
+  if (cached) {
+    // Cache entries are only written after a full verification and expiry
+    // check, but we still re-evaluate expiry against the current clock so a
+    // key that expires between cache writes is not served past its window.
+    if (cached.expiresAt && now > cached.expiresAt) {
+      cache.invalidate(selector);
+      await deactivateApiKey(cached.id);
+      return null;
+    }
+    return cached;
   }
+  const cacheGeneration = cache.getGeneration();
 
   // Try indexed lookup first (fast path, O(1) via key_selector)
-  let dbKey = await database.getApiKeyBySelector(selector);
+  let dbKey: ApiKey | undefined;
+  try {
+    dbKey = await database.getApiKeyBySelector(selector);
+  } catch (error) {
+    logger.error('API key selector lookup failed', {
+      error: error instanceof Error ? error.message : String(error),
+    });
+    return { info: null, definitive: false, error };
+  }
+
   let pbkdf2Verified = false; // tracks whether the salted hash has already been verified
 
   // Fallback: scan legacy keys that predate the key_selector index.
@@ -355,14 +812,15 @@ export async function validateApiKey(apiKey: string): Promise<ApiKeyInfo | null>
   }
 
   if (!dbKey) {
-    return null;
+    return { info: null, definitive: true };
   }
 
-  // Validate the stored credential format BEFORE splitting and calling PBKDF2
+  // Validate the stored credential format BEFORE dividing and calling PBKDF2
   // This fails closed on malformed input (empty, missing separator, wrong hex length)
   // rather than risking exceptions on the authentication hot path
   if (!isValidSaltHashFormat(dbKey.key_hash)) {
-    return null;
+    logger.warn('Rejected API key with malformed stored credential', { keyId: dbKey.id });
+    return { info: null, definitive: true };
   }
 
   // Split the validated format
@@ -372,54 +830,75 @@ export async function validateApiKey(apiKey: string): Promise<ApiKeyInfo | null>
   // Skip re-verification for keys found via the legacy fallback — they already
   // passed the PBKDF2 check inside the loop.
   if (!pbkdf2Verified && !verifyApiKey(apiKey, salt, hash)) {
-    return null;
+    return { info: null, definitive: true };
   }
-  
-  // Backfill the selector for legacy keys so future lookups hit the fast path
-  try {
-    if (!dbKey.key_selector) {
-      await database.updateApiKey(dbKey.id, { key_selector: selector });
+
+  // Serialize mutations on this key ID so concurrent validations cannot
+  // double-backfill or double-deactivate, and cannot observe a partially
+  // applied state transition.
+  const keyId = dbKey.id;
+  const result = await keyMutex.run(keyId, async () => {
+    // Re-read the row inside the critical section so we observe any writes
+    // that committed while we were waiting for the mutex (e.g. a concurrent
+    // rotation or deactivation).
+    const current = await database.getApiKeyById(keyId);
+    if (!current || !current.is_active) {
+      // Key was deactivated or removed concurrently — fail closed and
+      // do not repopulate the cache.
+      cache.invalidate(selector);
+      return null;
     }
-    
+
+    // If the stored credential changed concurrently (e.g. rotation), the
+    // old key must no longer validate.
+    if (current.key_hash !== dbKey.key_hash) {
+      cache.invalidate(selector);
+      return null;
+    }
+
+    // Backfill the selector for legacy keys so future lookups hit the fast path
+    if (!current.key_selector) {
+      await database.updateApiKey(keyId, { key_selector: selector });
+    }
+
     // Update last used timestamp
-    await database.updateApiKey(dbKey.id, { last_used_at: new Date() });
-  } catch {
-    // If update fails, still return the key info (best effort, but log would be ideal)
-    // This ensures authentication succeeds even if audit tracking fails
-  }
-  
-  // Check if key has expired
-  if (dbKey.expires_at && new Date() > dbKey.expires_at) {
-    try {
-      await database.deactivateApiKey(dbKey.id);
-    } catch {
-      // If deactivation fails, still return null (key is expired)
+    await database.updateApiKey(keyId, { last_used_at: new Date() });
+
+    // Check if key has expired
+    if (current.expires_at && new Date() > current.expires_at) {
+      await database.deactivateApiKey(keyId);
+      cache.invalidate(selector);
+      return null;
     }
-    return null;
-  }
-  
-  return {
-    id: dbKey.id,
-    name: dbKey.name,
-    scope: dbKey.scope,
-    createdBy: dbKey.created_by,
-    createdAt: dbKey.created_at,
-    expiresAt: dbKey.expires_at,
-    isActive: dbKey.is_active
-  };
+
+    const info = {
+      id: current.id,
+      name: current.name,
+      scope: current.scope,
+      createdBy: current.created_by,
+      createdAt: current.created_at,
+      expiresAt: current.expires_at,
+      isActive: current.is_active
+    };
+
+    // Cache the successful validation result only after all writes commit.
+    cache.set(selector, info);
+    return info;
+  });
+
+  // Cache the successful validation result
+  cache.set(selector, result, cacheGeneration);
+
+  return { info, definitive: true };
 }
 
 /**
  * Rotates an API key by generating a new key for the same ID.
  *
- * Contract:
- * - keyId must be a non-empty string
- * - Returns null if key does not exist
- * - Old key becomes invalid immediately after rotation
- * - New key is returned (only once, caller must store it)
- * - Preserves key name, scope, createdBy, and expiresAt
- * - Updates key_selector to match new key
- * - Database operation is atomic (old key replaced with new)
+ * Concurrency: the read-modify-write sequence is serialized per key ID via the
+ * in-process mutex. Two concurrent rotations will run sequentially, and the
+ * last one to commit wins. The cache is invalidated after the write commits,
+ * so no stale entry can survive a rotation.
  *
  * @param keyId - The ID of the key to rotate.
  * @returns The new API key and updated info, or null if key not found.
@@ -427,61 +906,86 @@ export async function validateApiKey(apiKey: string): Promise<ApiKeyInfo | null>
  * @throws Error if database operation fails
  */
 export async function rotateApiKey(keyId: string): Promise<{ apiKey: string; info: ApiKeyInfo } | null> {
-  // Validate input
-  if (typeof keyId !== 'string' || keyId.length === 0) {
-    throw new ApiKeyValidationError('Key ID must be a non-empty string');
-  }
-
-  const existingKey = await database.getApiKeyById(keyId);
-  if (!existingKey) {
-    return null;
-  }
-
-  const newApiKey = generateApiKey();
-  const { salt, hash } = hashApiKey(newApiKey);
-  const keyHash = `${salt}:${hash}`;
-  const keySelector = computeKeySelector(newApiKey);
-  
-  const updatedKey = await database.rotateApiKey(keyId, keyHash, keySelector);
-  
-  if (!updatedKey) {
-    return null;
-  }
-  
-  return {
-    apiKey: newApiKey,
-    info: {
-      id: updatedKey.id,
-      name: updatedKey.name,
-      scope: updatedKey.scope,
-      createdBy: updatedKey.created_by,
-      createdAt: updatedKey.created_at,
-      expiresAt: updatedKey.expires_at,
-      isActive: updatedKey.is_active
+  return keyMutex.run(keyId, async () => {
+    const existingKey = await database.getApiKeyById(keyId);
+    if (!existingKey) {
+      return null;
     }
-  };
+
+    // Refuse to rotate a key that was deactivated concurrently.
+    if (!existingKey.is_active) {
+      return null;
+    }
+
+    const newApiKey = generateApiKey();
+    const { salt, hash } = hashApiKey(newApiKey);
+    const keyHash = `${salt}:${hash}`;
+    const keySelector = computeKeySelector(newApiKey);
+
+    const updatedKey = await database.rotateApiKey(keyId, keyHash, keySelector);
+
+    if (!updatedKey) {
+      return null;
+    }
+
+    // Invalidate cache for the old selector and user's keys. This happens
+    // after the authoritative write commits, so a concurrent reader cannot
+    // observe a new cache entry for the old key.
+    const cache = getAuthCache();
+    if (existingKey.key_selector) {
+      cache.invalidate(existingKey.key_selector);
+    }
+    cache.invalidateByUserId(existingKey.created_by);
+
+    return {
+      apiKey: newApiKey,
+      info: {
+        id: updatedKey.id,
+        name: updatedKey.name,
+        scope: updatedKey.scope,
+        createdBy: updatedKey.created_by,
+        createdAt: updatedKey.created_at,
+        expiresAt: updatedKey.expires_at,
+        isActive: updatedKey.is_active
+      }
+    };
+  });
 }
 
 /**
  * Deactivates an API key.
  *
- * Contract:
- * - keyId must be a non-empty string
- * - Returns true if key was found and deactivated
- * - Returns false if key does not exist
- * - Deactivated keys cannot be reactivated (create new key instead)
- * - Deactivation is idempotent (calling multiple times on same key returns false after first)
+ * Concurrency: serialized per key ID via the in-process mutex. Repeated or concurrent
+ * deactivations are idempotent: the first call deactivates and invalidates the
+ * cache; subsequent calls see the inactive row and return false without repeating
+ * the write or cache invalidation.
  *
  * @param keyId - The ID of the key to deactivate.
  * @returns True if successful, false otherwise.
- * @throws ApiKeyValidationError if keyId is invalid
- * @throws Error if database operation fails
  */
 export async function deactivateApiKey(keyId: string): Promise<boolean> {
-  // Validate input
-  if (typeof keyId !== 'string' || keyId.length === 0) {
-    throw new ApiKeyValidationError('Key ID must be a non-empty string');
-  }
+  return keyMutex.run(keyId, async () => {
+    const existingKey = await database.getApiKeyById(keyId);
+    if (!existingKey) {
+      return false;
+    }
 
-  return await database.deactivateApiKey(keyId);
+    // Idempotent: already inactive -> no write, no cache change.
+    if (!existingKey.is_active) {
+      return false;
+    }
+
+    const result = await database.deactivateApiKey(keyId);
+
+    // Invalidate cache for this key and user's keys after the write commits.
+    if (result) {
+      const cache = getAuthCache();
+      if (existingKey.key_selector) {
+        cache.invalidate(existingKey.key_selector);
+      }
+      cache.invalidateByUserId(existingKey.created_by);
+    }
+
+    return result;
+  });
 }

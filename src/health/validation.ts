@@ -11,6 +11,7 @@
  */
 
 import { z } from 'zod';
+import { MAX_HEALTH_PAGE_SIZE, DEFAULT_HEALTH_PAGE_SIZE } from './pagination';
 
 // ─── Constants ────────────────────────────────────────────────────────────────
 
@@ -114,8 +115,8 @@ export const HealthWriteBodySchema = z
 /**
  * Schema for the GET /health query parameters.
  *
- * Only the `verbose` parameter is accepted. Unknown query parameters
- * are rejected to prevent probing internal behaviour via arbitrary keys.
+ * Accepts `verbose`, `limit`, and `cursor` for cursor-based pagination.
+ * Unknown query parameters are rejected to prevent probing internal behaviour.
  */
 export const HealthQuerySchema = z
   .object({
@@ -127,6 +128,39 @@ export const HealthQuerySchema = z
       .enum(['true', 'false'], {
         errorMap: () => ({ message: 'verbose must be "true" or "false"' }),
       })
+      .optional(),
+
+    /**
+     * Maximum number of probes to return in this page.
+     * Must be a positive integer between 1 and MAX_HEALTH_PAGE_SIZE (100).
+     * Values above the cap are clamped to the cap.
+     * Defaults to DEFAULT_HEALTH_PAGE_SIZE (20) when omitted.
+     */
+    limit: z
+      .preprocess(
+        (v) =>
+          v === undefined || v === '' || v === null
+            ? String(DEFAULT_HEALTH_PAGE_SIZE)
+            : v,
+        z
+          .string()
+          .regex(/^\d+$/, 'limit must be a positive integer')
+          .transform((s) => Number(s))
+          .refine(
+            (n) => n >= 1,
+            'limit must be at least 1',
+          ),
+      )
+      .optional(),
+
+    /**
+     * Opaque cursor from a previous response's `nextCursor` field.
+     * When omitted the first page is returned.
+     * Must be a non-empty string (format is opaque to clients).
+     */
+    cursor: z
+      .string()
+      .min(1, 'cursor must not be empty')
       .optional(),
   })
   .strict();
@@ -141,3 +175,6 @@ export type HealthWriteBody = z.infer<typeof HealthWriteBodySchema>;
 
 /** TypeScript type inferred from {@link HealthQuerySchema}. */
 export type HealthQuery = z.infer<typeof HealthQuerySchema>;
+
+/** Convenience re-exports so consumers don't need to import from pagination.ts directly. */
+export { MAX_HEALTH_PAGE_SIZE, DEFAULT_HEALTH_PAGE_SIZE } from './pagination';

@@ -638,6 +638,22 @@ The following guards are applied (in order) on every `PUT` request:
 
 ---
 
+## Observability
+
+Every `GET` and `PUT` reputation request emits:
+
+- `reputation_requests_total` with bounded operation, status, status-code, and error-cause labels
+- `reputation_request_duration_seconds` with the same bounded labels
+- `reputation_errors_total` for client and server failures
+- A structured `reputation_request` completion log with method, operation, status, status code, error cause, and duration
+
+The instrumentation runs before authentication and validation, so `401`, `403`,
+and `400` failures are included. It never logs or labels freelancer IDs,
+reviewer IDs, comments, request bodies, headers, or raw exception messages.
+Metrics are available from the Prometheus scrape endpoint at `GET /metrics`.
+
+---
+
 ## Related docs
 
 - [`docs/backend/reputation-system.md`](./backend/reputation-system.md) — internal architecture, DB schema, anti-abuse design.

@@ -56,6 +56,7 @@ import type { AuditAction, AuditSeverity } from './types';
 import type { AuthenticatedRequest } from '../auth/authenticate';
 import { buildAuditMetadata } from './redact';
 import { auditService, AuditService } from './service';
+import { validateEnv } from '../config/env.schema';
 
 // ─── Internal helpers ─────────────────────────────────────────────────────────
 
@@ -118,6 +119,8 @@ function deriveResourceId(path: string): string {
  * @param service - AuditService instance to write entries to (defaults to
  *                  the application singleton).
  */
+const AUDIT_FINISH_FLAG = Symbol('protectedEndpointAudit.finishRegistered');
+
 export function createProtectedEndpointAuditMiddleware(
   service: AuditService = auditService,
 ): RequestHandler {
@@ -126,6 +129,26 @@ export function createProtectedEndpointAuditMiddleware(
     res: Response,
     next: NextFunction,
   ): void {
+    const env = validateEnv();
+
+    if (!env.AUDIT_ENABLED) {
+      // Feature flag off — skip the finish listener entirely; no audit entries
+      // are written for protected-endpoint traffic.
+      next();
+      return;
+    }
+
+    // Idempotency guard: if this middleware is mounted more than once on the
+    // same request (e.g. via nested routers), only register a single `finish`
+    // listener. This prevents duplicate audit entries for the same request
+    // and keeps concurrent execution deterministic.
+    const resWithFlag = res as Response & { [AUDIT_FINISH_FLAG]?: boolean };
+    if (resWithFlag[AUDIT_FINISH_FLAG]) {
+      next();
+      return;
+    }
+    resWithFlag[AUDIT_FINISH_FLAG] = true;
+
     res.on('finish', () => {
       try {
         // req.user is populated by authenticateMiddleware after this runs
@@ -164,6 +187,13 @@ export function createProtectedEndpointAuditMiddleware(
         // Audit failures must never disrupt the request lifecycle.
         console.error('[protectedEndpointAuditMiddleware] Failed to write audit entry:', err);
       }
+    });
+
+    // Ensure the flag is cleared if the response is closed without finishing
+    // (e.g. client abort) so that a subsequent request on a reused Response
+    // object (unlikely in Express, but defensive) is not silently skipped.
+    res.on('close', () => {
+      resWithFlag[AUDIT_FINISH_FLAG] = false;
     });
 
     next();

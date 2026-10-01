@@ -105,8 +105,34 @@ export type AuditAction =
 
 export const AUDIT_SEVERITIES = ['INFO', 'WARNING', 'CRITICAL'] as const;
 
+/** Array of all valid AuditAction values for validation. */
+export const AUDIT_ACTIONS: readonly AuditAction[] = [
+  'CONTRACT_CREATED',
+  'CONTRACT_UPDATED',
+  'CONTRACT_CANCELLED',
+  'CONTRACT_COMPLETED',
+  'PAYMENT_INITIATED',
+  'PAYMENT_RELEASED',
+  'PAYMENT_DISPUTED',
+  'REPUTATION_UPDATED',
+  'USER_CREATED',
+  'USER_UPDATED',
+  'USER_DELETED',
+  'AUTH_LOGIN',
+  'AUTH_LOGOUT',
+  'AUTH_FAILED',
+  'ADMIN_ACTION',
+  'ENDPOINT_ACCESS',
+  'ENDPOINT_MUTATION',
+  'DEPLOYMENT_PROMOTED',
+  'DEPLOYMENT_ROLLED_BACK',
+] as const;
+
 /** Severity level of the audit event. */
 export type AuditSeverity = (typeof AUDIT_SEVERITIES)[number];
+
+/** Array of all valid AuditSeverity values for validation. */
+export const AUDIT_SEVERITIES: readonly AuditSeverity[] = ['INFO', 'WARNING', 'CRITICAL'] as const;
 
 /**
  * Runtime guard for {@link AuditAction}.
@@ -321,152 +347,328 @@ export function decodeCursor(cursor: string): CursorData {
   }
 }
 
-/** The only filter keys an audit cursor may carry. */
-const CURSOR_FILTER_KEYS = [
-  'action',
-  'severity',
-  'actor',
-  'resource',
-  'resourceId',
-  'from',
-  'to',
-] as const;
+// ─── Validation error types ───────────────────────────────────────────────────
 
-type CursorValidation =
-  | { ok: true; data: CursorData }
-  | { ok: false; reason: CursorFormatErrorReason };
-
-function isValidCursorFilterValue(key: string, value: unknown): boolean {
-  if (typeof value !== 'string' || value.length === 0) {
-    return false;
+/**
+ * Validation error for audit repository operations.
+ * Provides structured error information for diagnostic purposes without exposing sensitive data.
+ */
+export class AuditValidationError extends Error {
+  constructor(
+    message: string,
+    public readonly field: string,
+    public readonly value: unknown,
+    public readonly constraint: string,
+  ) {
+    super(message);
+    this.name = 'AuditValidationError';
   }
-  if (key === 'action') {
-    return (AUDIT_ACTIONS as readonly string[]).includes(value);
-  }
-  if (key === 'severity') {
-    return (AUDIT_SEVERITIES as readonly string[]).includes(value);
-  }
-  if (key === 'from' || key === 'to') {
-    return !Number.isNaN(Date.parse(value));
-  }
-  return true;
 }
 
 /**
- * Validates an already-parsed value against the {@link CursorData} shape.
- * Total: never throws, never mutates its input.
+ * Result of a validation operation.
  */
-function validateCursorData(parsed: unknown): CursorValidation {
-  if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
-    return { ok: false, reason: 'not_an_object' };
+export interface ValidationResult<T> {
+  valid: boolean;
+  data?: T;
+  error?: AuditValidationError;
+}
+
+// ─── Validation constants ─────────────────────────────────────────────────────
+
+/**
+ * Maximum length for string fields in audit entries.
+ * This prevents database errors and abuse while accommodating legitimate long values.
+ */
+export const MAX_STRING_LENGTH = 1000;
+
+/**
+ * Maximum length for metadata JSON string when serialized.
+ * This prevents excessively large metadata from causing performance issues.
+ */
+export const MAX_METADATA_LENGTH = 10000;
+
+/**
+ * Maximum limit for query results to prevent resource exhaustion.
+ */
+export const MAX_QUERY_LIMIT = 1000;
+
+/**
+ * Minimum limit for query results to prevent accidental zero-limit queries.
+ */
+export const MIN_QUERY_LIMIT = 1;
+
+// ─── Validation helpers ───────────────────────────────────────────────────────
+
+/**
+ * Validates that a string field is not empty and within length limits.
+ */
+export function validateStringField(
+  value: unknown,
+  fieldName: string,
+  maxLength: number = MAX_STRING_LENGTH,
+): ValidationResult<string> {
+  if (typeof value !== 'string') {
+    return {
+      valid: false,
+      error: new AuditValidationError(
+        `${fieldName} must be a string`,
+        fieldName,
+        value,
+        'type: string',
+      ),
+    };
   }
 
-  const candidate = parsed as Record<string, unknown>;
-
-  const lastId = candidate['lastId'];
-  if (typeof lastId !== 'string' || lastId.length === 0) {
-    return { ok: false, reason: 'missing_last_id' };
+  if (value.length === 0) {
+    return {
+      valid: false,
+      error: new AuditValidationError(
+        `${fieldName} cannot be empty`,
+        fieldName,
+        value,
+        'minLength: 1',
+      ),
+    };
   }
 
-  const lastTimestamp = candidate['lastTimestamp'];
-  if (typeof lastTimestamp !== 'string' || lastTimestamp.length === 0) {
-    return { ok: false, reason: 'missing_last_timestamp' };
-  }
-  if (Number.isNaN(Date.parse(lastTimestamp))) {
-    return { ok: false, reason: 'invalid_last_timestamp' };
-  }
-
-  const filters = candidate['filters'];
-  if (typeof filters !== 'object' || filters === null || Array.isArray(filters)) {
-    return { ok: false, reason: 'invalid_filters' };
-  }
-
-  const rawFilters = filters as Record<string, unknown>;
-  const nextFilters: CursorData['filters'] = {};
-  for (const key of Object.keys(rawFilters)) {
-    if (!(CURSOR_FILTER_KEYS as readonly string[]).includes(key)) {
-      return { ok: false, reason: 'invalid_filters' };
-    }
-    const value = rawFilters[key];
-    if (value === undefined) {
-      continue;
-    }
-    if (!isValidCursorFilterValue(key, value)) {
-      return { ok: false, reason: 'invalid_filters' };
-    }
-    (nextFilters as Record<string, unknown>)[key] = value;
+  if (value.length > maxLength) {
+    return {
+      valid: false,
+      error: new AuditValidationError(
+        `${fieldName} exceeds maximum length of ${maxLength}`,
+        fieldName,
+        value.length,
+        `maxLength: ${maxLength}`,
+      ),
+    };
   }
 
-  return { ok: true, data: { lastId, lastTimestamp, filters: nextFilters } };
+  return { valid: true, data: value };
 }
 
 /**
- * Non-throwing guard for an already-parsed cursor object.
- * Use when the value may already be in memory and throwing is undesirable.
+ * Validates that a value is a valid ISO-8601 timestamp.
  */
-export function isCursorData(value: unknown): value is CursorData {
-  return validateCursorData(value).ok;
+export function validateTimestamp(value: unknown, fieldName: string): ValidationResult<string> {
+  if (typeof value !== 'string') {
+    return {
+      valid: false,
+      error: new AuditValidationError(
+        `${fieldName} must be a string`,
+        fieldName,
+        value,
+        'type: string',
+      ),
+    };
+  }
+
+  // ISO-8601 regex (simplified but covers most common formats)
+  const iso8601Regex = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?(Z|[+-]\d{2}:\d{2})?$/;
+  if (!iso8601Regex.test(value)) {
+    return {
+      valid: false,
+      error: new AuditValidationError(
+        `${fieldName} must be a valid ISO-8601 timestamp`,
+        fieldName,
+        value,
+        'format: ISO-8601',
+      ),
+    };
+  }
+
+  // Verify it's a valid date
+  const date = new Date(value);
+  if (isNaN(date.getTime())) {
+    return {
+      valid: false,
+      error: new AuditValidationError(
+        `${fieldName} is not a valid date`,
+        fieldName,
+        value,
+        'valid date',
+      ),
+    };
+  }
+
+  return { valid: true, data: value };
 }
 
 /**
- * Encodes cursor data to an opaque base64 string.
- *
- * Deterministic: fields and filter keys are serialized in a fixed order and
- * unknown filter keys are dropped, so logically-equal cursor data always
- * produces byte-identical output (which keeps `encodeCursor`/`decodeCursor`
- * a stable round-trip and avoids leaking caller state through the cursor).
+ * Validates that a value is one of the allowed enum values.
  */
-export function encodeCursor(data: CursorData): string {
-  const payload: CursorData = {
-    lastId: data.lastId,
-    lastTimestamp: data.lastTimestamp,
-    filters: {
-      ...(data.filters.action !== undefined && { action: data.filters.action }),
-      ...(data.filters.severity !== undefined && { severity: data.filters.severity }),
-      ...(data.filters.actor !== undefined && { actor: data.filters.actor }),
-      ...(data.filters.resource !== undefined && { resource: data.filters.resource }),
-      ...(data.filters.resourceId !== undefined && { resourceId: data.filters.resourceId }),
-      ...(data.filters.from !== undefined && { from: data.filters.from }),
-      ...(data.filters.to !== undefined && { to: data.filters.to }),
-    },
-  };
-  return Buffer.from(JSON.stringify(payload), 'utf-8').toString('base64');
+export function validateEnum<T extends string>(
+  value: unknown,
+  fieldName: string,
+  allowedValues: readonly T[],
+): ValidationResult<T> {
+  if (typeof value !== 'string') {
+    return {
+      valid: false,
+      error: new AuditValidationError(
+        `${fieldName} must be a string`,
+        fieldName,
+        value,
+        'type: string',
+      ),
+    };
+  }
+
+  if (!allowedValues.includes(value as T)) {
+    return {
+      valid: false,
+      error: new AuditValidationError(
+        `${fieldName} must be one of: ${allowedValues.join(', ')}`,
+        fieldName,
+        value,
+        `enum: [${allowedValues.join(', ')}]`,
+      ),
+    };
+  }
+
+  return { valid: true, data: value as T };
 }
 
 /**
- * Decodes an opaque base64 cursor string to validated cursor data.
- *
- * @throws {CursorFormatError} for every malformed, oversized, tampered, or
- *   structurally-invalid cursor. The same input always throws the same error
- *   with the same `reason`, so callers can recover deterministically (reject
- *   with a 400, or restart pagination) instead of depending on parse luck.
+ * Validates metadata object (must be plain object, not circular).
+ * This is a lightweight check; deep validation is handled by redact.ts.
  */
-export function decodeCursor(cursor: string): CursorData {
-  if (typeof cursor !== 'string') {
-    throw new CursorFormatError('not_a_string');
-  }
-  if (cursor.length === 0) {
-    throw new CursorFormatError('empty');
-  }
-  if (cursor.length > CURSOR_MAX_LENGTH) {
-    throw new CursorFormatError('too_long');
-  }
-  // Standard base64 alphabet, with at most two trailing padding characters.
-  if (!/^[A-Za-z0-9+/]+={0,2}$/.test(cursor)) {
-    throw new CursorFormatError('bad_charset');
+export function validateMetadata(value: unknown, fieldName: string): ValidationResult<Record<string, unknown>> {
+  if (value === null || value === undefined) {
+    return { valid: true, data: {} };
   }
 
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(Buffer.from(cursor, 'base64').toString('utf-8'));
-  } catch {
-    throw new CursorFormatError('not_json');
+  if (typeof value !== 'object' || Array.isArray(value)) {
+    return {
+      valid: false,
+      error: new AuditValidationError(
+        `${fieldName} must be a plain object`,
+        fieldName,
+        value,
+        'type: object',
+      ),
+    };
   }
 
-  const validation = validateCursorData(parsed);
-  if (!validation.ok) {
-    throw new CursorFormatError(validation.reason);
+  // Check serialized length to prevent oversized metadata
+  const serialized = JSON.stringify(value);
+  if (serialized.length > MAX_METADATA_LENGTH) {
+    return {
+      valid: false,
+      error: new AuditValidationError(
+        `${fieldName} serialized size exceeds maximum of ${MAX_METADATA_LENGTH}`,
+        fieldName,
+        serialized.length,
+        `maxSerializedLength: ${MAX_METADATA_LENGTH}`,
+      ),
+    };
   }
 
-  return validation.data;
+  return { valid: true, data: value as Record<string, unknown> };
+}
+
+/**
+ * Validates query limit parameter.
+ */
+export function validateLimit(value: unknown): ValidationResult<number> {
+  if (value === undefined || value === null) {
+    return { valid: true, data: 50 }; // Default limit
+  }
+
+  if (typeof value !== 'number') {
+    return {
+      valid: false,
+      error: new AuditValidationError(
+        'limit must be a number',
+        'limit',
+        value,
+        'type: number',
+      ),
+    };
+  }
+
+  if (!isFinite(value)) {
+    return {
+      valid: false,
+      error: new AuditValidationError(
+        'limit must be a finite number',
+        'limit',
+        value,
+        'finite',
+      ),
+    };
+  }
+
+  if (value < MIN_QUERY_LIMIT) {
+    return {
+      valid: false,
+      error: new AuditValidationError(
+        `limit must be at least ${MIN_QUERY_LIMIT}`,
+        'limit',
+        value,
+        `min: ${MIN_QUERY_LIMIT}`,
+      ),
+    };
+  }
+
+  if (value > MAX_QUERY_LIMIT) {
+    return {
+      valid: false,
+      error: new AuditValidationError(
+        `limit cannot exceed ${MAX_QUERY_LIMIT}`,
+        'limit',
+        value,
+        `max: ${MAX_QUERY_LIMIT}`,
+      ),
+    };
+  }
+
+  return { valid: true, data: Math.floor(value) };
+}
+
+/**
+ * Validates query offset parameter.
+ */
+export function validateOffset(value: unknown): ValidationResult<number> {
+  if (value === undefined || value === null) {
+    return { valid: true, data: 0 }; // Default offset
+  }
+
+  if (typeof value !== 'number') {
+    return {
+      valid: false,
+      error: new AuditValidationError(
+        'offset must be a number',
+        'offset',
+        value,
+        'type: number',
+      ),
+    };
+  }
+
+  if (!isFinite(value)) {
+    return {
+      valid: false,
+      error: new AuditValidationError(
+        'offset must be a finite number',
+        'offset',
+        value,
+        'finite',
+      ),
+    };
+  }
+
+  if (value < 0) {
+    return {
+      valid: false,
+      error: new AuditValidationError(
+        'offset cannot be negative',
+        'offset',
+        value,
+        'min: 0',
+      ),
+    };
+  }
+
+  return { valid: true, data: Math.floor(value) };
 }

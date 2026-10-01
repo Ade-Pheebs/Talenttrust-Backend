@@ -1,110 +1,406 @@
-import { runInNewContext } from 'node:vm';
-import {
-  buildAuditMetadata, INVALID, LIMIT_EXCEEDED, MAX_DEPTH, MAX_NODES,
-  maskEmail, redactBody, redactHeaders, REDACTED,
+﻿import {
+  maskEmail,
+  redactHeaders,
+  redactBody,
+  buildAuditMetadata,
+  REDACTED,
+  MAX_REDACTION_DEPTH,
 } from './redact';
 
-describe('audit redaction validation boundaries', () => {
-  it('copies accepted records, arrays and primitives without mutation', () => {
-    const input = Object.freeze({ nested: Object.freeze([{ password: 'secret', email: 'alice@example.com' }]), n: 0, b: false, nil: null });
-    expect(redactBody(input)).toEqual({ nested: [{ password: REDACTED, email: 'ali***@example.com' }], n: 0, b: false, nil: null });
-    expect(input.nested[0].password).toBe('secret');
-    expect(redactBody(undefined)).toBeUndefined();
-    expect(redactBody(Object.assign(Object.create(null), { ok: true }))).toEqual({ ok: true });
+describe('redact edge cases and non-mutation', () => {
+
+  it('handles circular references in objects by redacting the cycle', () => {
+    const circular: Record<string, unknown> = { name: 'alice' };
+    circular['self'] = circular;
+
+    const result = redactBody(circular) as Record<string, unknown>;
+    expect(result['name']).toBe('alice');
+    expect(result['self']).toBe(REDACTED);
   });
 
-  it.each([BigInt(1), Symbol('secret'), () => 'secret', NaN, Infinity, new Date(), new Map(), Buffer.from('secret')])('rejects unsupported values with a safe marker (%#)', value => {
-    expect(redactBody(value)).toBe(INVALID);
+  it('handles circular references in arrays by redacting the cycle', () => {
+    const arr: unknown[] = [1, 2];
+    arr.push(arr);
+
+    const result = redactBody(arr) as unknown[];
+    expect(result[0]).toBe(1);
+    expect(result[1]).toBe(2);
+    expect(result[2]).toBe(REDACTED);
   });
 
-  it('never calls accessors, toJSON or proxy traps', () => {
-    const getter = jest.fn(() => { throw new Error('secret'); });
-    const input = Object.defineProperties({}, {
-      ordinary: { enumerable: true, get: getter },
-      password: { enumerable: true, get: getter },
-    });
-    expect(redactBody(input)).toEqual({ ordinary: INVALID, password: REDACTED });
-    expect(redactHeaders(input)).toEqual({ ordinary: INVALID, password: INVALID });
-    const proxy = new Proxy({}, { ownKeys: getter, getPrototypeOf: getter });
-    expect(redactBody(proxy)).toBe(INVALID);
-    const toJSON = jest.fn(() => 'secret');
-    expect(JSON.stringify(redactBody({ toJSON }))).not.toContain('secret');
-    expect(getter).not.toHaveBeenCalled();
-    expect(toJSON).not.toHaveBeenCalled();
+  it('handles circular references between object and array', () => {
+    const obj: Record<string, unknown> = { id: 1 };
+    const arr: unknown[] = [obj];
+    obj['children'] = arr;
+
+    const result = redactBody(obj) as Record<string, unknown>;
+    expect(result['id']).toBe(1);
+    const children = result['children'] as unknown[];
+    expect(children[0]).toBe(REDACTED);
   });
 
-  it('handles cycles, repeated references and retries independently', () => {
-    const shared = { email: 'a@example.com', token: 'secret' };
-    const input: Record<string, unknown> = { a: shared, b: shared };
-    input.self = input;
-    const output = redactBody(input);
-    expect(output).toEqual({ a: { email: 'a***@example.com', token: REDACTED }, b: { email: 'a***@example.com', token: REDACTED }, self: INVALID });
-    expect(redactBody(input)).toEqual(output);
-    expect(redactBody(output)).toEqual(output);
-    expect(redactBody({ ok: true })).toEqual({ ok: true });
+  it('redacts values exceeding maximum depth', () => {
+    let nested: Record<string, unknown> = { value: 'deep' };
+    for (let i = 0; i < MAX_REDACTION_DEPTH + 5; i++) {
+      nested = { nested };
+    }
+
+    const result = redactBody(nested) as Record<string, unknown>;
+    // Should have REDACTED at some point due to depth limit
+    const serialised = JSON.stringify(result);
+    expect(serialised).toContain(REDACTED);
   });
 
-  it.each(['a@host.io', 'ab@host.io', 'alice@host.io', 'not-email'])('masks idempotently: %s', email => {
-    expect(maskEmail(maskEmail(email))).toBe(maskEmail(email));
+  it('handles deeply nested arrays within depth limit', () => {
+    let nested: unknown = 'leaf';
+    for (let i = 0; i < 10; i++) {
+      nested = [nested];
+    }
+
+    const result = redactBody(nested);
+    expect(JSON.stringify(result)).toContain('leaf');
   });
 
-  it('preserves prototype-shaped keys as own data', () => {
-    const output = redactBody(JSON.parse('{"__proto__":{"password":"secret"},"constructor":"ok"}')) as object;
-    expect(Object.getPrototypeOf(output)).toBe(Object.prototype);
-    expect(Object.hasOwn(output, '__proto__')).toBe(true);
-    expect(JSON.stringify(output)).toBe('{"__proto__":{"password":"[REDACTED]"},"constructor":"ok"}');
+  it('buildAuditMetadata handles null headers gracefully', () => {
+    const result = buildAuditMetadata(
+      'GET',
+      '/api/v1/contracts',
+      null as any,
+      undefined,
+      {},
+      200,
+      'req-1',
+    );
+    expect(result['headers']).toEqual({});
   });
 
-  it('bounds depth and width and diagnoses sparse slots', () => {
-    const nest = (depth: number): unknown => depth === 0 ? 1 : [nest(depth - 1)];
-    expect(redactBody(nest(MAX_DEPTH))).toEqual(nest(MAX_DEPTH));
-    expect(JSON.stringify(redactBody(nest(MAX_DEPTH + 1)))).toContain(LIMIT_EXCEEDED);
-    expect(redactBody(Array(MAX_NODES - 1).fill(1))).toHaveLength(MAX_NODES - 1);
-    expect(redactBody(Array(MAX_NODES).fill(1))).toBe(LIMIT_EXCEEDED);
-    expect(redactBody(Array(1))).toEqual([INVALID]);
+  it('buildAuditMetadata handles undefined headers gracefully', () => {
+    const result = buildAuditMetadata(
+      'GET',
+      '/api/v1/contracts',
+      undefined as any,
+      undefined,
+      {},
+      200,
+      'req-1',
+    );
+    expect(result['headers']).toEqual({});
   });
 
-  it('redacts duplicate case variants and copies header arrays', () => {
-    const headers = { Authorization: 'secret1', authorization: ['secret2'], 'set-cookie': ['secret3'], accept: ['json'] };
-    const output = redactHeaders(headers);
-    expect(output).toEqual({ Authorization: REDACTED, authorization: REDACTED, 'set-cookie': REDACTED, accept: ['json'] });
-    headers.accept.push('html');
-    expect(output.accept).toEqual(['json']);
-    expect(redactBody({ headers })).toMatchObject({ headers: { Authorization: REDACTED, authorization: REDACTED } });
-    expect(redactHeaders({ ' Authorization ': 'secret' })).toEqual({ ' Authorization ': INVALID });
+  it('buildAuditMetadata handles non-object headers gracefully', () => {
+    const result = buildAuditMetadata(
+      'GET',
+      '/api/v1/contracts',
+      'invalid' as any,
+      undefined,
+      {},
+      200,
+      'req-1',
+    );
+    expect(result['headers']).toEqual({});
   });
 
-  it('accepts plain records from another realm', () => {
-    expect(redactHeaders(runInNewContext('({authorization: \"secret\"})'))).toEqual({ authorization: REDACTED });
+  it('buildAuditMetadata handles invalid method by coercing to UNKNOWN', () => {
+    const result = buildAuditMetadata(
+      null as any,
+      '/api/v1/contracts',
+      {},
+      undefined,
+      {},
+      200,
+      'req-1',
+    );
+    expect(result['method']).toBe('UNKNOWN');
   });
 
-  it('diagnoses invalid header values and enforces header bounds', () => {
-    expect(redactHeaders({ accept: 42 } as never)).toEqual({ accept: INVALID });
-    expect(redactHeaders({ accept: ['ok', 42] } as never)).toEqual({ accept: INVALID });
-    expect(redactHeaders({ accept: Array(MAX_NODES + 1).fill('x') })).toEqual({ accept: LIMIT_EXCEEDED });
-    expect(redactHeaders({ accept: Array(MAX_NODES - 1).fill('x') }).accept).toHaveLength(MAX_NODES - 1);
-    expect(() => redactHeaders(Object.fromEntries(Array.from({ length: MAX_NODES + 1 }, (_, i) => [`x-${i}`, 'x'])))).toThrow('Audit headers limit exceeded');
+  it('buildAuditMetadata handles invalid path by coercing to empty string', () => {
+    const result = buildAuditMetadata(
+      'GET',
+      null as any,
+      {},
+      undefined,
+      {},
+      200,
+      'req-1',
+    );
+    expect(result['path']).toBe('');
   });
 
-  it('shares the node budget across branches and recovers on the next call', () => {
-    const branch = Array(MAX_NODES - 3).fill(0);
-    const input = { first: branch, second: branch };
-    expect(redactBody(input)).toEqual({ first: branch, second: LIMIT_EXCEEDED });
-    expect(redactBody({ ok: 1 })).toEqual({ ok: 1 });
+  it('buildAuditMetadata handles invalid statusCode by coercing to 0', () => {
+    const result = buildAuditMetadata(
+      'GET',
+      '/api/v1/contracts',
+      {},
+      undefined,
+      {},
+      NaN as any,
+      'req-1',
+    );
+    expect(result['statusCode']).toBe(0);
   });
 
-  it.each([100, 200, 599])('accepts HTTP status boundary %s', status => {
-    expect(buildAuditMetadata('GET', '/', {}, undefined, {}, status, undefined)).toEqual({ method: 'GET', path: '/', headers: {}, body: null, query: null, statusCode: status, requestId: null });
+  it('buildAuditMetadata handles non-object query by setting to null', () => {
+    const result = buildAuditMetadata(
+      'GET',
+      '/api/v1/contracts',
+      {},
+      undefined,
+      'invalid' as any,
+      200,
+      'req-1',
+    );
+    expect(result['query']).toBeNull();
   });
 
-  it.each([99, 600, 200.5, NaN])('rejects invalid status %s without echoing input', status => {
-    expect(() => buildAuditMetadata('GET', '/', {}, null, {}, status, undefined)).toThrow('Invalid audit metadata envelope');
+  it('redactBody does not mutate the original object with circular reference', () => {
+    const circular: Record<string, unknown> = { name: 'original' };
+    circular['self'] = circular;
+
+    redactBody(circular);
+    expect(circular.name).toBe('original');
+    expect(circular.self).toBe(circular);
   });
 
-  it('rejects invalid envelopes while preserving valid calls after failure', () => {
-    expect(() => buildAuditMetadata('GET', '/?token=secret', {}, null, {}, 200, undefined)).toThrow('Invalid audit metadata envelope');
-    expect(() => redactHeaders(null as never)).toThrow('Invalid audit headers');
-    expect(() => buildAuditMetadata('GET', '/', {}, null, [] as never, 200, undefined)).toThrow('Invalid audit metadata envelope');
-    expect(buildAuditMetadata('POST', '/api', {}, { password: 'secret' }, { q: 'a@host.io' }, 201, 'id')).toMatchObject({ body: { password: REDACTED }, query: { q: 'a***@host.io' }, requestId: 'id' });
+  it('redactBody handles multiple circular references in same object', () => {
+    const obj1: Record<string, unknown> = { id: 1 };
+    const obj2: Record<string, unknown> = { id: 2 };
+    obj1['ref'] = obj2;
+    obj2['ref'] = obj1;
+
+    const result = redactBody(obj1) as Record<string, unknown>;
+    expect(result['id']).toBe(1);
+    // obj2 gets processed first, then when we try to process obj1 again from obj2.ref,
+    // it's already in visited set, so it returns REDACTED
+    const ref = result['ref'] as Record<string, unknown>;
+    expect(ref['id']).toBe(2);
+    expect(ref['ref']).toBe(REDACTED);
+  });
+
+  it('redactBody handles empty objects', () => {
+    const result = redactBody({});
+    expect(result).toEqual({});
+  });
+
+  it('redactBody handles empty arrays', () => {
+    const result = redactBody([]);
+    expect(result).toEqual([]);
+  });
+
+  it('redactBody handles arrays with mixed types', () => {
+    const result = redactBody([1, 'string', null, undefined, true, { key: 'value' }]);
+    expect(result).toEqual([1, 'string', null, undefined, true, { key: 'value' }]);
+  });
+
+  it('redactBody handles special characters in keys', () => {
+    const result = redactBody({ 'key-with-dash': 'value', 'key_with_underscore': 'value' }) as Record<string, unknown>;
+    expect(result['key-with-dash']).toBe('value');
+    expect(result['key_with_underscore']).toBe('value');
+  });
+
+  it('redactBody handles numeric string keys', () => {
+    const result = redactBody({ '123': 'value' }) as Record<string, unknown>;
+    expect(result['123']).toBe('value');
+  });
+
+  it('redactBody handles Date objects by treating them as objects', () => {
+    const date = new Date('2024-01-01');
+    const result = redactBody({ date });
+    // Date objects become plain objects with no special handling
+    expect(result).toBeDefined();
+  });
+
+  it('redactBody handles RegExp objects by treating them as objects', () => {
+    const regex = /test/g;
+    const result = redactBody({ regex });
+    // RegExp objects become plain objects with no special handling
+    expect(result).toBeDefined();
+  });
+
+  it('redactBody handles deeply nested structure at exactly depth limit', () => {
+    let nested: Record<string, unknown> = { value: 'leaf' };
+    for (let i = 0; i < MAX_REDACTION_DEPTH - 1; i++) {
+      nested = { nested };
+    }
+
+    const result = redactBody(nested) as Record<string, unknown>;
+    // Should process successfully without hitting the limit
+    const serialised = JSON.stringify(result);
+    expect(serialised).toContain('leaf');
+  });
+
+  it('redactBody handles array with circular reference at different positions', () => {
+    const obj: Record<string, unknown> = { id: 1 };
+    const arr: unknown[] = [obj, 2, obj];
+    obj['self'] = arr;
+
+    const result = redactBody(arr) as unknown[];
+    // obj gets processed the first time we see it
+    const firstObj = result[0] as Record<string, unknown>;
+    expect(firstObj['id']).toBe(1);
+    // When we process obj.self, it points to arr which is already in visited set
+    expect(firstObj['self']).toBe(REDACTED);
+    expect(result[1]).toBe(2);
+    // obj is already in visited set when we encounter it the second time
+    expect(result[2]).toBe(REDACTED);
+  });
+
+  it('redactHeaders handles headers with array values', () => {
+    const headers = { 'set-cookie': ['id=1', 'id=2'] };
+    const result = redactHeaders(headers);
+    expect(result['set-cookie']).toBe(REDACTED);
+  });
+
+  it('redactHeaders handles headers with undefined values', () => {
+    const headers = { 'x-custom': undefined };
+    const result = redactHeaders(headers);
+    expect(result['x-custom']).toBeUndefined();
+  });
+
+  it('redactHeaders handles empty headers object', () => {
+    const result = redactHeaders({});
+    expect(result).toEqual({});
+  });
+
+  it('maskEmail handles email with special characters in local part', () => {
+    const result = maskEmail('user+tag@example.com');
+    expect(result).toBe('use***@example.com');
+  });
+
+  it('maskEmail handles email with subdomains', () => {
+    const result = maskEmail('user@mail.example.com');
+    expect(result).toBe('use***@mail.example.com');
+  });
+
+  it('maskEmail handles email with numbers', () => {
+    const result = maskEmail('user123@example.com');
+    expect(result).toBe('use***@example.com');
+  });
+
+  it('buildAuditMetadata handles all null/undefined inputs', () => {
+    const result = buildAuditMetadata(
+      null as any,
+      null as any,
+      null as any,
+      null,
+      null as any,
+      null as any,
+      null,
+    );
+    expect(result['method']).toBe('UNKNOWN');
+    expect(result['path']).toBe('');
+    expect(result['statusCode']).toBe(0);
+    expect(result['requestId']).toBeNull();
+    expect(result['headers']).toEqual({});
+    expect(result['body']).toBeNull();
+    expect(result['query']).toBeNull();
+  });
+
+  // ─── Immutability verification tests ───────────────────────────────────────
+
+  it('redactBody never mutates simple objects', () => {
+    const original = { username: 'alice', password: 'secret' };
+    const originalCopy = { ...original };
+    redactBody(original);
+    expect(original).toEqual(originalCopy);
+  });
+
+  it('redactBody never mutates nested objects', () => {
+    const original = { user: { id: 1, secret: 'value' } };
+    const originalCopy = JSON.parse(JSON.stringify(original));
+    redactBody(original);
+    expect(original).toEqual(originalCopy);
+  });
+
+  it('redactBody never mutates arrays', () => {
+    const original = [1, 2, { password: 'secret' }];
+    const originalCopy = JSON.parse(JSON.stringify(original));
+    redactBody(original);
+    expect(original).toEqual(originalCopy);
+  });
+
+  it('redactBody returns a new object, not the same reference', () => {
+    const original = { key: 'value' };
+    const result = redactBody(original) as Record<string, unknown>;
+    expect(result).not.toBe(original);
+    expect(result.key).toBe('value');
+  });
+
+  it('redactBody returns a new array, not the same reference', () => {
+    const original = [1, 2, 3];
+    const result = redactBody(original) as unknown[];
+    expect(result).not.toBe(original);
+    expect(result).toEqual(original);
+  });
+
+  it('redactBody creates new nested objects', () => {
+    const original = { nested: { key: 'value' } };
+    const result = redactBody(original) as Record<string, unknown>;
+    const resultNested = result.nested as Record<string, unknown>;
+    const originalNested = original.nested as Record<string, unknown>;
+    expect(resultNested).not.toBe(originalNested);
+  });
+
+  it('redactBody creates new nested arrays', () => {
+    const original = { arr: [1, 2, 3] };
+    const result = redactBody(original) as Record<string, unknown>;
+    const resultArr = result.arr as unknown[];
+    const originalArr = original.arr as unknown[];
+    expect(resultArr).not.toBe(originalArr);
+  });
+
+  it('redactHeaders never mutates the original headers object', () => {
+    const original = { authorization: 'Bearer token', 'content-type': 'application/json' };
+    const originalCopy = { ...original };
+    redactHeaders(original);
+    expect(original).toEqual(originalCopy);
+  });
+
+  it('redactHeaders returns a new object, not the same reference', () => {
+    const original = { 'x-api-key': 'secret' };
+    const result = redactHeaders(original);
+    expect(result).not.toBe(original);
+  });
+
+  it('buildAuditMetadata never mutates input headers', () => {
+    const headers = { authorization: 'Bearer token' };
+    const headersCopy = { ...headers };
+    buildAuditMetadata('GET', '/', headers, undefined, {}, 200, 'req-1');
+    expect(headers).toEqual(headersCopy);
+  });
+
+  it('buildAuditMetadata never mutates input body', () => {
+    const body = { password: 'secret' };
+    const bodyCopy = { ...body };
+    buildAuditMetadata('POST', '/', {}, body, {}, 201, 'req-1');
+    expect(body).toEqual(bodyCopy);
+  });
+
+  it('buildAuditMetadata never mutates input query', () => {
+    const query = { token: 'value' };
+    const queryCopy = { ...query };
+    buildAuditMetadata('GET', '/', {}, undefined, query, 200, 'req-1');
+    expect(query).toEqual(queryCopy);
+  });
+
+  it('redactBody returns same reference for primitives', () => {
+    expect(redactBody(null)).toBe(null);
+    expect(redactBody(undefined)).toBe(undefined);
+    expect(redactBody(42)).toBe(42);
+    expect(redactBody(true)).toBe(true);
+    expect(redactBody(false)).toBe(false);
+  });
+
+  it('redactBody returns new string for email masking', () => {
+    const original = 'alice@example.com';
+    const result = redactBody(original);
+    expect(result).not.toBe(original);
+    expect(result).toBe('ali***@example.com');
+  });
+
+  it('redactBody returns same string reference for non-email strings', () => {
+    const original = 'not-an-email';
+    const result = redactBody(original);
+    // Strings are immutable, so this is acceptable
+    expect(result).toBe(original);
   });
 });

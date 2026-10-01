@@ -21,7 +21,7 @@ fn fresh_env() -> Env {
 }
 
 fn register(env: &Env) -> (Address, PredictifyHybridClient) {
-    let contract_id = env.register(crate::PredictifyHybrid, ());
+    let contract_id = env.register_contract(None, crate::PredictifyHybrid);
     let client = PredictifyHybridClient::new(env, &contract_id);
     (contract_id, client)
 }
@@ -120,6 +120,14 @@ mod batch_operations_tests {
     #[test]
     fn same_key_accepted_after_ttl_expiry() {
         let env = fresh_env();
+
+        // `extend_ttl` only fires when an entry's remaining TTL is already
+        // under the threshold, so start the ledger's persistent-entry floor
+        // low enough for the contract's instance/code bump to be exercised
+        // once the ledger jumps past the receipt window.
+        env.ledger()
+            .with_mut(|li| li.min_persistent_entry_ttl = 500);
+
         let (_id, client) = register(&env);
         let user = caller(&env);
         let idem = key(&env, 0x06);
@@ -128,6 +136,13 @@ mod batch_operations_tests {
 
         // First submission — consumed.
         client.place_bets(&user, &one_bet(&env), &idem);
+
+        // Extend the instance TTL before advancing so it doesn't expire.
+        env.as_contract(&_id, || {
+            env.storage()
+                .instance()
+                .extend_ttl(IDEM_KEY_TTL_LEDGERS * 3, IDEM_KEY_TTL_LEDGERS * 3);
+        });
 
         // Simulate ledger advancing past TTL so storage is evicted.
         env.ledger().with_mut(|li| {
@@ -138,9 +153,11 @@ mod batch_operations_tests {
         client.place_bets(&user, &one_bet(&env), &idem);
     }
 
-    /// Same key but different payload (different bets vector): the payload
-    /// difference is irrelevant — the key alone governs idempotency, so the
-    /// second call is still rejected.
+    /// Same key but different payload (different bets vector): the key still
+    /// governs idempotency, so the second call is rejected — but it is
+    /// rejected as a *token collision* rather than as a duplicate, so a
+    /// client can tell that its batch was never applied and needs a fresh
+    /// token. See I8 in `bets`.
     #[test]
     fn same_key_different_payload_rejected() {
         let env = fresh_env();
@@ -161,8 +178,8 @@ mod batch_operations_tests {
         let result = client.try_place_bets(&user, &bets_b, &idem);
         assert_eq!(
             result,
-            Err(Ok(Error::IdempotentBatchAlreadyApplied)),
-            "duplicate key with different payload must still be rejected"
+            Err(Ok(Error::IdempotencyKeyReusedWithDifferentBatch)),
+            "duplicate key with different payload must be reported as a token collision"
         );
     }
 
@@ -182,6 +199,41 @@ mod batch_operations_tests {
         );
     }
 
+    /// A bet with zero or negative amount is rejected.
+    #[test]
+    fn invalid_bet_amount_rejected() {
+        let env = fresh_env();
+        let (_id, client) = register(&env);
+        let user = caller(&env);
+        let idem = key(&env, 0x09);
+
+        let mut bets = Vec::new(&env);
+        bets.push_back(Bet {
+            market_id: 1,
+            amount: 0,
+        });
+
+        env.mock_all_auths();
+        let result = client.try_place_bets(&user, &bets, &idem);
+        assert_eq!(
+            result,
+            Err(Ok(Error::InvalidBetAmount)),
+            "zero amount must return InvalidBetAmount error"
+        );
+        
+        let mut bets = Vec::new(&env);
+        bets.push_back(Bet {
+            market_id: 1,
+            amount: -100,
+        });
+        let result = client.try_place_bets(&user, &bets, &idem);
+        assert_eq!(
+            result,
+            Err(Ok(Error::InvalidBetAmount)),
+            "negative amount must return InvalidBetAmount error"
+        );
+    }
+
     /// The zero key (`[0u8; 32]`) disables idempotency checking; repeated
     /// calls with the zero key all succeed (deprecated backward-compat path).
     #[test]
@@ -195,5 +247,82 @@ mod batch_operations_tests {
         client.place_bets(&user, &one_bet(&env), &zero);
         // Second call with zero key must also succeed (no dedup check).
         client.place_bets(&user, &one_bet(&env), &zero);
+    }
+
+    #[test]
+    fn invalid_bet_amount_rejected() {
+        let env = fresh_env();
+        let (_id, client) = register(&env);
+        let user = caller(&env);
+
+        let mut bets = Vec::new(&env);
+        bets.push_back(Bet {
+            market_id: 1,
+            amount: 0,
+        });
+
+        env.mock_all_auths();
+        let result = client.try_place_bets(&user, &bets, &key(&env, 0x09));
+        assert_eq!(
+            result,
+            Err(Ok(Error::InvalidBetAmount)),
+            "zero bet amount must return InvalidBetAmount error"
+        );
+
+        let mut bets_neg = Vec::new(&env);
+        bets_neg.push_back(Bet {
+            market_id: 1,
+            amount: -100,
+        });
+        let result_neg = client.try_place_bets(&user, &bets_neg, &key(&env, 0x0A));
+        assert_eq!(
+            result_neg,
+            Err(Ok(Error::InvalidBetAmount)),
+            "negative bet amount must return InvalidBetAmount error"
+        );
+    }
+
+    #[test]
+    fn invalid_market_id_rejected() {
+        let env = fresh_env();
+        let (_id, client) = register(&env);
+        let user = caller(&env);
+
+        let mut bets = Vec::new(&env);
+        bets.push_back(Bet {
+            market_id: 0,
+            amount: 100,
+        });
+
+        env.mock_all_auths();
+        let result = client.try_place_bets(&user, &bets, &key(&env, 0x0B));
+        assert_eq!(
+            result,
+            Err(Ok(Error::InvalidMarketId)),
+            "zero market ID must return InvalidMarketId error"
+        );
+    }
+
+    #[test]
+    fn batch_too_large_rejected() {
+        let env = fresh_env();
+        let (_id, client) = register(&env);
+        let user = caller(&env);
+
+        let mut bets = Vec::new(&env);
+        for _ in 0..101 {
+            bets.push_back(Bet {
+                market_id: 1,
+                amount: 100,
+            });
+        }
+
+        env.mock_all_auths();
+        let result = client.try_place_bets(&user, &bets, &key(&env, 0x0C));
+        assert_eq!(
+            result,
+            Err(Ok(Error::BatchTooLarge)),
+            "batch exceeding 100 bets must return BatchTooLarge error"
+        );
     }
 }

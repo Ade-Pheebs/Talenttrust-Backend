@@ -75,7 +75,7 @@ export function getDb(dbPath?: string, options?: GetDbOptions): DatabaseInstance
 
   created.pragma("foreign_keys = ON"); // Enforce FK constraints
 
-  const shouldRunMigrations = options?.runMigrations ?? (resolvedPath === ':memory:');
+  const shouldRunMigrations = options?.runMigrations ?? true;
   if (shouldRunMigrations) {
     runMigrations(created);
   }

@@ -1,3 +1,29 @@
+/**
+ * @module audit/idempotency
+ * @description Idempotency store for audit entry creation.
+ *
+ * Concurrency model:
+ * - Node's event loop is single-threaded, so synchronous method bodies are
+ *   effectively atomic with respect to other JavaScript execution.
+ * - However, callers may await between a "get" and a "set" (e.g. across an
+ *   await boundary in an async request handler). Two racing requests can
+ *   both observe "miss" and both proceed to append, causing duplicate audit
+ *   entries and a branched hash chain.
+ * - To harden against this, the store exposes an atomic
+ *   `claim()` operation that reserves a key before the caller awaits any
+ *   I/O. A second concurrent claim for the same key either returns the
+ *   existing record (fast path) or receives a distinct `'in-flight'` status.
+ *
+ * Invariants:
+ * - A given key is at most once in the `in-flight` state at any time.
+ * - A key in the `in-flight` state cannot be reclaimed by another caller
+ *   until it is committed or released.
+ * - Once committed, the record is immutable for the remainder of its TTL.
+ * - Expired records are treated as absent by every read path.
+ * - Body hashes are compared on commit; a mismatch is a client error,
+ *   not a silent overwrite.
+ */
+
 import { createHash } from 'crypto';
 import type { AuditEntry, CreateAuditEntryInput } from './types';
 
@@ -10,6 +36,16 @@ export interface IdempotencyRecord {
 export interface IdempotencyStoreOptions {
   maxSize?: number;
   ttlMs?: number;
+  /**
+   * Optional clock supplied by tests or callers that need deterministic
+   * time behaviour. Defaults to `Date.now`.
+   */
+  clock?: () => number;
+}
+
+export interface IdempotencyClaimResult {
+  status: 'created' | 'existing' | 'conflict';
+  record?: IdempotencyRecord;
 }
 
 /**
@@ -92,8 +128,15 @@ function assertValidKey(key: unknown): asserts key is string {
 
 export class IdempotencyStore {
   private readonly store = new Map<string, IdempotencyRecord>();
+  /**
+   * Keys that have been claimed but not yet committed or released.
+   * Value is the body hash recorded at claim time, so commit can verify
+   * the caller is still working on the same payload.
+   */
+  private readonly inFlight = new Map<string, string>();
   private readonly maxSize: number;
   private readonly ttlMs: number;
+  private readonly clock: () => number;
 
   constructor(options: IdempotencyStoreOptions = {}) {
     const maxSize = options.maxSize ?? DEFAULT_MAX_SIZE;
@@ -191,6 +234,7 @@ export class IdempotencyStore {
   delete(key: string): void {
     assertValidKey(key);
     this.store.delete(key);
+    this.inFlight.delete(key);
   }
 
   size(): number {
@@ -198,8 +242,38 @@ export class IdempotencyStore {
     return this.store.size;
   }
 
+  /** Number of keys currently claimed but not yet committed. */
+  inFlightCount(): number {
+    return this.inFlight.size;
+  }
+
   clear(): void {
     this.store.clear();
+    this.inFlight.clear();
+  }
+
+  private ensureCapacity(): void {
+    if (this.store.size < this.maxSize) {
+      return;
+    }
+
+    // Evict the oldest committed record. We never evict in-flight keys
+    // because that would allow a concurrent caller to claim the same key
+    // and produce a duplicate audit entry.
+    const oldestKey = this.store.keys().next().value;
+    if (oldestKey !== undefined) {
+      this.store.delete(oldestKey);
+    }
+  }
+
+  private ensureCapacity(): void {
+    while (this.store.size >= this.maxSize) {
+      const oldestKey = this.store.keys().next().value;
+      if (oldestKey === undefined) {
+        break;
+      }
+      this.store.delete(oldestKey);
+    }
   }
 
   private write(
@@ -231,7 +305,7 @@ export class IdempotencyStore {
   }
 
   private evictExpired(): void {
-    const now = Date.now();
+    const now = this.clock();
     for (const [key, record] of this.store) {
       if (this.isExpired(record, now)) {
         this.store.delete(key);

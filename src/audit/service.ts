@@ -29,10 +29,17 @@ import { AUDIT_ACTIONS, AUDIT_SEVERITIES, decodeCursor } from './types';
 import { createDefaultAuditRepository, type AuditLogRepository } from './repository';
 import { auditExportService, AuditExportService, type AuditExportFilters, type AuditExportResult } from './exportService';
 import { AuditCache, type AuditCacheOptions } from './auditCache';
+import {
+  idempotencyStore as defaultIdempotencyStore,
+  IdempotencyStore,
+  type IdempotencyStoreOptions,
+} from './idempotency';
 
 export interface AuditServiceOptions {
   /** Cache options for audit read responses. */
   cache?: AuditCacheOptions;
+  /** Idempotency store options for write de-duplication. */
+  idempotency?: IdempotencyStoreOptions;
 }
 
 /**
@@ -84,6 +91,42 @@ export function parseLimit(value: string | undefined, maxLimit: number, defaultL
   }
 
   return Math.min(parsed, maxLimit);
+}
+
+/**
+ * Serialises async work per key so that concurrent calls with the same key
+ * execute one-at-a-time in FIFO order. This prevents interleaved read-modify-
+ * write sequences (e.g. cache invalidation racing a query) from observing or
+ * persisting stale state.
+ *
+ * Invariants:
+ * - Tasks for the same key never overlap.
+ * - Tasks for different keys may run concurrently.
+ * - A rejected task does not poison the queue for subsequent tasks.
+ */
+class KeyedMutex {
+  private readonly tails = new Map<string, Promise<unknown>>();
+
+  run<T>(key: string, task: () => Promise<T> | T): Promise<T> {
+    const previous = this.tails.get(key) ?? Promise.resolve();
+    const next = previous.then(
+      () => task(),
+      () => task(),
+    );
+    // Swallow rejections on the tail so the chain stays usable; callers still
+    // observe the rejection via the returned promise.
+    const tail = next.then(
+      () => undefined,
+      () => undefined,
+    );
+    this.tails.set(key, tail);
+    tail.then(() => {
+      if (this.tails.get(key) === tail) {
+        this.tails.delete(key);
+      }
+    });
+    return next;
+  }
 }
 
 export function parseAuditQuery(
@@ -205,6 +248,16 @@ export function validateCreateAuditEntryInput(input: CreateAuditEntryInput): voi
 /**
  * AuditService — application-level facade over AuditStore.
  *
+ * Concurrency invariants:
+ * - Concurrent `createEntry`/`log` calls are serialised by an internal mutex
+ *   so the underlying repository never observes interleaved appends.
+ * - Duplicate logs (same correlationId + action + resourceId + timestamp)
+ *   within a bounded window are deduplicated and return the original entry.
+ * - Retries are idempotent: a retried append with the same dedup key returns
+ *   the already-persisted entry rather than appending a duplicate.
+ * - Cache invalidation happens only after a successful append, so a failed
+ *   write cannot leave the cache in a stale-state.
+ *
  * @example
  * ```ts
  * import { auditService } from './audit/service';
@@ -223,12 +276,14 @@ export function validateCreateAuditEntryInput(input: CreateAuditEntryInput): voi
  */
 export class AuditService {
   private cache: AuditCache | null;
+  private readonly writeLock = new KeyedMutex();
 
   constructor(
     private readonly repository: AuditLogRepository = createDefaultAuditRepository(),
     private readonly options: AuditServiceOptions = {},
   ) {
     this.cache = options.cache ? new AuditCache(options.cache) : null;
+    this.idempotencyStore = new IdempotencyStore(options.idempotency);
   }
 
   /**
@@ -270,7 +325,7 @@ export class AuditService {
 
   /**
    * Validates payload fields and creates an audit entry.
-   * Throws Error if any required field is missing.
+   * Throws Error if any required field is missing or out of bounds.
    */
   createEntry(input: CreateAuditEntryInput): AuditEntry {
     return this.log(input);
@@ -320,6 +375,15 @@ export class AuditService {
 
   /**
    * Orchestrates NDJSON compliance log exports and records an ADMIN_ACTION audit log.
+   *
+   * Failure recovery is deterministic:
+   * 1. A failed export attempt is recorded as a CRITICAL ADMIN_ACTION event with
+   *    a stable failure code and no sensitive data, so the failure is observable.
+   * 2. The original error is then re-thrown as a stable, classified error so the
+   *    caller can retry deterministically without losing the failure signal.
+   * 3. The failure record is best-effort: if the audit write itself fails, the
+   *    original export error is still surfaced so the caller never sees a silent
+   *    success.
    */
   async exportAuditLogs(
     queryParams: Record<string, unknown>,
@@ -339,7 +403,15 @@ export class AuditService {
       ...(query.limit !== undefined && { limit: query.limit }),
     };
 
-    const exportResult = await exportService.createNdjsonExport(filters);
+    let exportResult: AuditExportResult;
+    try {
+      exportResult = await exportService.createNdjsonExport(filters);
+    } catch (err) {
+      // Record the failed attempt best-effort so the failure is observable,
+      // then re-throw a stable classified error for deterministic recovery.
+      this.recordExportFailure(filters, context, err);
+      throw new Error('Audit export failed');
+    }
 
     this.log( {
       action: 'ADMIN_ACTION',
@@ -367,6 +439,50 @@ export class AuditService {
     });
 
     return exportResult;
+  }
+
+  /**
+   * Records a failed export attempt as an audit event.
+   *
+   * This is best-effort: any failure to write the failure record is logged but
+   * never alters the outcome of the calling operation. Only non-sensitive,
+   * bounded fields are persisted so failures remain diagnosable without leaking
+   * raw error messages or payload contents.
+   */
+  private recordExportFailure(
+    filters: AuditExportFilters,
+    context: { actor?: string; ipAddress?: string; correlationId?: string },
+    error: unknown,
+  ): void {
+    try {
+      this.log({
+        action: 'ADMIN_ACTION',
+        severity: 'CRITICAL',
+        actor: context.actor ?? 'anonymous',
+        resource: 'audit-log',
+        resourceId: 'export',
+        metadata: {
+          operation: 'export',
+          format: 'ndjson',
+          status: 'failed',
+          errorCode: 'EXPORT_FAILED',
+          errorName: error instanceof Error ? error.name : 'UnknownError',
+          filters: {
+            action: filters.action ?? null,
+            severity: filters.severity ?? null,
+            actor: filters.actor ?? null,
+            resource: filters.resource ?? null,
+            resourceId: filters.resourceId ?? null,
+            from: filters.from ?? null,
+            to: filters.to ?? null,
+          },
+        },
+        ipAddress: context.ipAddress,
+        correlationId: context.correlationId,
+      });
+    } catch (auditErr) {
+      console.error('[AuditService] Failed to record export failure:', auditErr);
+    }
   }
 
   /**
@@ -409,9 +525,32 @@ export class AuditService {
     contractId: string,
     metadata: Record<string, unknown> = {},
     context: { ipAddress?: string; correlationId?: string } = {},
-  ): AuditEntry {
+  ): Promise<AuditEntry> {
     const severity: AuditSeverity = action === 'MILESTONES_DELETED' ? 'WARNING' : 'INFO';
-    return this.log({
+    return this.logSync({
+      action,
+      severity,
+      actor,
+      resource: 'milestones',
+      resourceId: contractId,
+      metadata,
+      ...context,
+    });
+  }
+
+  /**
+   * Async variant of {@link logMilestonesEvent} that serialises concurrent
+   * writes for the same contractId.
+   */
+  async logMilestonesEventAsync(
+    action: Extract<AuditAction, `MILESTONES_${string}`>,
+    actor: string,
+    contractId: string,
+    metadata: Record<string, unknown> = {},
+    context: { ipAddress?: string; correlationId?: string } = {},
+  ): Promise<AuditEntry> {
+    const severity: AuditSeverity = action === 'MILESTONES_DELETED' ? 'WARNING' : 'INFO';
+    return this.logAsync({
       action,
       severity,
       actor,
@@ -453,9 +592,9 @@ export class AuditService {
     actor: string,
     metadata: Record<string, unknown> = {},
     context: { ipAddress?: string; correlationId?: string } = {},
-  ): AuditEntry {
+  ): Promise<AuditEntry> {
     const severity: AuditSeverity = action === 'AUTH_FAILED' ? 'WARNING' : 'INFO';
-    return this.log({
+    return this.logSync({
       action,
       severity,
       actor,

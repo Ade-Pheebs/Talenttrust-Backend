@@ -1,3 +1,4 @@
+
 /**
  * @file service.test.ts
  * @description Focused unit tests for the `AuditService`-level contract.
@@ -791,7 +792,14 @@ describe('AuditService — extracted business logic & query parsing', () => {
         nextCursor: undefined,
       });
 
-      const validCursor = Buffer.from(JSON.stringify({ timestamp: '2026-01-01T00:00:00.000Z', id: '123' })).toString('base64url');
+      // Must be produced by the codec: decodeCursor now enforces the real
+      // CursorData shape ({ lastId, lastTimestamp, filters }) rather than
+      // accepting any JSON object.
+      const validCursor = encodeCursor({
+        lastId: '123',
+        lastTimestamp: '2026-01-01T00:00:00.000Z',
+        filters: {},
+      });
       const result = service.queryLogs({ cursor: validCursor });
 
       expect(result).toHaveProperty('nextCursor');

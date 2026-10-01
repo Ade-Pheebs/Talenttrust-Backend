@@ -1,1 +1,415 @@
-LyoqCiAqIEBtb2R1bGUgYXVkaXQvc2VydmljZQogKiBAZGVzY3JpcHRpb24gSGlnaC1sZXZlbCBhdWRpdCBsb2dnaW5nIHNlcnZpY2UuCiAqCiAqIFByb3ZpZGVzIGEgY2xlYW4gQVBJIGZvciBhcHBsaWNhdGlvbiBjb2RlIHRvIGVtaXQgYXVkaXQgZXZlbnRzIHdpdGhvdXQKICogY291cGxpbmcgZGlyZWN0bHkgdG8gdGhlIHN0b3JlIGltcGxlbWVudGF0aW9uLiBBbGwgc2Vuc2l0aXZlIHN0YXRlIGNoYW5nZXMKICogKGNvbnRyYWN0IGxpZmVjeWNsZSwgcGF5bWVudHMsIHVzZXIgbWFuYWdlbWVudCwgYXV0aCBldmVudHMpIG11c3QgZ28gdGhyb3VnaAogKiB0aGlzIHNlcnZpY2UuCiAqCiAqIFNlY3VyaXR5IG5vdGVzOgogKiAtIENhbGxlcnMgTVVTVCBzYW5pdGlzZSBtZXRhZGF0YSBiZWZvcmUgcGFzc2luZyBpdCBpbiDigJQgbm8gcmF3IFBJSS4KICogLSBMb2dnaW5nIGZhaWx1cmVzIGFyZSBjYXVnaHQgYW5kIHJlcG9ydGVkIHZpYSBjb25zb2xlLmVycm9yIHRvIGF2b2lkCiAqICAgZGlzcnVwdGluZyB0aGUgcHJpbWFyeSByZXF1ZXN0IGZsb3csIGJ1dCB0aGV5IGFyZSBhbHNvIHJlLXRocm93biBpbgogKiAgIHN0cmljdCBtb2RlIHNvIHRlc3RzIGNhbiBhc3NlcnQgb24gdGhlbS4KICovCgppbXBvcnQgdHlwZSB7IEF1ZGl0RW50cnksIEF1ZGl0UXVlcnksIEF1ZGl0U2V2ZXJpdHksIENyZWF0ZUF1ZGl0RW50cnlJbnB1dCwgSW50ZWdyaXR5UmVwb3J0LCBBdWRpdFF1ZXJ5UmVzdWx0IH0gZnJvbSAnLi90eXBlcyc7CmltcG9ydCB0eXBlIHsgQXVkaXRBY3Rpb24gfSBmcm9tICcuL3R5cGVzJzsKaW1wb3J0IHsgZGVjb2RlQ3Vyc29yIH0gZnJvbSAnLi90eXBlcyc7CmltcG9ydCB7IGNyZWF0ZURlZmF1bHRBdWRpdFJlcG9zaXRvcnksIHR5cGUgQXVkaXRMb2dSZXBvc2l0b3J5IH0gZnJvbSAnLi9yZXBvc2l0b3J5JzsKaW1wb3J0IHsgYXVkaXRFeHBvcnRTZXJ2aWNlLCBBdWRpdEV4cG9ydFNlcnZpY2UsIHR5cGUgQXVkaXRFeHBvcnRGaWx0ZXJzLCB0eXBlIEF1ZGl0RXhwb3J0UmVzdWx0IH0gZnJvbSAnLi9leHBvcnRTZXJ2aWNlJzsKaW1wb3J0IHsgQXVkaXRDYWNoZSwgdHlwZSBBdWRpdENhY2hlT3B0aW9ucyB9IGZyb20gJy4vYXVkaXRDYWNoZSc7CgpleHBvcnQgaW50ZXJmYWNlIEF1ZGl0U2VydmljZU9wdGlvbnMgewogIC8qKiBDYWNoZSBvcHRpb25zIGZvciBhdWRpdCByZWFkIHJlc3BvbnNlcy4gKi8KICBjYWNoZT86IEF1ZGl0Q2FjaGVPcHRpb25zOwp9CgpleHBvcnQgY29uc3QgVkFMSURfQUNUSU9OUyA9IG5ldyBTZXQ8QXVkaXRBY3Rpb24+KFsnQ09OVFJBQ1RfQ1JFQVRFRCcsICdDT05UUkFDVF9VUERBVEVEJywgJ0NPTlRSQUNUX0NBTkNFTExFRCcsICdDT05UUkFDVF9DT01QTEVURUQnLCAnUEFZTUVOVF9JTklUSUFURUQnLCAnUEFZTUVOVF9SRUxFQVNFRCcsICdQQVlNRU5UX0RJU1BVRUQnLCAnUkVQVVRBVElPTl9VUERBVEVEJywgJ1JFUFVUQVRJT05fQ09SUkVDVEVEJywgJ1VTRVJfQ1JFQVRFRCcsICdVU0VSX1VQREFURUQnLCAnVVNFUl9ERUxFVEVEJywgJ0FVVEhfTE9HSU4nLCAnQVVUSF9MT0dPVVQnLCAnQVVUSF9GQUlMRUQnLCAnQVVUSF9MT0NLT1VUX1RSSUdHRVJFRCcsICdBVVRIX0xPQ0tPVVRfUkVMRUFTRUQnLCAnQURNSU5fQUNUSU9OJywgJ0VORFBPSU5UX0FDQ0VTUycsICdFTkRQT0lOVF9NVVRBVElPTiddKTsKCmV4cG9ydCBjb25zdCBWQUxJRF9TRVZFUklUSUVTID0gbmV3IFNldDxBdWRpdFNldmVyaXR5PihbJ0lORk8nLCAnV0FSTklORycsICdDUklUSUNBTCddKTsKCmV4cG9ydCBmdW5jdGlvbiBwYXJzZU9wdGlvbmFsSXNvRGF0ZSgKICB2YWx1ZTogc3RyaW5nIHwgdW5kZWZpbmVkLAogIGZpZWxkTmFtZTogJ2Zyb20nIHwgJ3RvJywKKTogc3RyaW5nIHwgdW5kZWZpbmVkIHsKICBpZiAodmFsdWUgPT09IHVuZGVmaW5lZCkgewogICAgcmV0dXJuIHVuZGVmaW5lZDsKICB9CgogIGNvbnN0IHBhcnNlZCA9IERhdGUucGFyc2UodmFsdWUpOwogIGlmIChOdW1iZXIuaXNOYU4ocGFyc2VkKSkgewogICAgdGhyb3cgbmV3IEVycm9yKGBJbnZhbGlkICR7ZmllbGROYW1lfSB0aW1lc3RhbXBgKTsKICB9CgogIHJldHVybiBuZXcgRGF0ZShwYXJzZWQpLnRvSVNPU3RyaW5nKCk7Cn0KCmV4cG9ydCBmdW5jdGlvbiBwYXJzZU9mZnNldCh2YWx1ZTogc3RyaW5nIHwgdW5kZWZpbmVkKTogbnVtYmVyIHsKICBpZiAodmFsdWUgPT09IHVuZGVmaW5lZCkgewogICAgcmV0dXJuIDA7CiAgfQoKICBjb25zdCBwYXJzZWQgPSBOdW1iZXIucGFyc2VJbnQodmFsdWUsIDEwKTsKICBpZiAoIU51bWJlci5pc0Zpbml0ZShwYXJzZWQpIHx8IHBhcnNlZCA8IDApIHsKICAgIHRocm93IG5ldyBFcnJvcignSW52YWxpZCBvZmZzZXQnKTsKICB9CgogIHJldHVybiBwYXJzZWQ7Cn0KCmV4cG9ydCBmdW5jdGlvbiBwYXJzZUxpbWl0KHZhbHVlOiBzdHJpbmcgfCB1bmRlZmluZWQsIG1heExpbWl0OiBudW1iZXIsIGRlZmF1bHRMaW1pdD86IG51bWJlcik6IG51bWJlciB8IHVuZGVmaW5lZCB7CiAgaWYgKHZhbHVlID09PSB1bmRlZmluZWQpIHsKICAgIHJldHVybiBkZWZhdWx0TGltaXQ7CiAgfQoKICBjb25zdCBwYXJzZWQgPSBOdW1iZXIucGFyc2VJbnQodmFsdWUsIDEwKTsKICBpZiAoIU51bWJlci5pc0Zpbml0ZShwYXJzZWQpIHx8IHBhcnNlZCA8IDEpIHsKICAgIHRocm93IG5ldyBFcnJvcignSW52YWxpZCBsaW1pdCcpOwogIH0KCiAgcmV0dXJuIE1hdGgubWluKHBhcnNlZCwgbWF4TGltaXQpOwp9CgpleHBvcnQgZnVuY3Rpb24gcGFyc2VBdWRpdFF1ZXJ5KAogIHJlcVF1ZXJ5OiBSZWNvcmQ8c3RyaW5nLCB1bmtub3duPiwKICBvcHRpb25zOiB7IGRlZmF1bHRMaW1pdD86IG51bWJlcjsgbWF4TGltaXQ6IG51bWJlciB9LAopOiB7IHF1ZXJ5OiBBdWRpdFF1ZXJ5OyBsaW1pdD86IG51bWJlcjsgb2Zmc2V0OiBudW1iZXIgfSB7CiAgY29uc3QgYWN0aW9uID0gcmVxUXVlcnlbJ2FjdGlvbiddIGFzIHN0cmluZyB8IHVuZGVmaW5lZDsKICBjb25zdCBzZXZlcml0eSA9IHJlcVF1ZXJ5WydzZXZlcml0eSddIGFzIHN0cmluZyB8IHVuZGVmaW5lZDsKICBjb25zdCBhY3RvciA9IHJlcVF1ZXJ5WydhY3RvciddIGFzIHN0cmluZyB8IHVuZGVmaW5lZDsKICBjb25zdCByZXNvdXJjZSA9IHJlcVF1ZXJ5WydyZXNvdXJjZSddIGFzIHN0cmluZyB8IHVuZGVmaW5lZDsKICBjb25zdCByZXNvdXJjZUlkID0gcmVxUXVlcnlbJ3Jlc291cmNlSWQnXSBhcyBzdHJpbmcgfCB1bmRlZmluZWQ7CiAgY29uc3QgY3Vyc29yID0gcmVxUXVlcnlbJ2N1cnNvciddIGFzIHN0cmluZyB8IHVuZGVmaW5lZDsKCiAgaWYgKGFjdGlvbiAmJiAhVkFMSURfQUNUSU9OUy5oYXMoYWN0aW9uIGFzIEF1ZGl0QWN0aW9uKSkgewogICAgdGhyb3cgbmV3IEVycm9yKGBJbnZhbGlkIGFjdGlvbjogJHthY3Rpb259YCk7CiAgfQoKICBpZiAoc2V2ZXJpdHkgJiYgIVZBTElEX1NFVkVSSVRJRVMuaGFzKHNldmVyaXR5IGFzIEF1ZGl0U2V2ZXJpdHkpKSB7CiAgICB0aHJvdyBuZXcgRXJyb3IoYEludmFsaWQgc2V2ZXJpdHk6ICR7c2V2ZXJpdHl9YCk7CiAgfQoKICBjb25zdCBsaW1pdCA9IHBhcnNlTGltaXQocmVxUXVlcnlbJ2xpbWl0J10gYXMgc3RyaW5nIHwgdW5kZWZpbmVkLCBvcHRpb25zLm1heExpbWl0LCBvcHRpb25zLmRlZmF1bHRMaW1pdCk7CiAgY29uc3Qgb2Zmc2V0ID0gcGFyc2VPZmZzZXQocmVxUXVlcnlbJ29mZnNldCddIGFzIHN0cmluZyB8IHVuZGVmaW5lZCk7CiAgY29uc3QgZnJvbSA9IHBhcnNlT3B0aW9uYWxJc29EYXRlKHJlcVF1ZXJ5Wydmcm9tJ10gYXMgc3RyaW5nIHwgdW5kZWZpbmVkLCAnZnJvbScpOwogIGNvbnN0IHRvID0gcGFyc2VPcHRpb25hbElzb0RhdGUocmVxUXVlcnlbJ3RvJ10gYXMgc3RyaW5nIHwgdW5kZWZpbmVkLCAndG8nKTsKCiAgLy8gVmFsaWRhdGUgY3Vyc29yIGZvcm1hdCBpZiBwcm92aWRlZAogIGlmIChjdXJzb3IpIHsKICAgIHRyeSB7CiAgICAgIGRlY29kZUN1cnNvcihjdXJzb3IpOwogICAgfSBjYXRjaCAoX2Vycm9yKSB7CiAgICAgIHRocm93IG5ldyBFcnJvcignSW52YWxpZCBjdXJzb3IgZm9ybWF0Jyk7CiAgICB9CiAgfQoKICByZXR1cm4gewogICAgcXVlcnk6IHsKICAgICAgLi4uKGFjdGlvbiAmJiB7IGFjdGlvbjogYWN0aW9uIGFzIEF1ZGl0QWN0aW9uIH0pLAogICAgICAuLi4oc2V2ZXJpdHkgJiYgeyBzZXZlcml0eTogc2V2ZXJpdHkgYXMgQXVkaXRTZXZlcml0eSB9KSwKICAgICAgLi4uKGFjdG9yICYmIHsgYWN0b3IgfSksCiAgICAgIC4uLihyZXNvdXJjZSAmJiB7IHJlc291cmNlIH0pLAogICAgICAuLi4ocmVzb3VyY2VJZCAmJiB7IHJlc291cmNlSWQgfSksCiAgICAgIC4uLihmcm9tICYmIHsgZnJvbSB9KSwKICAgICAgLi4uKHRvICYmIHsgdG8gfSksCiAgICAgIC4uLihsaW1pdCAhPT0gdW5kZWZpbmVkICYmIHsgbGltaXQgfSksCiAgICAgIG9mZnNldCwKICAgICAgLi4uKGN1cnNvciAmJiB7IGN1cnNvciB9KSwKICAgIH0sCiAgICBsaW1pdCwKICAgIG9mZnNldCwKICB9Owp9CgovKioKICogQXVkaXRTZXJ2aWNlIOKAlCBhcHBsaWNhdGlvbi1sZXZlbCBmYWNhZGUgb3ZlciBBdWRpdFN0b3JlLgogKgogKiBAZXhhbXBsZQogKiBgYGB0cwogKiBpbXBvcnQgeyBhdWRpdFNlcnZpY2UgfSBmcm9tICcuL2F1ZGl0L3NlcnZpY2UnOwogKgogKiBhd2FpdCBhdWRpdFNlcnZpY2UubG9nKHsKICogICBhY3Rpb246ICdDT05UUkFDVF9DUkVBVEVEJywKICogICBzZXZlcml0eTogJ0lORk8nLAogKiAgIGFjdG9yOiByZXEudXNlci5pZCwKICogICByZXNvdXJjZTogJ2NvbnRyYWN0JywKICogICByZXNvdXJjZUlkOiBjb250cmFjdC5pZCwKICogICBtZXRhZGF0YTogeyBjbGllbnRJZDogY29udHJhY3QuY2xpZW50SWQgfSwKICogICBpcEFkZHJlc3M6IHJlcS5pcCwKICogICBjb3JyZWxhdGlvbklkOiByZXEuaGVhZGVyc1sneC1jb3JyZWxhdGlvbi1pZCddIGFzIHN0cmluZywKICogfSk7CiAqIGBgYAogKi8KZXhwb3J0IGNsYXNzIEF1ZGl0U2VydmljZSB7CiAgcHJpdmF0ZSBjYWNoZTogQXVkaXRDYWNoZSB8IG51bGw7CgogIGNvbnN0cnVjdG9yKAogICAgcHJpdmF0ZSByZWFkb25seSByZXBvc2l0b3J5OiBBdWRpdExvZ1JlcG9zaXRvcnkgPSBjcmVhdGVEZWZhdWx0QXVkaXRSZXBvc2l0b3J5KCksCiAgICBwcml2YXRlIHJlYWRvbmx5IG9wdGlvbnM6IEF1ZGl0U2VydmljZU9wdGlvbnMgPSB7fSwKICApIHsKICAgIHRoaXMuY2FjaGUgPSBvcHRpb25zLmNhY2hlID8gbmV3IEF1ZGl0Q2FjaGUob3B0aW9ucy5jYWNoZSkgOiBudWxsOwogIH0KCiAgLyoqCiAgICogUmVjb3JkcyBhbiBhdWRpdCBldmVudC4KICAgKgogICAqIEBwYXJhbSBpbnB1dCAtIEV2ZW50IGRldGFpbHMuIG1ldGFkYXRhIG11c3QgYmUgcHJlLXNhbml0aXNlZC4KICAgKiBAcmV0dXJucyBUaGUgcGVyc2lzdGVkLCBpbW11dGFibGUgQXVkaXRFbnRyeS4KICAgKiBAdGhyb3dzIE9ubHkgd2hlbiBvcHRpb25zLnN0cmljdCBpcyB0cnVlIGFuZCB0aGUgc3RvcmUgdGhyb3dzLgogICAqLwogIGxvZyhpbnB1dDogQ3JlYXRlQXVkaXRFbnRyeUlucHV0KTogQXVkaXRFbnRyeSB7CiAgICB0cnkgewogICAgICBjb25zdCBlbnRyeSA9IHRoaXMucmVwb3NpdG9yeS5hcHBlbmQoaW5wdXQpOwogICAgICAKICAgICAgLy8gSW52YWxpZGF0ZSBjYWNoZSBvbiB3cml0ZSBvcGVyYXRpb25zCiAgICAgIGlmICh0aGlzLmNhY2hlKSB7CiAgICAgICAgdGhpcy5jYWNoZS5pbnZhbGlkYXRlQnlSZXNvdXJjZUlkKGlucHV0LnJlc291cmNlSWQpOwogICAgICB9CiAgICAgIAogICAgICByZXR1cm4gZW50cnk7CiAgICB9IGNhdGNoIChlcnIpIHsKICAgICAgY29uc29sZS5lcnJvcignW0F1ZGl0U2VydmljZV0gRmFpbGVkIHRvIHBlcnNpc3QgYXVkaXQgZW50cnk6JywgZXJyKTsKICAgICAgdGhyb3cgZXJyOwogICAgfQogIH0KCiAgLyoqCiAgICogVmFsaWRhdGVzIHBheWxvYWQgZmllbGRzIGFuZCBjcmVhdGVzIGFuIGF1ZGl0IGVudHJ5LgogICAqIFRocm93cyBFcnJvciBpZiBhbnkgcmVxdWlyZWQgZmllbGQgaXMgbWlzc2luZy4KICAgKi8KICBjcmVhdGVFbnRyeShpbnB1dDogQ3JlYXRlQXVkaXRFbnRyeUlucHV0KTogQXVkaXRFbnRyeSB7CiAgICBpZiAoIWlucHV0LmFjdGlvbiB8fCAhaW5wdXQuc2V2ZXJpdHkgfHwgIWlucHV0LmFjdG9yIHx8ICFpbnB1dC5yZXNvdXJjZSB8fCAhaW5wdXQucmVzb3VyY2VJZCkgewogICAgICB0aHJvdyBuZXcgRXJyb3IoJ01pc3NpbmcgcmVxdWlyZWQgZmllbGRzOiBhY3Rpb24sIHNldmVyaXR5LCBhY3RvciwgcmVzb3VyY2UsIHJlc291cmNlSWQnKTsKICAgIH0KICAgIHJldHVybiB0aGlzLmxvZyhpbnB1dCk7CiAgfQoKICAvKioKICAgKiBWYWxpZGF0ZXMgcmF3IHF1ZXJ5IHBhcmFtZXRlcnMgYW5kIHJldHVybnMgcGFyc2VkIEF1ZGl0UXVlcnkuCiAgICovCiAgdmFsaWRhdGVBbmRQYXJzZVF1ZXJ5KAogICAgcmVxUXVlcnk6IFJlY29yZDxzdHJpbmcsIHVua25vd24+LAogICAgb3B0aW9uczogeyBkZWZhdWx0TGltaXQ/OiBudW1iZXI7IG1heExpbWl0OiBudW1iZXIgfSwKICApOiB7IHF1ZXJ5OiBBdWRpdFF1ZXJ5OyBsaW1pdD86IG51bWJlcjsgb2Zmc2V0OiBudW1iZXIgfSB7CiAgICByZXR1cm4gcGFyc2VBdWRpdFF1ZXJ5KHJlcVF1ZXJ5LCBvcHRpb25zKTsKICB9CgogIC8qKgogICAqIFByb2Nlc3NlcyBxdWVyeSBmaWx0ZXJzIGFuZCByZXR1cm5zIGZvcm1hdHRlZCBwYWdpbmF0ZWQgcmVzdWx0cy4KICAgKi8KICBxdWVyeUxvZ3MoCiAgICBxdWVyeVBhcmFtczogUmVjb3JkPHN0cmluZywgdW5rbm93bj4sCiAgICBvcHRpb25zOiB7IGRlZmF1bHRMaW1pdD86IG51bWJlcjsgbWF4TGltaXQ6IG51bWJlciB9ID0geyBkZWZhdWx0TGltaXQ6IDUwLCBtYXhMaW1pdDogMTAwIH0sCiAgKToKICAgIHwgeyBlbnRyaWVzOiBBdWRpdEVudHJ5W107IGNvdW50OiBudW1iZXI7IGxpbWl0PzogbnVtYmVyOyBuZXh0Q3Vyc29yPzogc3RyaW5nIH0KICAgIHwgeyBlbnRyaWVzOiBBdWRpdEVudHJ5W107IGNvdW50OiBudW1iZXI7IGxpbWl0OiBudW1iZXI7IG9mZnNldDogbnVtYmVyIH0gewogICAgY29uc3QgeyBxdWVyeSB9ID0gdGhpcy52YWxpZGF0ZUFuZFBhcnNlUXVlcnkocXVlcnlQYXJhbXMsIG9wdGlvbnMpOwoKICAgIGlmIChxdWVyeS5jdXJzb3IpIHsKICAgICAgY29uc3QgcmVzdWx0ID0gdGhpcy5xdWVyeVdpdGhDdXJzb3IocXVlcnkpOwogICAgICByZXR1cm4gewogICAgICAgIGVudHJpZXM6IHJlc3VsdC5lbnRyaWVzLAogICAgICAgIGNvdW50OiByZXN1bHQuY291bnQsCiAgICAgICAgbGltaXQ6IHJlc3VsdC5saW1pdCwKICAgICAgICBuZXh0Q3Vyc29yOiByZXN1bHQubmV4dEN1cnNvciwKICAgICAgfTsKICAgIH0KCiAgICBjb25zdCBsaW1pdCA9IHF1ZXJ5LmxpbWl0ID8/IG9wdGlvbnMuZGVmYXVsdExpbWl0ID8/IDUwOwogICAgY29uc3Qgb2Zmc2V0ID0gcXVlcnkub2Zmc2V0ID8/IDA7CiAgICBjb25zdCBlbnRyaWVzID0gdGhpcy5xdWVyeShxdWVyeSk7CiAgICByZXR1cm4gewogICAgICBlbnRyaWVzLAogICAgICBjb3VudDogZW50cmllcy5sZW5ndGgsCiAgICAgIGxpbWl0LAogICAgICBvZmZzZXQsCiAgICB9OwogIH0KCiAgLyoqCiAgICogT3JjaGVzdHJhdGVzIE5ESlNPTiBjb21wbGlhbmNlIGxvZyBleHBvcnRzIGFuZCByZWNvcmRzIGFuIEFETUlOX0FDVElPTiBhdWRpdCBsb2cuCiAgICovCiAgYXN5bmMgZXhwb3J0QXVkaXRMb2dzKAogICAgcXVlcnlQYXJhbXM6IFJlY29yZDxzdHJpbmcsIHVua25vd24+LAogICAgY29udGV4dDogeyBhY3Rvcj86IHN0cmluZzsgaXBBZGRyZXNzPzogc3RyaW5nOyBjb3JyZWxhdGlvbklkPzogc3RyaW5nIH0sCiAgICBleHBvcnRTZXJ2aWNlOiBBdWRpdEV4cG9ydFNlcnZpY2UgPSBhdWRpdEV4cG9ydFNlcnZpY2UsCiAgKTogUHJvbWlzZTxBdWRpdEV4cG9ydFJlc3VsdD4gewogICAgY29uc3QgeyBxdWVyeSB9ID0gdGhpcy52YWxpZGF0ZUFuZFBhcnNlUXVlcnkocXVlcnlQYXJhbXMsIHsgbWF4TGltaXQ6IDUwXzAwMCB9KTsKCiAgICBjb25zdCBmaWx0ZXJzOiBBdWRpdEV4cG9ydEZpbHRlcnMgPSB7CiAgICAgIC4uLihxdWVyeS5hY3Rpb24gJiYgeyBhY3Rpb246IHF1ZXJ5LmFjdGlvbiB9KSwKICAgICAgLi4uKHF1ZXJ5LnNldmVyaXR5ICYmIHsgc2V2ZXJpdHk6IHF1ZXJ5LnNldmVyaXR5IH0pLAogICAgICAuLi4ocXVlcnkuYWN0b3IgJiYgeyBhY3RvcjogcXVlcnkuYWN0b3IgfSksCiAgICAgIC4uLihxdWVyeS5yZXNvdXJjZSAmJiB7IHJlc291cmNlOiBxdWVyeS5yZXNvdXJjZSB9KSwKICAgICAgLi4uKHF1ZXJ5LnJlc291cmNlSWQgJiYgeyByZXNvdXJjZUlkOiBxdWVyeS5yZXNvdXJjZUlkIH0pLAogICAgICAuLi4ocXVlcnkuZnJvbSAmJiB7IGZyb206IHF1ZXJ5LmZyb20gfSksCiAgICAgIC4uLihxdWVyeS50byAmJiB7IHRvOiBxdWVyeS50byB9KSwKICAgICAgLi4uKHF1ZXJ5LmxpbWl0ICE9PSB1bmRlZmluZWQgJiYgeyBsaW1pdDogcXVlcnkubGltaXQgfSksCiAgICB9OwoKICAgIGNvbnN0IGV4cG9ydFJlc3VsdCA9IGF3YWl0IGV4cG9ydFNlcnZpY2UuY3JlYXRlTmRqc29uRXhwb3J0KGZpbHRlcnMpOwoKICAgIHRoaXMubG9nKHsKICAgICAgYWN0aW9uOiAnQURNSU5fQUNUSU9OJy wKICAgICAgc2V2ZXJpdHk6ICdDUklUSUNBTCcsCiAgICAgIGFjdG9yOiBjb250ZXh0LmFjdG9yID8/ICdhbm9ueW1vdXMnLAogICAgICByZXNvdXJjZTogJ2F1ZGl0LWxvZycsCiAgICAgIHJlc291cmNlSWQ6ICdleHBvcnQnLAogICAgICBtZXRhZGF0YTogewogICAgICAgIG9wZXJhdGlvbjogJ2V4cG9ydCcsCiAgICAgICAgZm9ybWF0OiAnbmRqc29uJywKICAgICAgICBmaWx0ZXJzOiB7CiAgICAgICAgICBhY3Rpb246IGZpbHRlcnMuYWN0aW9uID8/IG51bGwsCiAgICAgICAgICBzZXZlcml0eTogZmlsdGVycy5zZXZlcml0eSA/PyBudWxsLAogICAgICAgICAgYWN0b3I6IGZpbHRlcnMuYWN0b3IgPz8gbnVsbCwKICAgICAgICAgIHJlc291cmNlOiBmaWx0ZXJzLnJlc291cmNlID8/IG51bGwsCiAgICAgICAgICByZXNvdXJjZUlkOiBmaWx0ZXJzLnJlc291cmNlSWQgPz8gbnVsbCwKICAgICAgICAgIGZyb206IGZpbHRlcnMuZnJvbSA/PyBudWxsLAogICAgICAgICAgdG86IGZpbHRlcnMudG8gPz8gbnVsbCwKICAgICAgICB9LAogICAgICAgIHJlY29yZENvdW50OiBleHBvcnRSZXN1bHQucmVjb3JkQ291bnQsCiAgICAgICAgYnl0ZXNXcml0dGVuOiBleHBvcnRSZXN1bHQuYnl0ZXNXcml0dGVuLAogICAgICB9LAogICAgICBpcEFkZHJlc3M6IGNvbnRleHQuaXBBZGRyZXNzLAogICAgICBjb3JyZWxhdGlvbklkOiBjb250ZXh0LmNvcnJlbGF0aW9uSWQsCiAgICB9KTsKCiAgICByZXR1cm4gZXhwb3J0UmVzdWx0OwogIH0KCiAgLyoqCiAgICogQ29udmVuaWVuY2Ugd3JhcHBlciBmb3IgY29udHJhY3QgbGlmZWN5Y2xlIGV2ZW50cy4KICAgKi8KICBsb2dDb250cmFjdEV2ZW50KAogICAgYWN0aW9uOiBFeHRyYWN0PEF1ZGl0QWN0aW9uLCBgQ09OVFJBQ1RfJHtzdHJpbmd9YD4sCiAgICBhY3Rvcjogc3RyaW5nLAogICAgY29udHJhY3RJZDogc3RyaW5nLAogICAgbWV0YWRhdGE6IFJlY29yZDxzdHJpbmcsIHVua25vd24+ID0ge30sCiAgICBjb250ZXh0OiB7IGlwQWRkcmVzcz86IHN0cmluZzsgY29ycmVsYXRpb25JZD86IHN0cmluZyB9ID0ge30sCiAgKTogQXVkaXRFbnRyeSB7CiAgICByZXR1cm4gdGhpcy5sb2coewogICAgICBhY3Rpb24sCiAgICAgIHNldmVyaXR5OiAnSU5GTycsCiAgICAgIGFjdG9yLAogICAgICByZXNvdXJjZTogJ2NvbnRyYWN0JywKICAgICAgcmVzb3VyY2VJZDogY29udHJhY3RJZCwKICAgICAgbWV0YWRhdGEsCiAgICAgIC4uLmNvbnRleHQsCiAgICB9KTsKICB9CgogIC8qKgogICAqIENvbnZlbmllbmNlIHdyYXBwZXIgZm9yIG1pbGVzdG9uZS1tdXRhdGlvbiBldmVudHMgb24gYSBjb250cmFjdC4KICAgKgogICAqIE1pbGVzdG9uZXMgYXJlIGEgZmllbGQgb24gdGhlIENvbnRyYWN0IHJlc291cmNlIHJhdGhlciB0aGFuIGEKICAgKiBzZXBhcmF0ZWx5LXBlcnNpc3RlZCBlbnRpdHksIHNvIGBtZXRhZGF0YWAgaXMgZXhwZWN0ZWQgdG8gY2FycnkgYQogICAqIGB7IGJlZm9yZSwgYWZ0ZXIgfWAgcGFpciBvZiBib3VuZGVkLCByZWRhY3RlZCBzbmFwc2hvdHMgKHNlZQogICAqIGBtb2R1bGVzL2NvbnRyYWN0cy9taWxlc3RvbmVzQXVkaXQudHNgKSByYXRoZXIgdGhhbiBhIERCIHJvdyBkaWZmLgogICAqCiAgICogTUlMRVNUT05FU19ERUxFVEVEIGlzIFdBUk5JTkcgc2V2ZXJpdHkg4oCUIGxvc2luZyBtaWxlc3RvbmUgZGF0YSAod2hldGhlcgogICAqIHZpYSBhbiBleHBsaWNpdCBjbGVhciBvciBhIGNvbnRyYWN0IGRlbGV0aW9uKSBpcyB0aGUgY2hhbmdlIG1vc3QgbGlrZWx5CiAgICogdG8gbWF0dGVyIGR1cmluZyBhbiBpbmNpZGVudCByZXZpZXcsIHNvIGl0IGlzIGZsYWdnZWQgYWJvdmUgdGhlIGRlZmF1bHQKICAgKiBJTkZPIGxldmVsIHVzZWQgZm9yIGNyZWF0ZWQvdXBkYXRlZC4KICAgKi8KICBsb2dNaWxlc3RvbmVzRXZlbnQoCiAgICBhY3Rpb246IEV4dHJhY3Q8QXVkaXRBY3Rpb24sIGBNSUxFU1RPTkVTXyR7c3RyaW5nfWA+LAogICAgYWN0b3I6IHN0cmluZywKICAgIGNvbnRyYWN0SWQ6IHN0cmluZywKICAgIG1ldGFkYXRhOiBSZWNvcmQ8c3RyaW5nLCB1bmtub3duPiA9IHt9LAogICAgY29udGV4dDogeyBpcEFkZHJlc3M/OiBzdHJpbmc7IGNvcnJlbGF0aW9uSWQ/OiBzdHJpbmcgfSA9IHt9LAogICk6IEF1ZGl0RW50cnkgewogICAgY29uc3Qgc2V2ZXJpdHk6IEF1ZGl0U2V2ZXJpdHkgPSBhY3Rpb24gPT09ICdNSUxFU1RPTkVTX0RFTEVURUQnID8gJ1dBUk5JTkcnIDogJ0lORk8nOwogICAgcmV0dXJuIHRoaXMubG9nKHsKICAgICAgYWN0aW9uLAogICAgICBzZXZlcml0eSwKICAgICAgYWN0b3IsCiAgICAgIHJlc291cmNlOiAnbWlsZXN0b25lcycsCiAgICAgIHJlc291cmNlSWQ6IGNvbnRyYWN0SWQsCiAgICAgIG1ldGFkYXRhLAogICAgICAuLi5jb250ZXh0LAogICAgfSk7CiAgfQoKICAvKioKICAgKiBDb252ZW5pZW5jZSB3cmFwcGVyIGZvciBwYXltZW50IGV2ZW50cy4KICAgKiBQYXltZW50IGV2ZW50cyBhcmUgYWx3YXlzIENSSVRJQ0FMIHNldmVyaXR5LgogICAqLwogIGxvZ1BheW1lbnRFdmVudCgKICAgIGFjdGlvbjogRXh0cmFjdDxBdWRpdEFjdGlvbiwgYFBBWU1FTlRfJHtzdHJpbmd9YD4sCiAgICBhY3Rvcjogc3RyaW5nLAogICAgcGF5bWVudElkOiBzdHJpbmcsCiAgICBtZXRhZGF0YTogUmVjb3JkPHN0cmluZywgdW5rbm93bj4gPSB7fSwKICAgIGNvbnRleHQ6IHsgaXBBZGRyZXNzPzogc3RyaW5nOyBjb3JyZWxhdGlvbklkPzogc3RyaW5nIH0gPSB7fSwKICApOiBBdWRpdEVudHJ5IHsKICAgIHJldHVybiB0aGlzLmxvZyggewogICAgICBhY3Rpb24sCiAgICAgIHNldmVyaXR5OiAnQ1JJVElDQUwnLAogICAgICBhY3RvciwKICAgICAgcmVzb3VyY2U6ICdwYXltZW50JywKICAgICAgcmVzb3VyY2VJZDogcGF5bWVudElkLAogICAgICBtZXRhZGF0YSwKICAgICAgLi4uY29udGV4dCwKICAgIH0pOwogIH0KCiAgLyoqCiAgICogQ29udmVuaWVuY2Ugd3JhcHBlciBmb3IgYXV0aGVudGljYXRpb24gZXZlbnRzLgogICAqIEFVVEhfRkFJTEVEIGlzIFdBUk5JTkc7IG90aGVycyBhcmUgSU5GTy4KICAgKi8KICBsb2dBdXRoRXZlbnQoCiAgICBhY3Rpb246IEV4dHJhY3Q8QXVkaXRBY3Rpb24sIGBBVVRIXyR7c3RyaW5nfWA+LAogICAgYWN0b3I6IHN0cmluZywKICAgIG1ldGFkYXRhOiBSZWNvcmQ8c3RyaW5nLCB1bmtub3duPiA9IHt9LAogICAgY29udGV4dDogeyBpcEFkZHJlc3M/OiBzdHJpbmc7IGNvcnJlbGF0aW9uSWQ/OiBzdHJpbmcgfSA9IHt9LAogICk6IEF1ZGl0RW50cnkgewogICAgY29uc3Qgc2V2ZXJpdHk6IEF1ZGl0U2V2ZXJpdHkgPSBhY3Rpb24gPT09ICdBVVRIX0ZBSUxFRCcgPyAnV0FSTklORycgOiAnSU5GTyc7CiAgICByZXR1cm4gdGhpcy5sb2coewogICAgICBhY3Rpb24sCiAgICAgIHNldmVyaXR5LAogICAgICBhY3RvciwKICAgICAgcmVzb3VyY2U6ICdhdXRoJywKICAgICAgcmVzb3VyY2VJZDogYWN0b3IsCiAgICAgIG1ldGFkYXRhLAogICAgICAuLi5jb250ZXh0LAogICAgfSk7CiAgfQoKICAvKioKICAgKiBRdWVyaWVzIGF1ZGl0IGVudHJpZXMgdXNpbmcgdGhlIHByb3ZpZGVkIGZpbHRlcnMuCiAgICovCiAgcXVlcnkocXVlcnk6IEF1ZGl0UXVlcnkpOiBBdWRpdEVudHJ5W10gewogICAgcmV0dXJuIHRoaXMucmVwb3NpdG9yeS5xdWVyeShxdWVyeSk7CiAgfQoKICAvKioKICAgKiBRdWVyaWVzIGF1ZGl0IGVudHJpZXMgdXNpbmcgY3Vyc29yLWJhc2VkIHBhZ2luYXRpb24uCiAgICovCiAgcXVlcnlXaXRoQ3Vyc29yKHF1ZXJ5OiBBdWRpdFF1ZXJ5KTogQXVkaXRRdWVyeVJlc3VsdCB7CiAgICByZXR1cm4gdGhpcy5yZXBvc2l0b3J5LnF1ZXJ5V2l0aEN1cnNvcihxdWVyeSk7CiAgfQoKICAvKioKICAgKiBSZXRyaWV2ZXMgYSBzaW5nbGUgYXVkaXQgZW50cnkgYnkgSUQuCiAgICovCiAgZ2V0QnlJZChpZDogc3RyaW5nKTogQXVkaXRFbnRyeSB8IHVuZGVmaW5lZCB7CiAgICByZXR1cm4gdGhpcy5yZXBvc2l0b3J5LmdldEJ5SWQoaWQpOwogIH0KCiAgLyoqCiAgICogVmVyaWZpZXMgdGhlIGludGVncml0eSBvZiB0aGUgYXVkaXQgbG9nIGNoYWluLgogICAqLwogIHZlcmlmeUludGVncml0eSgpOiBJbnRlZ3JpdHlSZXBvcnQgewogICAgcmV0dXJuIHRoaXMucmVwb3NpdG9yeS52ZXJpZnlJbnRlZ3JpdHkoKTsKICB9Cn0KCmV4cG9ydCBjb25zdCBhdWRpdFNlcnZpY2UgPSBuZXcgQXVkaXRTZXJ2aWNlKCk7Cg==
+/**
+ * @module audit/service
+ * @description High-level audit logging service.
+ *
+ * Provides a clean API for application code to emit audit events without
+ * coupling directly to the store implementation. All sensitive state changes
+ * (contract lifecycle, payments, user management, auth events) must go through
+ * this service.
+ *
+ * Security notes:
+ * - Callers MUST sanitise metadata before passing it in — no raw PII.
+ * - Logging failures are caught and reported via console.error to avoid
+ *   disrupting the primary request flow, but they are also re-thrown in
+ *   strict mode so tests can assert on them.
+ */
+
+import type { AuditEntry, AuditQuery, AuditSeverity, CreateAuditEntryInput, IntegrityReport, AuditQueryResult } from './types';
+import type { AuditAction } from './types';
+import { decodeCursor } from './types';
+import { createDefaultAuditRepository, type AuditLogRepository } from './repository';
+import { auditExportService, AuditExportService, type AuditExportFilters, type AuditExportResult } from './exportService';
+import { AuditCache, type AuditCacheOptions } from './auditCache';
+
+export interface AuditServiceOptions {
+  /** Cache options for audit read responses. */
+  cache?: AuditCacheOptions;
+}
+
+export const VALID_ACTIONS = new Set<AuditAction>(['CONTRACT_CREATED', 'CONTRACT_UPDATED', 'CONTRACT_CANCELLED', 'CONTRACT_COMPLETED', 'PAYMENT_INITIATED', 'PAYMENT_RELEASED', 'PAYMENT_DISPUTED', 'REPUTATION_UPDATED', 'REPUTATION_CORRECTED', 'USER_CREATED', 'USER_UPDATED', 'USER_DELETED', 'AUTH_LOGIN', 'AUTH_LOGOUT', 'AUTH_FAILED', 'AUTH_LOCKOUT_TRIGGERED', 'AUTH_LOCKOUT_RELEASED', 'ADMIN_ACTION', 'ENDPOINT_ACCESS', 'ENDPOINT_MUTATION']);
+
+export const VALID_SEVERITIES = new Set<AuditSeverity>(['INFO', 'WARNING', 'CRITICAL']);
+
+export function parseOptionalIsoDate(
+  value: string | undefined,
+  fieldName: 'from' | 'to',
+): string | undefined {
+  if (value === undefined) {
+    return undefined;
+  }
+
+  const parsed = Date.parse(value);
+  if (Number.isNaN(parsed)) {
+    throw new Error(`Invalid ${fieldName} timestamp`);
+  }
+
+  return new Date(parsed).toISOString();
+}
+
+export function parseOffset(value: string | undefined): number {
+  if (value === undefined) {
+    return 0;
+  }
+
+  const parsed = Number.parseInt(value, 10);
+  if (!Number.isFinite(parsed) || parsed < 0) {
+    throw new Error('Invalid offset');
+  }
+
+  return parsed;
+}
+
+export function parseLimit(value: string | undefined, maxLimit: number, defaultLimit?: number): number | undefined {
+  if (value === undefined) {
+    return defaultLimit;
+  }
+
+  const parsed = Number.parseInt(value, 10);
+  if (!Number.isFinite(parsed) || parsed < 1) {
+    throw new Error('Invalid limit');
+  }
+
+  return Math.min(parsed, maxLimit);
+}
+
+export function parseAuditQuery(
+  reqQuery: Record<string, unknown>,
+  options: { defaultLimit?: number; maxLimit: number },
+): { query: AuditQuery; limit?: number; offset: number } {
+  const action = reqQuery['action'] as string | undefined;
+  const severity = reqQuery['severity'] as string | undefined;
+  const actor = reqQuery['actor'] as string | undefined;
+  const resource = reqQuery['resource'] as string | undefined;
+  const resourceId = reqQuery['resourceId'] as string | undefined;
+  const cursor = reqQuery['cursor'] as string | undefined;
+
+  if (action && !VALID_ACTIONS.has(action as AuditAction)) {
+    throw new Error(`Invalid action: ${action}`);
+  }
+
+  if (severity && !VALID_SEVERITIES.has(severity as AuditSeverity)) {
+    throw new Error(`Invalid severity: ${severity}`);
+  }
+
+  const limit = parseLimit(reqQuery['limit'] as string | undefined, options.maxLimit, options.defaultLimit);
+  const offset = parseOffset(reqQuery['offset'] as string | undefined);
+  const from = parseOptionalIsoDate(reqQuery['from'] as string | undefined, 'from');
+  const to = parseOptionalIsoDate(reqQuery['to'] as string | undefined, 'to');
+
+  // Validate cursor format if provided
+  if (cursor) {
+    try {
+      decodeCursor(cursor);
+    } catch (_error) {
+      throw new Error('Invalid cursor format');
+    }
+  }
+
+  return {
+    query: {
+      ...(action && { action: action as AuditAction }),
+      ...(severity && { severity: severity as AuditSeverity }),
+      ...(actor && { actor }),
+      ...(resource && { resource }),
+      ...(resourceId && { resourceId }),
+      ...(from && { from }),
+      ...(to && { to }),
+      ...(limit !== undefined && { limit }),
+      offset,
+      ...(cursor && { cursor }),
+    },
+    limit,
+    offset,
+  };
+}
+
+/**
+ * AuditService — application-level facade over AuditStore.
+ *
+ * @example
+ * ```ts
+ * import { auditService } from './audit/service';
+ *
+ * await auditService.log( {
+ *   action: 'CONTRACT_CREATED',
+ *   severity: 'INFO',
+ *   actor: req.user.id,
+ *   resource: 'contract',
+ *   resourceId: contract.id,
+ *   metadata: { clientId: contract.clientId },
+ *   ipAddress: req.ip,
+ *   correlationId: req.headers['x-correlation-id'] as string,
+ * });
+ * ```
+ */
+export class AuditService {
+  private cache: AuditCache | null;
+
+  constructor(
+    private readonly repository: AuditLogRepository = createDefaultAuditRepository(),
+    private readonly options: AuditServiceOptions = {},
+  ) {
+    this.cache = options.cache ? new AuditCache(options.cache) : null;
+  }
+
+  /**
+   * Records an audit event.
+   *
+   * @param input - Event details. metadata must be pre-sanitised.
+   * @returns The persisted, immutable AuditEntry.
+   * @throws Only when options.strict is true and the store throws.
+   */
+  log(input: CreateAuditEntryInput): AuditEntry {
+    try {
+      const entry = this.repository.append(input);
+      
+      // Invalidate cache on write operations
+      if (this.cache) {
+        this.cache.invalidateByResourceId(input.resourceId);
+      }
+      
+      return entry;
+    } catch (err) {
+      console.error('[AuditService] Failed to persist audit entry:', err);
+      throw err;
+    }
+  }
+
+  /**
+   * Validates payload fields and creates an audit entry.
+   * Throws Error if any required field is missing.
+   */
+  createEntry(input: CreateAuditEntryInput): AuditEntry {
+    if (!input.action || !input.severity || !input.actor || !input.resource || !input.resourceId) {
+      throw new Error('Missing required fields: action, severity, actor, resource, resourceId');
+    }
+    return this.log(input);
+  }
+
+  /**
+   * Validates raw query parameters and returns parsed AuditQuery.
+   */
+  validateAndParseQuery(
+    reqQuery: Record<string, unknown>,
+    options: { defaultLimit?: number; maxLimit: number },
+  ): { query: AuditQuery; limit?: number; offset: number } {
+    return parseAuditQuery(reqQuery, options);
+  }
+
+  /**
+   * Processes query filters and returns formatted paginated results.
+   */
+  queryLogs(
+    queryParams: Record<string, unknown>,
+    options: { defaultLimit?: number; maxLimit: number } = { defaultLimit: 50, maxLimit: 100 },
+  ):
+    | { entries: AuditEntry[]; count: number; limit?: number; nextCursor?: string }
+    | { entries: AuditEntry[]; count: number; limit: number; offset: number } {
+    const { query } = this.validateAndParseQuery(queryParams, options);
+
+    if (query.cursor) {
+      const result = this.queryWithCursor(query);
+      return {
+        entries: result.entries,
+        count: result.count,
+        limit: result.limit,
+        nextCursor: result.nextCursor,
+      };
+    }
+
+    const limit = query.limit ?? options.defaultLimit ?? 50;
+    const offset = query.offset ?? 0;
+    const entries = this.query(query);
+    return {
+      entries,
+      count: entries.length,
+      limit,
+      offset,
+    };
+  }
+
+  /**
+   * Orchestrates NDJSON compliance log exports and records an ADMIN_ACTION audit log.
+   */
+  async exportAuditLogs(
+    queryParams: Record<string, unknown>,
+    context: { actor?: string; ipAddress?: string; correlationId?: string },
+    exportService: AuditExportService = auditExportService,
+  ): Promise<AuditExportResult> {
+    const { query } = this.validateAndParseQuery(queryParams, { maxLimit: 50_000 });
+
+    const filters: AuditExportFilters = {
+      ...(query.action && { action: query.action }),
+      ...(query.severity && { severity: query.severity }),
+      ...(query.actor && { actor: query.actor }),
+      ...(query.resource && { resource: query.resource }),
+      ...(query.resourceId && { resourceId: query.resourceId }),
+      ...(query.from && { from: query.from }),
+      ...(query.to && { to: query.to }),
+      ...(query.limit !== undefined && { limit: query.limit }),
+    };
+
+    const exportResult = await exportService.createNdjsonExport(filters);
+
+    this.log({
+      action: 'ADMIN_ACTION',
+      severity: 'CRITICAL',
+      actor: context.actor ?? 'anonymous',
+      resource: 'audit-log',
+      resourceId: 'export',
+      metadata: {
+        operation: 'export',
+        format: 'ndjson',
+        filters: {
+          action: filters.action ?? null,
+          severity: filters.severity ?? null,
+          actor: filters.actor ?? null,
+          resource: filters.resource ?? null,
+          resourceId: filters.resourceId ?? null,
+          from: filters.from ?? null,
+          to: filters.to ?? null,
+        },
+        recordCount: exportResult.recordCount,
+        bytesWritten: exportResult.bytesWritten,
+      },
+      ipAddress: context.ipAddress,
+      correlationId: context.correlationId,
+    });
+
+    return exportResult;
+  }
+
+  /**
+   * Convenience wrapper for contract lifecycle events.
+   */
+  logContractEvent(
+    action: Extract<AuditAction, `CONTRACT_${string}`>,
+    actor: string,
+    contractId: string,
+    metadata: Record<string, unknown> = {},
+    context: { ipAddress?: string; correlationId?: string } = {},
+  ): AuditEntry {
+    return this.log( {
+      action,
+      severity: 'INFO',
+      actor,
+      resource: 'contract',
+      resourceId: contractId,
+      metadata,
+      ...context,
+    });
+  }
+
+  /**
+   * Convenience wrapper for milestone-mutation events on a contract.
+   *
+   * Milestones are a field on the Contract resource rather than a
+   * separately-persisted entity, so `metadata` is expected to carry a
+   * `{ before, after }` pair of bounded, redacted snapshots (see
+   * `modules/contracts/milestonesAudit.ts`) rather than a DB row diff.
+   *
+   * MILESTONES_DELETED is WARNING severity — losing milestone data (whether
+   * via an explicit clear or a contract deletion) is the change most likely
+   * to matter during an incident review, so it is flagged above the default
+   * INFO level used for created/updated.
+   */
+  logMilestonesEvent(
+    action: Extract<AuditAction, `MILESTONES_${string}`>,
+    actor: string,
+    contractId: string,
+    metadata: Record<string, unknown> = {},
+    context: { ipAddress?: string; correlationId?: string } = {},
+  ): AuditEntry {
+    const severity: AuditSeverity = action === 'MILESTONES_DELETED' ? 'WARNING' : 'INFO';
+    return this.log({
+      action,
+      severity,
+      actor,
+      resource: 'milestones',
+      resourceId: contractId,
+      metadata,
+      ...context,
+    });
+  }
+
+  /**
+   * Convenience wrapper for payment events.
+   * Payment events are always CRITICAL severity.
+   */
+  logPaymentEvent(
+    action: Extract<AuditAction, `PAYMENT_${string}`>,
+    actor: string,
+    paymentId: string,
+    metadata: Record<string, unknown> = {},
+    context: { ipAddress?: string; correlationId?: string } = {},
+  ): AuditEntry {
+    return this.log( {
+      action,
+      severity: 'CRITICAL',
+      actor,
+      resource: 'payment',
+      resourceId: paymentId,
+      metadata,
+      ...context,
+    });
+  }
+
+  /**
+   * Convenience wrapper for authentication events.
+   * AUTH_FAILED is WARNING; others are INFO.
+   */
+  logAuthEvent(
+    action: Extract<AuditAction, `AUTH_${string|`>,
+    actor: string,
+    metadata: Record<string, unknown> = {},
+    context: { ipAddress?: string; correlationId?: string } = {},
+  ): AuditEntry {
+    const severity: AuditSeverity = action === 'AUTH_FAILED' ? 'WARNING' : 'INFO';
+    return this.log({
+      action,
+      severity,
+      actor,
+      resource: 'auth',
+      resourceId: actor,
+      metadata,
+      ...context,
+    });
+  }
+
+  /**
+   * Retrieves a single audit entry by ID.
+   */
+  getEntry(id: string): AuditEntry | undefined {
+    return this.repository.findById(id);
+  }
+
+  /**
+   * Queries audit entries with the given filters.
+   */
+  query(query: AuditQuery): AuditEntry[] {
+    return this.repository.query(query);
+  }
+
+  /**
+   * Queries audit entries using cursor-based pagination.
+   */
+  queryWithCursor(query: AuditQuery): AuditQueryResult {
+    return this.repository.queryWithCursor(query);
+  }
+
+  /**
+   * Verifies the integrity of the audit log chain.
+   */
+  verifyIntegrity(): IntegrityReport {
+    return this.repository.verifyIntegrity();
+  }
+
+  /**
+   * Returns the total count of audit entries.
+   */
+  count(): number {
+    return this.repository.count();
+  }
+}
+
+export const auditService = new AuditService();

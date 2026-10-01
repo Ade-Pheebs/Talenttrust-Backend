@@ -1,3 +1,4 @@
+import { randomUUID } from 'crypto';
 import { createWriteStream, createReadStream, promises as fsp } from 'fs';
 import { pipeline } from 'stream/promises';
 import { Readable } from 'stream';
@@ -9,11 +10,15 @@ import { redactBody } from './redact';
 import type { AuditEntry, AuditQuery } from './types';
 import { logger } from '../utils/logger';
 
+export const AUDIT_EXPORT_SCHEMA_VERSION = 1 as const;
+
 export interface AuditExportResult {
   filePath: string;
   fileName: string;
   bytesWritten: number;
   recordCount: number;
+  /** Schema version of the export payload; incremented on breaking changes. */
+  schemaVersion: typeof AUDIT_EXPORT_SCHEMA_VERSION;
   openReadStream(): ReadStream;
   cleanup(): Promise<void>;
   committed: boolean;
@@ -39,6 +44,11 @@ export interface AuditExportServiceOptions {
    * @default 50
    */
   retryBaseDelayMs?: number;
+}
+
+export interface AuditExportStreamResult extends Omit<AuditExportResult, 'openReadStream'> {
+  /** Always true for stream helpers: the temp file is removed before resolving. */
+  cleanedUp: true;
 }
 
 /**
@@ -227,6 +237,9 @@ const CSV_HEADERS = [
   'metadata',
 ] as const;
 
+/** Public, stable contract for the CSV column order. */
+export const AUDIT_EXPORT_CSV_HEADERS: readonly string[] = CSV_HEADERS;
+
 type CsvColumn = (typeof CSV_HEADERS)[number];
 
 /**
@@ -321,6 +334,11 @@ export class AuditExportService {
     this.batchSize = Math.max(options.batchSize ?? 500, 1);
     this.maxAttempts = Math.max(options.maxAttempts ?? 3, 1);
     this.retryBaseDelayMs = Math.max(options.retryBaseDelayMs ?? 50, 0);
+  }
+
+  /** Returns the stable CSV header order used by every CSV export. */
+  getCsvHeaders(): readonly string[] {
+    return CSV_HEADERS;
   }
 
   // ─── NDJSON export ─────────────────────────────────────────────────────────

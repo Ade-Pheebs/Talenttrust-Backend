@@ -1,7 +1,7 @@
 import { Response, NextFunction } from 'express';
 import { Resource, Action } from './roles';
 import { AuthenticatedRequest } from './authenticate';
-import { isAllowed } from './authorize';
+import { evaluateAuthorization } from './authorize';
 import { getContext, requestContextStorage } from '../context';
 
 export function requirePermission(resource: Resource, action: Action) {
@@ -14,7 +14,10 @@ export function requirePermission(resource: Resource, action: Action) {
     const current = getContext() ?? {};
     const enriched = { ...current, actorId: user.id };
     requestContextStorage.run(enriched, () => {
-      if (!isAllowed(user.role, resource, action)) {
+      // Use the decision API so unexpected-input denials (unregistered
+      // role/resource, unrecognized action) are logged with a reason while
+      // the response contract stays byte-for-byte identical.
+      if (!evaluateAuthorization(user.role, resource, action).allowed) {
         res.status(403).json({ error: 'Forbidden: insufficient permissions' });
         return;
       }

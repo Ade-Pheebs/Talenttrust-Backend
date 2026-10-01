@@ -42,6 +42,18 @@
  *   - Unknown roles are denied by default (deny-by-default).
  *   - Unknown resources or actions are denied by default.
  *   - No runtime mutation of the matrix is permitted from this module.
+ *
+ * Determinism and recovery notes:
+ *   - `isAllowed` is a pure function of its arguments and the immutable
+ *     ACCESS_CONTROL_MATRIX. It never mutates state, never throws for well-
+ *     typed inputs, and always returns a boolean. This makes failure
+ *     recovery deterministic: the same inputs always produce the same
+ *     decision, regardless of concurrency or retries.
+ *   - Any unexpected error while evaluating the matrix is treated as a
+ *     deny (fail-closed) and reported through the injectable logger so
+ *     operators can diagnose failures without exposing sensitive data.
+ *   - The decision is stable across retries and concurrent execution because
+ *     there is no shared mutable state involved.
  */
 
 import { Role, Resource, Action, ACCESS_CONTROL_MATRIX } from './roles';

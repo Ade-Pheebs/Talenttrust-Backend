@@ -445,8 +445,8 @@ export class TokenBucketLimiter {
   }
 
   private syncLegacyStoreQueue(providerId: string, queue: Array<() => void>): void {
-    if (!this.legacyStore) return;
-    let bucket = this.legacyStore.getTokenBucket(providerId);
+    if (!this.rateLimitStore) return;
+    let bucket = this.rateLimitStore.getTokenBucket(providerId);
     if (!bucket) {
       const tokens = this.store.getTokenCount(providerId) ?? this.capacity;
       const count = typeof tokens === 'number' ? tokens : this.capacity;
@@ -454,7 +454,7 @@ export class TokenBucketLimiter {
     } else {
       bucket.queue = queue;
     }
-    this.legacyStore.setTokenBucket(providerId, bucket);
+    this.rateLimitStore.setTokenBucket(providerId, bucket);
   }
 
   private scheduleDrain(providerId: string): void {

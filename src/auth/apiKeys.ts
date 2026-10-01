@@ -725,6 +725,7 @@ export async function validateApiKey(apiKey: string): Promise<ApiKeyInfo | null>
     }
     return cached;
   }
+  const cacheGeneration = cache.getGeneration();
 
   // Try indexed lookup first (fast path, O(1) via key_selector)
   let dbKey: ApiKey | undefined;
@@ -825,8 +826,14 @@ export async function validateApiKey(apiKey: string): Promise<ApiKeyInfo | null>
     isActive: dbKey.is_active
   };
 
-  // Cache the successful validation result (only after all checks passed)
-  cache.set(selector, result);
+  // A credential may have been rotated or deactivated while this read was in
+  // flight. Do not authorize from a result older than the latest invalidation.
+  if (cache.getGeneration() !== cacheGeneration) {
+    return null;
+  }
+
+  // Cache the successful validation result
+  cache.set(selector, result, cacheGeneration);
 
   return { info, definitive: true };
 }

@@ -147,7 +147,7 @@ describe('ContractEventIndexer Integration (Replay & Cursor Pagination)', () => 
       const result = await indexer.indexBatch(sourceId, batch);
 
       expect(result.processedCount).toBe(2);
-      expect(result.errors.length).toBe(GreaterThan(0));
+      expect(result.errors.length).toBeGreaterThan(0);
       expect(result.newCursor!.lastSequence).toBe(12);
     });
   });
@@ -237,4 +237,4 @@ describe('ContractEventIndexer Integration (Replay & Cursor Pagination)', () => 
       expect(result.newCursor!.network).toBe('testnet');
     });
   });
-}
+});

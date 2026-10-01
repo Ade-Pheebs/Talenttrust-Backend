@@ -20,37 +20,20 @@
  */
 
 /**
- * Maximum number of audit entries that may be submitted in a single bulk
- * request. Enforced by the request validator and by the export service so
- * that concurrent bulk writes cannot exhaust memory or produce unbounded
- * batches. Kept here (rather than in the router) so every entry point shares
- * the same limit.
- */
-export const MAX_BULK_AUDIT_ENTRIES = 1000;
-
-/**
- * Maximum number of entries that may be exported in a single page. Bounds
- * the work performed per request so concurrent exports cannot starve the
- * event loop or produce oversized responses.
- */
-export const MAX_EXPORT_PAGE_SIZE = 1000;
-
-/** Default page size used when a caller does not supply an explicit limit. */
-export const DEFAULT_EXPORT_PAGE_SIZE = 100;
-
-/**
- * Every audited action, as a runtime value list.
+ * Every action that may be **submitted over the public HTTP surface**, as a
+ * runtime value list.
  *
- * This is the single source of truth: {@link AuditAction} is derived from it,
- * and both the request-body validator (`audit/inputValidation`) and the query
- * filter validator (`audit/router`) validate against this same array, so a new
- * action can never be accepted by one path and rejected by the other.
+ * This is the single source of truth for the *request* contract: the
+ * request-body validator (`audit/inputValidation`), the query filter validator
+ * and the response schemas (`audit/schemas`) all derive their enums from this
+ * array, so a new action can never be accepted by one path and rejected by
+ * another.
  *
- * Compatibility contract: this array is the only source of truth for the
- * runtime validation of audit actions. Any action accepted by the runtime
- * must appear here, and any action appearing here must be accepted by the
- * runtime. The `TypeScript type {@link AuditAction} is derived from this array
- * so that the compile-time and runtime contracts cannot diverge.
+ * Invariant: `AUDIT_ACTIONS` is a subset of {@link AUDIT_DOMAIN_ACTIONS} — the
+ * registry is deliberately narrower than the domain because internal-only
+ * actions (see {@link AUDIT_DOMAIN_ACTIONS}) are emitted by service helpers and
+ * never by an untrusted caller. `schemas.compatibility.test.ts` asserts the
+ * subset relationship so the two lists cannot drift apart.
  */
 export const AUDIT_ACTIONS = Object.freeze([
   'CONTRACT_CREATED',
@@ -85,28 +68,65 @@ export const AUDIT_ACTIONS = Object.freeze([
 export type AuditAction = (typeof AUDIT_ACTIONS)[number];
 
 /**
- * Runtime lookup set for {@link AUDIT_ACTIONS}.
+ * Every member of the {@link AuditAction} union, as a runtime value list.
  *
- * This is derived from the same array as the compile-time type, ensuring that
- * runtime validation and type-level validation cannot diverge. Callers that
- * need to check whether a string is a valid audit action should use this
- * set rather than re-implementing their own list.
+ * Where {@link AUDIT_ACTIONS} describes what an untrusted caller may
+ * **submit**, this list describes what the log may legitimately **contain**.
+ * The difference matters in one direction only: the service layer emits
+ * internal-only actions (`CONTRACT_DELETED`, `MILESTONES_*`) through
+ * `AuditService.log*` helpers, so a response schema validated against
+ * {@link AUDIT_ACTIONS} would reject a perfectly legitimate entry on the way
+ * out. Validating responses against this list instead keeps the outbound
+ * contract honest without widening the inbound one.
+ *
+ * `satisfies` rejects a typo that is not a member of the union, and
+ * {@link AUDIT_DOMAIN_ACTIONS_ARE_EXHAUSTIVE} fails to compile when a member
+ * of the union is added here — the two together make drift a build error
+ * rather than a runtime surprise.
  */
-export const AUDIT_ACTION_SET: Readonly<Set<string> = new Set(AUDIT_ACTIONS);
+export const AUDIT_DOMAIN_ACTIONS = [
+  'CONTRACT_CREATED',
+  'CONTRACT_UPDATED',
+  'CONTRACT_CANCELLED',
+  'CONTRACT_COMPLETED',
+  'CONTRACT_DELETED',
+  'PAYMENT_INITIATED',
+  'PAYMENT_RELEASED',
+  'PAYMENT_DISPUTED',
+  'REPUTATION_UPDATED',
+  'REPUTATION_CORRECTED',
+  'USER_CREATED',
+  'USER_UPDATED',
+  'USER_DELETED',
+  'AUTH_LOGIN',
+  'AUTH_LOGOUT',
+  'AUTH_FAILED',
+  'AUTH_LOCKOUT_TRIGGERED',
+  'AUTH_LOCKOUT_RELEASED',
+  'ADMIN_ACTION',
+  'ENDPOINT_ACCESS',
+  'ENDPOINT_MUTATION',
+  'DEPLOYMENT_PROMOTED',
+  'DEPLOYMENT_ROLLED_BACK',
+  'MILESTONES_CREATED',
+  'MILESTONES_UPDATED',
+  'MILESTONES_DELETED',
+] as const satisfies readonly AuditAction[];
 
 /**
- * Type guard for {@link AuditAction}.
+ * Compile-time exhaustiveness guard for {@link AUDIT_DOMAIN_ACTIONS}.
  *
- * Returns `true` iff the given value is a string present in {@link AUDIT_ACTIONS}.
- * This is the canonical runtime check for audit actions and must be used by
- * all validation paths (request body, query filters, cursor decoding) so that
- * the compatibility contract is enforced in exactly one place.
+ * Resolves to `true` only while the list covers every member of the
+ * {@link AuditAction} union. Adding a member to the union without adding it to
+ * the list turns this type into `never`, so assigning `true` below fails to
+ * compile. Exported so the assertion is a named, reviewable part of the module
+ * rather than an unused local.
  */
-export function isAuditAction(value: unknown): value is AuditAction {
-  return typeof value === 'string' && AUDIT_ACTION_SET.has(value);
-}
+export type AuditDomainActionsAreExhaustive =
+  Exclude<AuditAction, (typeof AUDIT_DOMAIN_ACTIONS)[number]> extends never ? true : never;
 
-/** Severity levels used in the audit log. */
+export const AUDIT_DOMAIN_ACTIONS_ARE_EXHAUSTIVE: AuditDomainActionsAreExhaustive = true;
+
 export const AUDIT_SEVERITIES = ['INFO', 'WARNING', 'CRITICAL'] as const;
 
 /** Array of all valid AuditAction values for validation. */

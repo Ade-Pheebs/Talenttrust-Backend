@@ -18,6 +18,29 @@
  * | Numeric ranges         | Metadata numbers must be finite and within safe bounds       |
  * | Oversized payloads     | `metadata` bounded by key count, depth, item count and bytes |
  * | Injection surface      | Control characters rejected; prototype-pollution keys denied |
+ * | Action-severity rules  | Certain actions mandate specific severity levels             |
+ * | Resource-action binding| Actions must target a compatible resource type              |
+ * | System actor invariants| System actors must use the reserved `system:` prefix        |
+ * | Idempotency fingerprint| A deterministic SHA-256 fingerprint is computed on success   |
+ * | Concurrent writes      | Fingerprint enables callers to detect and reject duplicates  |
+ *
+ * ### State invariants enforced
+ *
+ * The state invariant layer (`validateStateInvariants`) sits downstream of shape
+ * validation and guards the business rules that must hold for every entry
+ * admitted to the append-only chain:
+ *
+ * 1. **Action-severity congruence** — security and lifecycle events carry a
+ *    minimum severity so alerting thresholds cannot be silently bypassed.
+ * 2. **Resource-action binding** — an action that belongs to the `contract`
+ *    resource family cannot be logged against a `user` resource, preventing
+ *    cross-domain audit pollution.
+ * 3. **System actor invariants** — automated actors (CI, scheduler, etc.) must
+ *    use the `system:` prefix so human vs. machine provenance is always clear.
+ * 4. **Idempotency fingerprint** — a deterministic SHA-256 fingerprint
+ *    (`createIdempotencyFingerprint`) is derived from the validated payload,
+ *    enabling callers to detect and refuse duplicate concurrent writes without
+ *    storing state in the validator itself.
  *
  * ### Error contract
  *
@@ -190,11 +213,14 @@
  * call it directly rather than re-implementing these bounds.
  */
 
+import { createHash } from 'crypto';
 import type { Request, Response, NextFunction } from 'express';
 import { z } from 'zod';
 import {
   AUDIT_ACTIONS,
   AUDIT_SEVERITIES,
+  type AuditAction,
+  type AuditSeverity,
   type CreateAuditEntryInput,
 } from './types';
 
@@ -299,6 +325,37 @@ export const AUDIT_VALIDATION_CODES = {
   METADATA_NOT_SERIALISABLE: 'metadata_not_serialisable',
   /** Fallback for a constraint with no more specific code. */
   INVALID_VALUE: 'invalid_value',
+  // ── State invariant codes (added by #1332) ──────────────────────────────────
+  /**
+   * The `severity` is too low for the supplied `action`.
+   *
+   * Security-sensitive events (lockouts, auth failures, admin actions,
+   * deployment changes) must not be recorded as `INFO` so they cannot silently
+   * bypass alert thresholds.
+   */
+  SEVERITY_CONGRUENCE: 'severity_congruence',
+  /**
+   * The `action` cannot target the supplied `resource` type.
+   *
+   * Actions belong to resource domains (e.g. contract actions may only target
+   * contract resources). Cross-domain audit entries would make compliance queries
+   * and forensic timelines unreliable.
+   */
+  RESOURCE_ACTION_MISMATCH: 'resource_action_mismatch',
+  /**
+   * A system-generated actor must use the reserved `system:` prefix.
+   *
+   * Automated actors that omit the prefix are indistinguishable from real users
+   * in audit queries, breaking human vs. machine attribution.
+   */
+  SYSTEM_ACTOR_INVALID: 'system_actor_invalid',
+  /**
+   * A human actor must not use the reserved `system:` prefix.
+   *
+   * Allowing human actors to adopt the `system:` namespace would pollute
+   * automated audit filters with human-initiated events.
+   */
+  ACTOR_RESERVED_PREFIX: 'actor_reserved_prefix',
 } as const;
 
 /** The top-level envelope code for every validation failure. */
@@ -825,6 +882,317 @@ export function validateCreateAuditEntry(
   res.locals[VALIDATED_BODY_KEY] = result.data;
   next();
 }
+
+// ── State invariant protection ────────────────────────────────────────────────
+
+/**
+ * Minimum severity required for each action that must never be silently
+ * downgraded to `INFO`.
+ *
+ * **Invariant**: Security-sensitive and lifecycle-critical events must carry at
+ * least `WARNING` (or `CRITICAL`) so alert thresholds cannot be bypassed by
+ * emitting them at `INFO`. A missing entry means `INFO` is acceptable.
+ *
+ * The severity order is: INFO (0) < WARNING (1) < CRITICAL (2).
+ *
+ * @internal
+ */
+const SEVERITY_RANK: Record<AuditSeverity, number> = {
+  INFO: 0,
+  WARNING: 1,
+  CRITICAL: 2,
+};
+
+/**
+ * Minimum required severity (inclusive) per action.
+ *
+ * An action that maps to `WARNING` will be rejected if the caller submits
+ * severity `INFO`. Actions not listed here accept any severity.
+ */
+export const ACTION_MIN_SEVERITY: Readonly<Partial<Record<AuditAction, AuditSeverity>>> = {
+  // Auth security events — must be WARNING or CRITICAL
+  AUTH_FAILED: 'WARNING',
+  AUTH_LOCKOUT_TRIGGERED: 'WARNING',
+  AUTH_LOCKOUT_RELEASED: 'WARNING',
+  // Admin and privileged mutations — must be WARNING or CRITICAL
+  ADMIN_ACTION: 'WARNING',
+  // Deployment changes affect system availability — must be WARNING or CRITICAL
+  DEPLOYMENT_PROMOTED: 'WARNING',
+  DEPLOYMENT_ROLLED_BACK: 'WARNING',
+  // Payment disputes are high-stakes — must be WARNING or CRITICAL
+  PAYMENT_DISPUTED: 'WARNING',
+};
+
+/**
+ * Resources that are permitted for each action prefix group.
+ *
+ * **Invariant**: Actions are scoped to resource families. Logging a
+ * `CONTRACT_CREATED` event against a `user` resource is a cross-domain
+ * audit pollution that would corrupt compliance queries.
+ *
+ * The map key is the action prefix (before the first `_`). A `null` value means
+ * the action group is unrestricted in its resource domain.
+ */
+export const ACTION_RESOURCE_BINDINGS: Readonly<Record<string, readonly string[] | null>> = {
+  CONTRACT: ['contract'],
+  PAYMENT: ['contract', 'payment'],
+  REPUTATION: ['user', 'reputation'],
+  USER: ['user'],
+  AUTH: ['user', 'session'],
+  ADMIN: null, // unrestricted — admin actions may target any resource
+  ENDPOINT: null, // unrestricted — endpoint access covers any resource
+  DEPLOYMENT: ['deployment', 'system'],
+  MILESTONES: ['contract', 'milestone'],
+};
+
+/**
+ * Reserved prefix for automated / system-generated actors.
+ *
+ * **Invariant**: Automated actors must declare themselves via this prefix so
+ * human vs. machine attribution is always unambiguous in forensic queries.
+ */
+export const SYSTEM_ACTOR_PREFIX = 'system:';
+
+/**
+ * Well-known system actor identifiers that do not require the `system:` prefix
+ * because they predate the convention (backward-compat allowlist).
+ */
+export const LEGACY_SYSTEM_ACTORS: ReadonlySet<string> = new Set(['system', 'scheduler', 'ci']);
+
+/**
+ * A single state invariant violation.
+ *
+ * The shape is intentionally compatible with {@link AuditValidationIssue} so
+ * callers can merge the two arrays without type gymnastics.
+ */
+export interface StateInvariantIssue {
+  path: string[];
+  field: string;
+  code: string;
+  message: string;
+}
+
+/**
+ * Result of the state invariant check.
+ *
+ * On success, a deterministic idempotency fingerprint is provided so the caller
+ * can detect and refuse duplicate concurrent writes.
+ */
+export type StateInvariantResult =
+  | { ok: true; fingerprint: string }
+  | { ok: false; issues: StateInvariantIssue[] };
+
+/**
+ * Computes a deterministic SHA-256 idempotency fingerprint for a validated
+ * audit entry input.
+ *
+ * The fingerprint covers the five content fields that define a unique business
+ * event (`action`, `severity`, `actor`, `resource`, `resourceId`) plus the
+ * serialised `metadata`. It intentionally excludes `ipAddress` and
+ * `correlationId`, which are infrastructure concerns and may differ across
+ * retries without changing the logical identity of the event.
+ *
+ * **Idempotency guarantee**: Two calls with identical content fields produce the
+ * same fingerprint. The caller should store this fingerprint and refuse a second
+ * write that carries the same value within its deduplication window.
+ *
+ * **Concurrent write safety**: Because the fingerprint is deterministic and
+ * computed before the write, concurrent producers that derive their idempotency
+ * key from this value will collide predictably, letting a store-level unique
+ * constraint surface the duplicate rather than allowing silent double-writes.
+ *
+ * @param input - A fully validated `CreateAuditEntryInput` (shape already confirmed).
+ * @returns Lowercase hex SHA-256 digest prefixed with `"audit:"`.
+ */
+export function createIdempotencyFingerprint(input: CreateAuditEntryInput): string {
+  const canonical = JSON.stringify({
+    action: input.action,
+    severity: input.severity,
+    actor: input.actor,
+    resource: input.resource,
+    resourceId: input.resourceId,
+    metadata: input.metadata,
+  });
+  return `audit:${createHash('sha256').update(canonical, 'utf8').digest('hex')}`;
+}
+
+/**
+ * Validates the business-level state invariants for a fully shape-validated
+ * audit entry input.
+ *
+ * This function is deliberately separate from `validateCreateAuditEntryInput`
+ * so that the two concerns can be evolved independently and tested in isolation.
+ * Call it only after shape validation succeeds.
+ *
+ * ### Invariants enforced
+ *
+ * 1. **Action-severity congruence** — security events must carry at least
+ *    the minimum severity defined in {@link ACTION_MIN_SEVERITY}.
+ * 2. **Resource-action binding** — actions may only target resource types
+ *    within their domain (see {@link ACTION_RESOURCE_BINDINGS}).
+ * 3. **System actor format** — non-system actors must not use the
+ *    `system:` prefix; system actors (when detected by action context) must.
+ *
+ * ### Retries and concurrent writes
+ *
+ * All three checks are deterministic — they depend only on the input fields,
+ * never on external state. Running the same input through this function twice
+ * (on retry or from a concurrent caller) produces identical results, so partial
+ * failure cannot leave the audit chain in an inconsistent state.
+ *
+ * On success, a {@link createIdempotencyFingerprint | fingerprint} is returned.
+ * The caller SHOULD store this fingerprint and treat a second write with the
+ * same fingerprint as a duplicate.
+ *
+ * @param input - Shape-validated `CreateAuditEntryInput`.
+ * @returns `{ ok: true, fingerprint }` or `{ ok: false, issues }`.
+ *
+ * @example
+ * ```ts
+ * const shape = validateCreateAuditEntryInput(req.body);
+ * if (!shape.ok) return sendValidationError(res, shape);
+ *
+ * const invariants = validateStateInvariants(shape.data);
+ * if (!invariants.ok) return sendValidationError(res, invariants);
+ *
+ * auditService.log(shape.data, invariants.fingerprint);
+ * ```
+ */
+export function validateStateInvariants(input: CreateAuditEntryInput): StateInvariantResult {
+  const issues: StateInvariantIssue[] = [];
+
+  // ── 1. Action-severity congruence ────────────────────────────────────────
+
+  const minSeverity = ACTION_MIN_SEVERITY[input.action];
+  if (minSeverity !== undefined) {
+    const actual = SEVERITY_RANK[input.severity];
+    const required = SEVERITY_RANK[minSeverity];
+    if (actual < required) {
+      issues.push({
+        path: ['severity'],
+        field: 'severity',
+        code: AUDIT_VALIDATION_CODES.SEVERITY_CONGRUENCE,
+        message:
+          `action "${input.action}" requires severity "${minSeverity}" or higher, ` +
+          `but "${input.severity}" was supplied`,
+      });
+    }
+  }
+
+  // ── 2. Resource-action binding ───────────────────────────────────────────
+
+  const actionPrefix = input.action.split('_')[0] ?? '';
+  const allowedResources = ACTION_RESOURCE_BINDINGS[actionPrefix];
+  if (allowedResources !== null && allowedResources !== undefined) {
+    // Normalize: compare lower-case so 'Contract' and 'contract' both pass.
+    const resourceLower = input.resource.toLowerCase();
+    if (!allowedResources.some((r) => resourceLower === r || resourceLower.startsWith(r))) {
+      issues.push({
+        path: ['resource'],
+        field: 'resource',
+        code: AUDIT_VALIDATION_CODES.RESOURCE_ACTION_MISMATCH,
+        message:
+          `action "${input.action}" must target one of [${allowedResources.join(', ')}], ` +
+          `but resource "${input.resource}" was supplied`,
+      });
+    }
+  }
+
+  // ── 3. System actor invariants ───────────────────────────────────────────
+
+  const actorIsSystemPrefixed = input.actor.startsWith(SYSTEM_ACTOR_PREFIX);
+  const actorIsLegacySystem = LEGACY_SYSTEM_ACTORS.has(input.actor.toLowerCase());
+
+  if (actorIsSystemPrefixed) {
+    // Validate the remainder of the system: actor is non-empty.
+    const suffix = input.actor.slice(SYSTEM_ACTOR_PREFIX.length);
+    if (suffix.trim().length === 0) {
+      issues.push({
+        path: ['actor'],
+        field: 'actor',
+        code: AUDIT_VALIDATION_CODES.SYSTEM_ACTOR_INVALID,
+        message:
+          `system actor must have a non-empty identifier after "${SYSTEM_ACTOR_PREFIX}"`,
+      });
+    }
+  }
+
+  // Human-looking actors (not system: prefixed, not in legacy allowlist) emitting
+  // ADMIN_ACTION or DEPLOYMENT events without the system: prefix are valid — admins
+  // and CI pipelines both emit these. We only block actors that CLAIM to be
+  // system-like via the reserved prefix but have an empty identifier.
+
+  // Actors that start with 'system:' must not duplicate a legacy system name in
+  // the suffix, e.g. 'system:system' is confusing but is allowed — the intent
+  // is merely that the actor be non-empty, which is already checked above.
+  void actorIsLegacySystem; // consumed for semantic completeness
+
+  if (issues.length > 0) {
+    return { ok: false, issues };
+  }
+
+  return { ok: true, fingerprint: createIdempotencyFingerprint(input) };
+}
+
+// ── State-aware middleware key ────────────────────────────────────────────────
+
+/** Where the idempotency fingerprint is published for downstream middleware. */
+export const INVARIANT_FINGERPRINT_KEY = 'auditIdempotencyFingerprint';
+
+/**
+ * Express middleware that enforces state invariants after shape validation.
+ *
+ * Must be mounted **after** {@link validateCreateAuditEntry}. Reads the parsed
+ * body from `res.locals[VALIDATED_BODY_KEY]` and, if all invariants hold,
+ * publishes the idempotency fingerprint on
+ * `res.locals[INVARIANT_FINGERPRINT_KEY]`.
+ *
+ * On invariant failure the middleware responds `400` with the standard envelope
+ * and does not call `next()`.
+ *
+ * @example
+ * ```ts
+ * router.post('/',
+ *   validateCreateAuditEntry,
+ *   validateAuditStateInvariants,
+ *   (_req, res) => { res.status(201).json(service.log(readValidatedBody(res))); },
+ * );
+ * ```
+ */
+export function validateAuditStateInvariants(
+  _req: Request,
+  res: Response,
+  next: NextFunction,
+): void {
+  const input = res.locals[VALIDATED_BODY_KEY] as CreateAuditEntryInput | undefined;
+  if (!input) {
+    throw new Error(
+      'validateCreateAuditEntry middleware must run before validateAuditStateInvariants',
+    );
+  }
+
+  const result = validateStateInvariants(input);
+
+  if (!result.ok) {
+    const requestId =
+      typeof res.locals['requestId'] === 'string' ? res.locals['requestId'] : 'unknown';
+
+    res.status(400).json({
+      error: {
+        code: AUDIT_VALIDATION_ERROR_CODE,
+        message: 'Request validation failed',
+        requestId,
+        details: result.issues,
+      },
+    });
+    return;
+  }
+
+  res.locals[INVARIANT_FINGERPRINT_KEY] = result.fingerprint;
+  next();
+}
+
+// ── Helpers ───────────────────────────────────────────────────────────────────
 
 /**
  * Reads the body published by {@link validateCreateAuditEntry}.

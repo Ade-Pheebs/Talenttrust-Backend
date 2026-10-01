@@ -36,10 +36,38 @@
  * ### Primitives
  * Numbers, booleans, and `null` pass through unmodified.
  *
+ * ## State invariants and safety guarantees
+ *
+ * ### Circular reference protection
+ * The `redactBody` function detects circular references using a `WeakSet` to
+ * track visited objects. When a circular reference is detected, the offending
+ * value is replaced with `'[REDACTED]'` to prevent stack overflow and ensure
+ * the audit log operation completes safely.
+ *
+ * ### Depth limiting
+ * To prevent stack overflow from deeply nested structures, `redactBody` enforces
+ * a maximum recursion depth of 100 levels. Values beyond this depth are replaced
+ * with `'[REDACTED]'`. This is a defensive limit; legitimate audit data should
+ * not exceed this depth.
+ *
+ * ### Safe failure mode
+ * All redaction functions handle invalid or malformed inputs gracefully:
+ * - `redactHeaders` guards against null/undefined or non-object inputs
+ * - `buildAuditMetadata` validates and coerces primitive inputs to safe defaults
+ * - Processing errors are caught and logged without crashing the request path
+ * - When invariants are violated (circular refs, depth limit), the function
+ *   returns `'[REDACTED]'` rather than throwing
+ *
+ * ### Immutability
+ * All functions return new objects and never mutate their inputs. This is
+ * enforced by implementation and verified by tests.
+ *
  * @security
  * - Redaction is deterministic: the same input always produces the same output.
  * - `Authorization` header values are NEVER persisted under any circumstances.
  * - This module has no side-effects; all functions are pure transformations.
+ * - Circular references and deep nesting cannot cause stack overflow or crashes.
+ * - Invalid inputs are handled gracefully without exposing sensitive data.
  */
 
 /** Sentinel written in place of any redacted value. */
@@ -71,6 +99,12 @@ const SENSITIVE_KEY_FRAGMENTS = [
 
 /** Matches a simple `local@domain` email pattern. */
 const EMAIL_PATTERN = /^([^@\s]{1,64})@([^@\s]+\.[^@\s]+)$/;
+
+/**
+ * Maximum recursion depth for redactBody to prevent stack overflow.
+ * This is a defensive limit; legitimate audit data should not exceed this depth.
+ */
+export const MAX_REDACTION_DEPTH = 100;
 
 // ─── Predicate helpers ───────────────────────────────────────────────────────
 
@@ -120,6 +154,8 @@ export function maskEmail(value: string): string {
  * Sensitive header values are replaced with `'[REDACTED]'`; all other
  * headers are copied verbatim. The original object is never mutated.
  *
+ * Invalid or non-object inputs are handled gracefully to prevent crashes.
+ *
  * @param headers - Raw headers from `req.headers`.
  * @returns A flat object safe for audit storage.
  */
@@ -127,9 +163,26 @@ export function redactHeaders(
   headers: Record<string, string | string[] | undefined>,
 ): Record<string, unknown> {
   const result: Record<string, unknown> = {};
-  for (const [name, value] of Object.entries(headers)) {
-    result[name] = isSensitiveHeader(name) ? REDACTED : value;
+
+  // Guard against null/undefined or non-object inputs
+  if (headers === null || headers === undefined || typeof headers !== 'object') {
+    return result;
   }
+
+  try {
+    for (const [name, value] of Object.entries(headers)) {
+      // Ensure key is a string (Object.entries should guarantee this, but defend anyway)
+      if (typeof name !== 'string') {
+        continue;
+      }
+      result[name] = isSensitiveHeader(name) ? REDACTED : value;
+    }
+  } catch (err) {
+    // If header processing fails for any reason, return what we have so far
+    // This prevents audit logging from crashing the request
+    console.error('[redactHeaders] Failed to process headers:', err);
+  }
+
   return result;
 }
 
@@ -141,22 +194,56 @@ export function redactHeaders(
  * - String values that look like email addresses are masked via `maskEmail`.
  * - Arrays are traversed element-by-element.
  * - Primitives (number, boolean) and `null`/`undefined` pass through as-is.
+ * - Circular references are detected and replaced with REDACTED to prevent stack overflow.
+ * - Depth is limited to MAX_REDACTION_DEPTH to prevent stack overflow.
  *
  * @param value - The value to sanitise (may be any JSON-serialisable type).
  * @returns A deep copy with sensitive data replaced.
  */
 export function redactBody(value: unknown): unknown {
-  if (value === null || value === undefined) return value;
+  return redactBodyInternal(value, new WeakSet<object>(), 0);
+}
+
+/**
+ * Internal implementation of redactBody with circular reference detection and depth limiting.
+ *
+ * @param value - The value to sanitise.
+ * @param visited - WeakSet of objects already visited to detect circular references.
+ * @param depth - Current recursion depth.
+ * @returns A deep copy with sensitive data replaced, or REDACTED if invariants are violated.
+ */
+function redactBodyInternal(value: unknown, visited: WeakSet<object>, depth: number): unknown {
+  // Guard against excessive recursion depth
+  if (depth > MAX_REDACTION_DEPTH) {
+    return REDACTED;
+  }
+
+  if (value === null || value === undefined) {
+    return value;
+  }
 
   if (Array.isArray(value)) {
-    return value.map(redactBody);
+    // Check for circular reference in the array itself
+    if (visited.has(value)) {
+      return REDACTED;
+    }
+    visited.add(value);
+    const result = value.map((item) => redactBodyInternal(item, visited, depth + 1));
+    // Do NOT remove from visited - keep it to prevent revisiting from other paths
+    return result;
   }
 
   if (typeof value === 'object') {
+    // Check for circular reference in the object itself
+    if (visited.has(value)) {
+      return REDACTED;
+    }
+    visited.add(value);
     const result: Record<string, unknown> = {};
     for (const [key, val] of Object.entries(value as Record<string, unknown>)) {
-      result[key] = isSensitiveKey(key) ? REDACTED : redactBody(val);
+      result[key] = isSensitiveKey(key) ? REDACTED : redactBodyInternal(val, visited, depth + 1);
     }
+    // Do NOT remove from visited - keep it to prevent revisiting from other paths
     return result;
   }
 
@@ -171,6 +258,9 @@ export function redactBody(value: unknown): unknown {
 /**
  * Assembles the `metadata` object written to an audit entry for a protected
  * HTTP request. All sensitive fields are redacted before return.
+ *
+ * Handles invalid or malformed inputs gracefully to prevent audit logging
+ * from crashing the request path.
  *
  * @param method      - HTTP verb (e.g. `'POST'`).
  * @param path        - URL path (e.g. `'/api/v1/contracts/abc'`).
@@ -190,13 +280,18 @@ export function buildAuditMetadata(
   statusCode: number,
   requestId: string | undefined,
 ): Record<string, unknown> {
+  // Validate and coerce primitive inputs to safe defaults
+  const safeMethod = typeof method === 'string' ? method : 'UNKNOWN';
+  const safePath = typeof path === 'string' ? path : '';
+  const safeStatusCode = typeof statusCode === 'number' && isFinite(statusCode) ? statusCode : 0;
+
   return {
-    method,
-    path,
-    statusCode,
-    requestId: requestId ?? null,
+    method: safeMethod,
+    path: safePath,
+    statusCode: safeStatusCode,
+    requestId: typeof requestId === 'string' ? requestId : null,
     headers: redactHeaders(headers),
     body: body !== undefined && body !== null ? redactBody(body) : null,
-    query: Object.keys(query).length > 0 ? redactBody(query) : null,
+    query: query && typeof query === 'object' && Object.keys(query).length > 0 ? redactBody(query) : null,
   };
 }

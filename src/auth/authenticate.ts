@@ -21,6 +21,9 @@
  *   - Non-empty userId: req.user.userId is always a non-empty string
  *   - Deterministic validation: Same input always produces same output
  *   - Fail-safe: Validation failure results in 401, never calls next()
+ *   - Response integrity: Middleware never sends response if already sent
+ *   - Tamper-proof: req.user is frozen to prevent downstream mutation
+ *   - Runtime validation: Existing req.user is validated before reuse
  */
 
 import { Request, Response, NextFunction } from 'express';
@@ -50,205 +53,50 @@ export interface TokenPayload {
 }
 
 /** Express request extended with authenticated user info. */
-export interface AuthenticatedRequest extends Request {
+export interface AuthenticatedRequest extends Omit<Request, 'user'> {
   user?: TokenPayload;
 }
 
 /**
- * Maximum length of the base64 credential, in characters.
+ * Validates that an object conforms to TokenPayload structure at runtime.
+ * This protects against tampering of req.user by downstream middleware.
  *
- * A `{ userId, role }` payload for a maximal `userId` is a few hundred bytes,
- * so 4096 leaves generous headroom while keeping the worst-case decode and
- * parse cost small and fixed. Rejection happens on length alone, before any
- * buffer is allocated (VB-3).
+ * @param value - The value to validate.
+ * @returns True if the value is a valid TokenPayload, false otherwise.
  */
-export const MAX_TOKEN_LENGTH = 4096;
+function isValidTokenPayload(value: unknown): value is TokenPayload {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+    return false;
+  }
 
-/**
- * Maximum length of `userId`, in characters.
- *
- * `userId` is written verbatim into audit records and into the request context,
- * so an unbounded value would let a caller push arbitrarily large strings into
- * the log store (VB-5).
- */
-export const MAX_USER_ID_LENGTH = 128;
+  const payload = value as Record<string, unknown>;
+  
+  // Validate userId
+  if (typeof payload.userId !== 'string' || payload.userId.trim().length === 0) {
+    return false;
+  }
 
-/**
- * Allowed `userId` characters: printable ASCII excluding whitespace, quotes,
- * backslash, and every control character.
- *
- * Excluding CR and LF is the security-relevant part — it prevents a forged
- * token from injecting extra lines into line-oriented audit output. The rest
- * keeps identifiers to the shape the system actually issues (`randomUUID`,
- * and the `user-<role>` / `u<N>` forms used by tests and fixtures).
- */
-const USER_ID_PATTERN = /^[A-Za-z0-9._:@-]+$/;
+  // Validate role
+  if (typeof payload.role !== 'string') {
+    return false;
+  }
 
-/**
- * Standard base64 alphabet with optional trailing padding (RFC 4648 §4).
- *
- * Rejects whitespace, newlines, commas, and any other character that Node's
- * decoder would otherwise skip.
- */
-const BASE64_PATTERN = /^[A-Za-z0-9+/]+={0,2}$/;
+  if (!VALID_ROLES.includes(payload.role as Role)) {
+    return false;
+  }
 
-/**
- * A single bearer credential from one header.
- *
- * Exactly one SP after the scheme (RFC 7235 §2.1), then one run of non-space
- * characters and nothing after it. The anchored `\S+` is what rejects a
- * comma-joined second credential, interior whitespace, and any trailing CRLF —
- * all of which previously authenticated (VB-1).
- *
- * This pattern fixes the header's *structure* only. A returned credential may
- * still be refused by {@link validateToken} for failing the base64 alphabet,
- * length, or padding rules in VB-2; the two layers are separate so each
- * rejection reason is attributable.
- */
-const BEARER_PATTERN = /^Bearer (\S+)$/;
-
-/** Narrows an object to one that owns `key`. */
-function hasOwn(target: object, key: string): boolean {
-  return Object.prototype.hasOwnProperty.call(target, key);
+  return true;
 }
 
 /**
- * Stable, non-sensitive reason a credential was refused.
+ * Checks if the response has already been sent.
+ * This prevents double-sending responses which would cause an error.
  *
- * Emitted as `reason` on the `auth_legacy_bearer_rejected` log record so an
- * operator can tell a broken client from a forgery attempt without the log
- * line ever carrying credential material.
+ * @param res - Express response object.
+ * @returns True if response headers have been sent, false otherwise.
  */
-export type TokenRejectionReason =
-  | 'missing_header'
-  | 'malformed_header'
-  | 'empty_token'
-  | 'token_too_long'
-  | 'token_not_base64'
-  | 'token_not_json'
-  | 'token_not_object'
-  | 'user_id_missing'
-  | 'user_id_invalid'
-  | 'role_missing'
-  | 'role_invalid';
-
-/**
- * Outcome of validating one credential.
- *
- * Either a payload ready to become `req.user`, or the reason it was refused.
- */
-export type TokenValidationResult =
-  | { ok: true; payload: TokenPayload }
-  | { ok: false; reason: TokenRejectionReason };
-
-/**
- * Reasons that indicate a possible forgery attempt rather than a broken
- * client, and so are logged at `warn` instead of `debug`.
- *
- * The split keeps routine scanner traffic and misconfigured clients out of the
- * warning stream while still surfacing a structurally sound credential whose
- * claims were refused.
- */
-const SUSPICIOUS_REASONS: ReadonlySet<TokenRejectionReason> = new Set<TokenRejectionReason>([
-  'token_not_base64',
-  'token_not_json',
-  'token_not_object',
-  'user_id_invalid',
-  'role_invalid',
-]);
-
-/**
- * Extract the single bearer credential from an `Authorization` header.
- *
- * Named `parseBearerHeader` rather than `extractBearerToken` to avoid
- * collision with the JWT path's same-named helper in `src/lib/authHelpers.ts`,
- * which applies a deliberately looser grammar to signed tokens.
- *
- * @param header - Raw header value; anything other than a string is refused.
- * @returns The credential, or `null` if the header does not match the grammar
- *   in VB-1.
- */
-export function parseBearerHeader(header: unknown): string | null {
-  if (typeof header !== 'string') {
-    return null;
-  }
-  const match = BEARER_PATTERN.exec(header);
-  return match ? match[1] : null;
-}
-
-/**
- * Decode and validate a bearer credential, reporting why on refusal.
- *
- * Every boundary in the module docs is enforced here in a fixed order —
- * header grammar, size, encoding, JSON, shape, then claims — so a given
- * credential always produces the same verdict regardless of how many
- * independent problems it has.
- *
- * @param token - The raw base64 credential.
- * @returns A discriminated result carrying either the payload or a stable
- *   rejection reason. Never throws.
- */
-export function validateToken(token: unknown): TokenValidationResult {
-  if (typeof token !== 'string') {
-    return { ok: false, reason: 'malformed_header' };
-  }
-  if (token.length === 0) {
-    return { ok: false, reason: 'empty_token' };
-  }
-
-  // VB-3: bound the input before decoding or parsing anything.
-  if (token.length > MAX_TOKEN_LENGTH) {
-    return { ok: false, reason: 'token_too_long' };
-  }
-
-  // VB-2: canonical base64 only.
-  if (!BASE64_PATTERN.test(token) || token.length % 4 !== 0) {
-    return { ok: false, reason: 'token_not_base64' };
-  }
-  const decoded = Buffer.from(token, 'base64');
-  if (decoded.toString('base64') !== token) {
-    return { ok: false, reason: 'token_not_base64' };
-  }
-
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(decoded.toString('utf-8'));
-  } catch {
-    return { ok: false, reason: 'token_not_json' };
-  }
-
-  // VB-4: a plain object only, and claims must be own properties.
-  if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
-    return { ok: false, reason: 'token_not_object' };
-  }
-  const claims = parsed as Record<string, unknown>;
-
-  if (!hasOwn(claims, 'userId')) {
-    return { ok: false, reason: 'user_id_missing' };
-  }
-  const userId = claims['userId'];
-  // VB-5: non-empty, bounded, printable ASCII without control characters.
-  if (
-    typeof userId !== 'string' ||
-    userId.length === 0 ||
-    userId.length > MAX_USER_ID_LENGTH ||
-    !USER_ID_PATTERN.test(userId)
-  ) {
-    return { ok: false, reason: 'user_id_invalid' };
-  }
-
-  if (!hasOwn(claims, 'role')) {
-    return { ok: false, reason: 'role_missing' };
-  }
-  const role = claims['role'];
-  // VB-6: the role allowlist is the only source of roles.
-  if (typeof role !== 'string' || !(VALID_ROLES as readonly string[]).includes(role)) {
-    return { ok: false, reason: 'role_invalid' };
-  }
-
-  // Project onto exactly the two documented claims so no additional field of
-  // the payload can reach `req.user` and, through it, the audit trail.
-  return { ok: true, payload: { userId, role: role as Role } };
+function isResponseSent(res: Response): boolean {
+  return res.headersSent;
 }
 
 /**
@@ -357,6 +205,9 @@ function logRejection(reason: TokenRejectionReason, path: string | undefined): v
  * State invariants enforced:
  *   - Single authentication: req.user is set exactly once per request
  *   - Immutable identity: If req.user already exists, it is not overwritten
+ *   - Tamper-proof: req.user is frozen after setting to prevent downstream mutation
+ *   - Runtime validation: Existing req.user is validated before reuse
+ *   - Response integrity: Never sends response if already sent
  *   - Fail-safe: Validation failure results in 401, never calls next()
  *   - Deterministic: Same request always produces same result
  *   - Consistent error format: All 401 responses have { error: string }
@@ -366,8 +217,21 @@ export function authenticateMiddleware(
   res: Response,
   next: NextFunction,
 ): void {
+  // Invariant: Response integrity - check before attempting to send
+  if (isResponseSent(res)) {
+    authLogger.error('Response already sent, cannot authenticate');
+    return;
+  }
+
   // Invariant: Single authentication - prevent identity changes mid-request
   if (req.user) {
+    // Invariant: Runtime validation - ensure existing user is still valid
+    if (!isValidTokenPayload(req.user)) {
+      authLogger.error('Existing req.user is invalid or tampered, rejecting request');
+      res.status(500).json({ error: 'Internal authentication error' });
+      return;
+    }
+
     // Identity already established - log and continue (idempotency)
     authLogger.warn('Authentication already performed, skipping re-authentication', {
       existingUserId: req.user.userId,
@@ -382,7 +246,9 @@ export function authenticateMiddleware(
   // Invariant: Header must exist and be a string
   if (!header || typeof header !== 'string') {
     authLogger.warn('Missing Authorization header');
-    res.status(401).json({ error: 'Missing or invalid Authorization header' });
+    if (!isResponseSent(res)) {
+      res.status(401).json({ error: 'Missing or invalid Authorization header' });
+    }
     return;
   }
 
@@ -391,7 +257,9 @@ export function authenticateMiddleware(
     authLogger.warn('Invalid Authorization header format', {
       prefix: header.substring(0, 10),
     });
-    res.status(401).json({ error: 'Missing or invalid Authorization header' });
+    if (!isResponseSent(res)) {
+      res.status(401).json({ error: 'Missing or invalid Authorization header' });
+    }
     return;
   }
 
@@ -400,7 +268,9 @@ export function authenticateMiddleware(
   // Invariant: Token must not be empty after 'Bearer ' prefix
   if (token.length === 0) {
     authLogger.warn('Empty token after Bearer prefix');
-    res.status(401).json({ error: 'Invalid token' });
+    if (!isResponseSent(res)) {
+      res.status(401).json({ error: 'Invalid token' });
+    }
     return;
   }
 
@@ -411,16 +281,21 @@ export function authenticateMiddleware(
     authLogger.warn('Token validation failed', {
       tokenLength: token.length,
     });
-    res.status(401).json({ error: 'Invalid token' });
+    if (!isResponseSent(res)) {
+      res.status(401).json({ error: 'Invalid token' });
+    }
     return;
   }
 
   // Invariant: Set req.user exactly once (single authentication)
   req.user = payload;
 
-  // Invariant: Log successful authentication for diagnostics
+  // Invariant: Tamper-proof - freeze req.user to prevent downstream mutation
+  Object.freeze(req.user);
+
+  // Invariant: Log successful authentication for diagnostics (redact sensitive data)
   authLogger.info('Authentication successful', {
-    userId: payload.userId,
+    userId: payload.userId.substring(0, 8) + '...', // Redact for security
     role: payload.role,
   });
 

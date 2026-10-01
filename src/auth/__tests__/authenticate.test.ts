@@ -294,4 +294,135 @@ describe('authenticateMiddleware', () => {
     expect(req.user?.userId).toBe(longUserId);
     expect(next).toHaveBeenCalled();
   });
+
+  // ---- State invariant: Tamper-proof (frozen req.user) ----
+
+  it('should freeze req.user after setting to prevent downstream mutation', () => {
+    const token = createToken('u1', 'admin');
+    const req = mockReq({ authorization: `Bearer ${token}` });
+    const res = mockRes();
+    const next = mockNext();
+
+    authenticateMiddleware(req, res, next);
+
+    expect(req.user).toBeDefined();
+    // Invariant: req.user should be frozen
+    expect(Object.isFrozen(req.user)).toBe(true);
+    
+    // Attempting to modify should fail silently (in strict mode) or be ignored
+    expect(() => {
+      if (req.user) {
+        (req.user as any).userId = 'hacked';
+      }
+    }).not.toThrow();
+    
+    // Value should remain unchanged
+    expect(req.user?.userId).toBe('u1');
+  });
+
+  // ---- State invariant: Runtime validation of existing req.user ----
+
+  it('should reject request if existing req.user is tampered with invalid structure', () => {
+    const req = mockReq() as AuthenticatedRequest;
+    req.user = { userId: 123, role: 'admin' } as any; // Tampered: userId is not a string
+    const res = mockRes();
+    const next = mockNext();
+
+    authenticateMiddleware(req, res, next);
+
+    // Invariant: Tampered req.user should be rejected
+    expect(res.status).toHaveBeenCalledWith(500);
+    expect(res.json).toHaveBeenCalledWith({ error: 'Internal authentication error' });
+    expect(next).not.toHaveBeenCalled();
+  });
+
+  it('should reject request if existing req.user has invalid role', () => {
+    const req = mockReq() as AuthenticatedRequest;
+    req.user = { userId: 'u1', role: 'hacker' as any }; // Tampered: invalid role
+    const res = mockRes();
+    const next = mockNext();
+
+    authenticateMiddleware(req, res, next);
+
+    // Invariant: Tampered req.user should be rejected
+    expect(res.status).toHaveBeenCalledWith(500);
+    expect(res.json).toHaveBeenCalledWith({ error: 'Internal authentication error' });
+    expect(next).not.toHaveBeenCalled();
+  });
+
+  it('should reject request if existing req.user has empty userId', () => {
+    const req = mockReq() as AuthenticatedRequest;
+    req.user = { userId: '', role: 'admin' }; // Tampered: empty userId
+    const res = mockRes();
+    const next = mockNext();
+
+    authenticateMiddleware(req, res, next);
+
+    // Invariant: Tampered req.user should be rejected
+    expect(res.status).toHaveBeenCalledWith(500);
+    expect(res.json).toHaveBeenCalledWith({ error: 'Internal authentication error' });
+    expect(next).not.toHaveBeenCalled();
+  });
+
+  it('should accept request if existing req.user is valid and well-formed', () => {
+    const req = mockReq() as AuthenticatedRequest;
+    req.user = { userId: 'u1', role: 'admin' }; // Valid
+    const res = mockRes();
+    const next = mockNext();
+
+    authenticateMiddleware(req, res, next);
+
+    // Invariant: Valid existing req.user should be accepted
+    expect(next).toHaveBeenCalled();
+    expect(res.status).not.toHaveBeenCalled();
+  });
+
+  // ---- State invariant: Response integrity ----
+
+  it('should not send response if headers already sent', () => {
+    const token = createToken('u1', 'admin');
+    const req = mockReq({ authorization: `Bearer ${token}` });
+    const res = mockRes() as any;
+    res.headersSent = true; // Simulate response already sent
+    const next = mockNext();
+
+    authenticateMiddleware(req, res, next);
+
+    // Invariant: Should not attempt to send response
+    expect(res.status).not.toHaveBeenCalled();
+    expect(res.json).not.toHaveBeenCalled();
+    expect(next).not.toHaveBeenCalled();
+  });
+
+  it('should not send response if headers already sent on missing header', () => {
+    const req = mockReq();
+    const res = mockRes() as any;
+    res.headersSent = true; // Simulate response already sent
+    const next = mockNext();
+
+    authenticateMiddleware(req, res, next);
+
+    // Invariant: Should not attempt to send response
+    expect(res.status).not.toHaveBeenCalled();
+    expect(res.json).not.toHaveBeenCalled();
+    expect(next).not.toHaveBeenCalled();
+  });
+
+  // ---- State invariant: Concurrent execution safety ----
+
+  it('should handle concurrent authentication attempts safely', () => {
+    const token = createToken('u1', 'admin');
+    const req = mockReq({ authorization: `Bearer ${token}` });
+    const res = mockRes();
+    const next = mockNext();
+
+    // Simulate concurrent calls
+    authenticateMiddleware(req, res, next);
+    authenticateMiddleware(req, res, next);
+
+    // Invariant: Should only authenticate once
+    expect(next).toHaveBeenCalledTimes(2); // Both call next (idempotent)
+    expect(req.user?.userId).toBe('u1');
+    expect(Object.isFrozen(req.user)).toBe(true);
+  });
 });

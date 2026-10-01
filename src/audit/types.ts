@@ -12,16 +12,26 @@
 /**
  * Every audited action, as a runtime value list.
  *
- * This is the single source of truth: {@link AuditAction} is derived from it,
- * and both the request-body validator (`audit/inputValidation`) and the query
- * filter validator (`audit/router`) validate against this same array, so a new
- * action can never be accepted by one path and rejected by the other.
+ * This is the single source of truth: {@link AuditAction} is *derived* from it
+ * (see below), so the compile-time union and the runtime list are the same set
+ * by construction and can never drift apart. Every validator in the module
+ * consumes this one array:
+ *   - `audit/inputValidation` (non-HTTP producers)
+ *   - `audit/schemas` (the HTTP body/query contract)
+ *   - `audit/service` (`VALID_ACTIONS`, the legacy query parser)
+ *
+ * Invariant: adding an entry here is the *only* way to add an action to the
+ * system. Previously this array, the `AuditAction` union, and the two
+ * hand-mirrored copies in `schemas.ts`/`service.ts` had already diverged, so
+ * the same action could be accepted by one ingest path and rejected by
+ * another.
  */
 export const AUDIT_ACTIONS = [
   'CONTRACT_CREATED',
   'CONTRACT_UPDATED',
   'CONTRACT_CANCELLED',
   'CONTRACT_COMPLETED',
+  'CONTRACT_DELETED',
   'PAYMENT_INITIATED',
   'PAYMENT_RELEASED',
   'PAYMENT_DISPUTED',
@@ -40,41 +50,40 @@ export const AUDIT_ACTIONS = [
   'ENDPOINT_MUTATION',
   'DEPLOYMENT_PROMOTED',
   'DEPLOYMENT_ROLLED_BACK',
+  'MILESTONES_CREATED',
+  'MILESTONES_UPDATED',
+  'MILESTONES_DELETED',
 ] as const;
 
-/** Categories of sensitive state changes that must be audited. */
-export type AuditAction =
-  | 'CONTRACT_CREATED'
-  | 'CONTRACT_UPDATED'
-  | 'CONTRACT_CANCELLED'
-  | 'CONTRACT_COMPLETED'
-  | 'CONTRACT_DELETED'
-  | 'PAYMENT_INITIATED'
-  | 'PAYMENT_RELEASED'
-  | 'PAYMENT_DISPUTED'
-  | 'REPUTATION_UPDATED'
-  | 'REPUTATION_CORRECTED'
-  | 'USER_CREATED'
-  | 'USER_UPDATED'
-  | 'USER_DELETED'
-  | 'AUTH_LOGIN'
-  | 'AUTH_LOGOUT'
-  | 'AUTH_FAILED'
-  | 'AUTH_LOCKOUT_TRIGGERED'
-  | 'AUTH_LOCKOUT_RELEASED'
-  | 'ADMIN_ACTION'
-  | 'ENDPOINT_ACCESS'
-  | 'ENDPOINT_MUTATION'
-  | 'DEPLOYMENT_PROMOTED'
-  | 'DEPLOYMENT_ROLLED_BACK'
-  | 'MILESTONES_CREATED'
-  | 'MILESTONES_UPDATED'
-  | 'MILESTONES_DELETED';
+/**
+ * Categories of sensitive state changes that must be audited.
+ *
+ * Derived from {@link AUDIT_ACTIONS}, never hand-maintained — the type and the
+ * runtime list are guaranteed to describe the same set of actions.
+ */
+export type AuditAction = (typeof AUDIT_ACTIONS)[number];
 
 export const AUDIT_SEVERITIES = ['INFO', 'WARNING', 'CRITICAL'] as const;
 
 /** Severity level of the audit event. */
 export type AuditSeverity = (typeof AUDIT_SEVERITIES)[number];
+
+/**
+ * Runtime guard for {@link AuditAction}.
+ *
+ * Use at trust boundaries that receive an action from untyped input (queues,
+ * config, decoded payloads) instead of casting with `as AuditAction`: unlike a
+ * cast, this actually checks the value against the {@link AUDIT_ACTIONS}
+ * vocabulary and narrows the type only when the check succeeds.
+ */
+export function isAuditAction(value: unknown): value is AuditAction {
+  return typeof value === 'string' && (AUDIT_ACTIONS as readonly string[]).includes(value);
+}
+
+/** Runtime guard for {@link AuditSeverity}, mirroring {@link isAuditAction}. */
+export function isAuditSeverity(value: unknown): value is AuditSeverity {
+  return typeof value === 'string' && (AUDIT_SEVERITIES as readonly string[]).includes(value);
+}
 
 /**
  * An immutable audit log entry.

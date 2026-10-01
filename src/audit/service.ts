@@ -16,7 +16,7 @@
 
 import type { AuditEntry, AuditQuery, AuditSeverity, CreateAuditEntryInput, IntegrityReport, AuditQueryResult } from './types';
 import type { AuditAction } from './types';
-import { decodeCursor } from './types';
+import { decodeCursor, AUDIT_ACTIONS } from './types';
 import { createDefaultAuditRepository, type AuditLogRepository } from './repository';
 import { auditExportService, AuditExportService, type AuditExportFilters, type AuditExportResult } from './exportService';
 import { AuditCache, type AuditCacheOptions } from './auditCache';
@@ -26,17 +26,14 @@ export interface AuditServiceOptions {
   cache?: AuditCacheOptions;
 }
 
-export const VALID_ACTIONS = new Set<AuditAction>([
-  'CONTRACT_CREATED', 'CONTRACT_UPDATED', 'CONTRACT_CANCELLED', 'CONTRACT_COMPLETED',
-  'PAYMENT_INITIATED', 'PAYMENT_RELEASED', 'PAYMENT_DISPUTED',
-  'REPUTATION_UPDATED',
-  'REPUTATION_CORRECTED',
-  'USER_CREATED', 'USER_UPDATED', 'USER_DELETED',
-  'AUTH_LOGIN', 'AUTH_LOGOUT', 'AUTH_FAILED',
-  'AUTH_LOCKOUT_TRIGGERED', 'AUTH_LOCKOUT_RELEASED',
-  'ADMIN_ACTION',
-  'ENDPOINT_ACCESS', 'ENDPOINT_MUTATION',
-]);
+/**
+ * The set of actions the legacy string-based query parser accepts.
+ *
+ * Derived from {@link AUDIT_ACTIONS} (the audit module's single source of
+ * truth) so it can never drift from the type system, the HTTP schema
+ * validators, or the non-HTTP input validator.
+ */
+export const VALID_ACTIONS = new Set<AuditAction>(AUDIT_ACTIONS);
 
 export const VALID_SEVERITIES = new Set<AuditSeverity>(['INFO', 'WARNING', 'CRITICAL']);
 

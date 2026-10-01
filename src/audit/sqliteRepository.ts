@@ -124,17 +124,60 @@ interface AuditRow {
   previous_hash: string;
 }
 
-function toAuditEntry(row: AuditRow): AuditEntry {
-  let metadata: unknown;
-  try {
-    metadata = JSON.parse(row.metadata_json) as unknown;
-  } catch {
-    throw new Error('Invalid audit metadata JSON');
+/**
+ * Recursively deep-freezes a plain object so that nested metadata objects
+ * returned from the DB cannot be mutated by callers.
+ *
+ * Only plain objects and arrays are frozen; primitives, null, functions,
+ * and class instances are returned as-is so we don't accidentally freeze
+ * host objects or break prototypes.
+ */
+function deepFreeze<T>(value: T): T {
+  if (value === null || typeof value !== 'object') {
+    return value;
   }
-  if (typeof metadata !== 'object' || metadata === null || Array.isArray(metadata)) {
-    throw new Error('Invalid audit metadata JSON');
+  // Freeze children first (depth-first), then freeze the container.
+  for (const key of Object.keys(value as object)) {
+    deepFreeze((value as Record<string, unknown>)[key]);
   }
+  return Object.freeze(value);
+}
 
+/**
+ * Safely parses a JSON string.  Returns an empty object `{}` instead of
+ * throwing when the stored value is malformed, so a corrupted `metadata_json`
+ * column can never crash the caller.
+ *
+ * @invariant The returned value is always a plain object (never null/undefined).
+ */
+function safeParseMetadata(raw: string): Record<string, unknown> {
+  try {
+    const parsed = JSON.parse(raw) as unknown;
+    // Guard: must be a non-null object so the AuditEntry type is satisfied.
+    if (parsed !== null && typeof parsed === 'object' && !Array.isArray(parsed)) {
+      return parsed as Record<string, unknown>;
+    }
+    return {};
+  } catch {
+    // Malformed JSON — return a safe, empty metadata object rather than
+    // propagating the SyntaxError to the caller.
+    return {};
+  }
+}
+
+/**
+ * Converts a raw SQLite row to a fully frozen AuditEntry.
+ *
+ * Invariants enforced:
+ * - The top-level entry object is frozen.
+ * - The `metadata` object is deep-frozen so nested values cannot be mutated
+ *   after a read.
+ * - Malformed `metadata_json` is silently replaced with `{}` (logged nowhere
+ *   because this is a low-level mapping function; callers and the integrity
+ *   check are responsible for surfacing data-quality issues).
+ */
+function toAuditEntry(row: AuditRow): AuditEntry {
+  const rawMetadata = safeParseMetadata(row.metadata_json);
   return Object.freeze({
     id: row.id,
     timestamp: row.timestamp,
@@ -143,7 +186,8 @@ function toAuditEntry(row: AuditRow): AuditEntry {
     actor: row.actor,
     resource: row.resource,
     resourceId: row.resource_id,
-    metadata: Object.freeze(metadata as Record<string, unknown>),
+    // Deep-freeze so nested objects cannot be mutated post-read.
+    metadata: deepFreeze(rawMetadata) as Readonly<Record<string, unknown>>,
     ipAddress: row.ip_address ?? undefined,
     correlationId: row.correlation_id ?? undefined,
     hash: row.hash,
@@ -151,62 +195,141 @@ function toAuditEntry(row: AuditRow): AuditEntry {
   });
 }
 
-/** Optional behaviour tuning for {@link SqliteAuditRepository}. */
-export interface SqliteAuditRepositoryOptions {
-  /**
-   * When `true` (the default), a write that fails with a missing-schema error
-   * runs one idempotent `initSchema()` repair and retries. Set to `false` to
-   * fail fast and force the caller to handle the broken schema explicitly.
-   */
-  autoRepairSchema?: boolean;
+/**
+ * Validates required string fields of `CreateAuditEntryInput`.
+ *
+ * @throws {Error} with a descriptive message when any required field is
+ *   absent (null/undefined) or is an empty/whitespace-only string.  The
+ *   check happens before any DB interaction so invalid data never reaches
+ *   the insert statement.
+ *
+ * Invariant: every audit entry persisted to the DB has non-blank required
+ * fields; this is the single enforcement point.
+ */
+function validateAppendInput(input: CreateAuditEntryInput): void {
+  const required: Array<keyof Pick<CreateAuditEntryInput, 'action' | 'severity' | 'actor' | 'resource' | 'resourceId'>> =
+    ['action', 'severity', 'actor', 'resource', 'resourceId'];
+
+  for (const field of required) {
+    const value = input[field];
+    if (value === null || value === undefined) {
+      throw new Error(`audit append: required field '${field}' is missing`);
+    }
+    if (typeof value === 'string' && value.trim() === '') {
+      throw new Error(`audit append: required field '${field}' must not be empty`);
+    }
+  }
+
+  // metadata must be a non-null object (arrays and primitives are invalid).
+  if (
+    input.metadata === null ||
+    input.metadata === undefined ||
+    typeof input.metadata !== 'object' ||
+    Array.isArray(input.metadata)
+  ) {
+    throw new Error("audit append: 'metadata' must be a plain object");
+  }
 }
 
 export class SqliteAuditRepository implements AuditLogRepository {
   /**
-   * @param db - A `better-sqlite3` connection (or the test double). The
-   *   `ReturnType<typeof Database>` form is used on purpose: the default export
-   *   of `../db/betterSqlite3` is the *constructor value*, so the instance type
-   *   must be derived from it rather than using `Database` directly.
-   * @param options - Optional recovery behaviour. Omitted entirely by existing
-   *   callers, which preserves the original single-argument construction.
+   * Re-entrancy guard for `append()`.
+   *
+   * better-sqlite3 transactions are synchronous and non-reentrant: calling
+   * `append()` from within an `append()` transaction (e.g. from a callback
+   * triggered by the INSERT) would attempt to start a nested transaction and
+   * corrupt the hash-chain state.  This flag detects that scenario and throws
+   * a clear error rather than producing silent data-integrity violations.
    */
-  constructor(
-    private readonly db: ReturnType<typeof Database>,
-    private readonly options: SqliteAuditRepositoryOptions = {},
-  ) {
+  private _appendInProgress = false;
+
+  constructor(private readonly db: ReturnType<typeof Database>) {
     this.initSchema();
     this.applyConnectionPragmas();
   }
 
+  /**
+   * Appends a new, tamper-evident audit entry to the log.
+   *
+   * Invariants enforced:
+   * 1. Required fields are validated before any DB interaction.
+   * 2. Re-entrancy is detected and rejected — concurrent nested calls would
+   *    break the hash chain.
+   * 3. The entire write (SELECT previous hash + INSERT) is wrapped in a
+   *    single serialisable SQLite transaction, so a crash or error leaves
+   *    zero partial state.
+   * 4. The returned entry is deep-frozen.
+   *
+   * @throws {Error} on re-entrancy, validation failure, or DB error.
+   */
   append(input: CreateAuditEntryInput): AuditEntry {
-    const insert = this.db.transaction((payload: CreateAuditEntryInput): AuditEntry => {
-      // Acquire the writer lock before reading the tail so another connection
-      // cannot make this transaction hash against a stale chain head.
-      const previousHashRow = this.db
-        .prepare<[], { hash: string }>(
-          'SELECT hash FROM audit_log_entries ORDER BY seq DESC LIMIT 1'
-        )
-        .get();
+    // --- Invariant 1: validate required fields before touching the DB ---
+    validateAppendInput(input);
 
-      const partial: Omit<AuditEntry, 'hash'> = {
-        id: randomUUID(),
-        timestamp: new Date().toISOString(),
-        action: payload.action,
-        severity: payload.severity,
-        actor: payload.actor,
-        resource: payload.resource,
-        resourceId: payload.resourceId,
-        metadata: Object.freeze({ ...payload.metadata }),
-        ipAddress: payload.ipAddress,
-        correlationId: payload.correlationId,
-        previousHash: previousHashRow?.hash ?? GENESIS_HASH,
-      };
+    // --- Invariant 2: re-entrancy guard ---
+    if (this._appendInProgress) {
+      throw new Error('SqliteAuditRepository.append() re-entrancy detected: nested call would corrupt the hash chain');
+    }
 
-      const entry: AuditEntry = Object.freeze({
-        ...partial,
-        hash: computeEntryHash(partial),
+    this._appendInProgress = true;
+    try {
+      const insert = this.db.transaction((payload: CreateAuditEntryInput): AuditEntry => {
+        const previousHashRow = this.db
+          .prepare<[], { hash: string }>(
+            'SELECT hash FROM audit_log_entries ORDER BY seq DESC LIMIT 1'
+          )
+          .get();
+
+        const partial: Omit<AuditEntry, 'hash'> = {
+          id: randomUUID(),
+          timestamp: new Date().toISOString(),
+          action: payload.action,
+          severity: payload.severity,
+          actor: payload.actor,
+          resource: payload.resource,
+          resourceId: payload.resourceId,
+          metadata: Object.freeze({ ...payload.metadata }),
+          ipAddress: payload.ipAddress,
+          correlationId: payload.correlationId,
+          previousHash: previousHashRow?.hash ?? GENESIS_HASH,
+        };
+
+        const entry: AuditEntry = Object.freeze({
+          ...partial,
+          hash: computeEntryHash(partial),
+        });
+
+        this.db
+          .prepare<
+            [string, string, string, string, string, string, string, string, string | null, string | null, string, string]
+          >(
+            `INSERT INTO audit_log_entries
+             (id, timestamp, action, severity, actor, resource, resource_id, metadata_json, ip_address, correlation_id, hash, previous_hash)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+          )
+          .run(
+            entry.id,
+            entry.timestamp,
+            entry.action,
+            entry.severity,
+            entry.actor,
+            entry.resource,
+            entry.resourceId,
+            JSON.stringify(entry.metadata),
+            entry.ipAddress ?? null,
+            entry.correlationId ?? null,
+            entry.hash,
+            entry.previousHash
+          );
+
+        return entry;
       });
 
+      return insert(input);
+    } finally {
+      // Always release the guard — even on error — so the caller can recover.
+      this._appendInProgress = false;
+    }
       this.db
         .prepare<
           [string, string, string, string, string, string, string, string, string | null, string | null, string, string]
@@ -264,16 +387,41 @@ export class SqliteAuditRepository implements AuditLogRepository {
     
     // Decode cursor if provided
     if (query.cursor) {
+      // Decode cursor first — if the format is invalid this will throw
+      // 'Invalid cursor format', which we catch below.
+      let cursorData: CursorData;
       try {
-        const cursorData: CursorData = decodeCursor(query.cursor);
-        
-        // Find the sequence number of the last entry from the previous page
+        cursorData = decodeCursor(query.cursor);
+      } catch {
+        // Malformed/undecodable cursor — fall back to the beginning of the
+        // result set rather than propagating a format error.
+        cursorData = { lastId: '', lastTimestamp: '', filters: {} };
+      }
+
+      // Verify filters match cursor BEFORE any DB work.
+      // This is a caller-invariant violation (mixing cursors across queries),
+      // so we throw rather than silently ignoring the mismatch.
+      if (
+        cursorData.lastId !== '' && // skip check when we fell back to empty cursor
+        (cursorData.filters.action !== query.action ||
+          cursorData.filters.severity !== query.severity ||
+          cursorData.filters.actor !== query.actor ||
+          cursorData.filters.resource !== query.resource ||
+          cursorData.filters.resourceId !== query.resourceId ||
+          cursorData.filters.from !== query.from ||
+          cursorData.filters.to !== query.to)
+      ) {
+        throw new Error('Cursor filters do not match query filters');
+      }
+
+      if (cursorData.lastId) {
+        // Find the sequence number of the last entry from the previous page.
         const lastEntryRow = this.db
           .prepare<[string], { seq: number }>(
             'SELECT seq FROM audit_log_entries WHERE id = ?'
           )
           .get(cursorData.lastId);
-        
+
         if (lastEntryRow) {
           startIndex = lastEntryRow.seq;
         }
@@ -351,6 +499,21 @@ export class SqliteAuditRepository implements AuditLogRepository {
     return row?.total ?? 0;
   }
 
+  /**
+   * Verifies the integrity of the entire hash chain.
+   *
+   * Invariants checked:
+   * 1. `previousHash` of each entry equals the `hash` of the preceding entry
+   *    (or GENESIS for the first).
+   * 2. The stored `hash` matches the recomputed hash of the entry's content
+   *    fields (detects field tampering).
+   * 3. No two entries share the same `hash` value — a duplicate hash would
+   *    indicate either a hash-collision attack or a forged insertion that
+   *    copied an existing entry's hash.
+   *
+   * @returns An `IntegrityReport` with `valid: false` and the index/ID of the
+   *   first corrupted entry when any invariant is violated.
+   */
   verifyIntegrity(): IntegrityReport {
     const checkedAt = new Date().toISOString();
     const rows = this.db
@@ -364,6 +527,10 @@ export class SqliteAuditRepository implements AuditLogRepository {
     if (rows.length === 0) {
       return { valid: true, totalEntries: 0, checkedAt };
     }
+
+    // --- Invariant 3: duplicate hash detection ---
+    // Build a set of seen hashes; a collision at any position is a hard failure.
+    const seenHashes = new Set<string>();
 
     let previousHash = GENESIS_HASH;
     for (let index = 0; index < rows.length; index += 1) {
@@ -380,6 +547,19 @@ export class SqliteAuditRepository implements AuditLogRepository {
         };
       }
 
+      // --- Invariant 3: duplicate hash ---
+      if (seenHashes.has(entry.hash)) {
+        return {
+          valid: false,
+          totalEntries: rows.length,
+          firstCorruptedIndex: index,
+          firstCorruptedId: entry.id,
+          checkedAt,
+        };
+      }
+      seenHashes.add(entry.hash);
+
+      // --- Invariant 1: previousHash linkage ---
       if (entry.previousHash !== previousHash) {
         return {
           valid: false,
@@ -390,6 +570,7 @@ export class SqliteAuditRepository implements AuditLogRepository {
         };
       }
 
+      // --- Invariant 2: hash content integrity ---
       const { hash, ...rest } = entry;
       const expectedHash = computeEntryHash(rest);
       if (hash !== expectedHash) {

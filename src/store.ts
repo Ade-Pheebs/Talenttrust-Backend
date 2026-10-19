@@ -147,8 +147,10 @@ export class EscrowStore {
     return c;
   }
 
-  deposit(id: number, amountRaw: unknown): EscrowContract {
+  /** @security caller must equal contract.client — mirrors deposit_funds's client.require_auth() */
+  deposit(id: number, amountRaw: unknown, caller: string): EscrowContract {
     const c = this.get(id);
+    if (c.client !== caller) throw new HttpError(403, 'forbidden', 'Only the contract client can deposit');
     this.requireActive(c);
     const amount = Number(amountRaw);
     if (!Number.isFinite(amount) || amount <= 0) {
@@ -162,8 +164,10 @@ export class EscrowStore {
     return this.touch(c);
   }
 
-  release(id: number, index: number): EscrowContract {
+  /** @security caller must equal contract.client — mirrors release_milestone's client.require_auth() */
+  release(id: number, index: number, caller: string): EscrowContract {
     const c = this.get(id);
+    if (c.client !== caller) throw new HttpError(403, 'forbidden', 'Only the contract client can release milestones');
     this.requireActive(c);
     const m = c.milestones[index];
     if (!m) throw new HttpError(404, 'milestone_not_found', `Milestone ${index} not found`);
@@ -177,15 +181,21 @@ export class EscrowStore {
     return this.touch(c);
   }
 
-  openDispute(id: number, raisedBy: unknown, reason: unknown): EscrowContract {
+  /**
+   * @security caller must be client or freelancer — mirrors caller.require_auth().
+   * raisedBy from the body is accepted for backwards compat but rejected (403) if it
+   * differs from the authenticated caller address.
+   */
+  openDispute(id: number, caller: string, reason: unknown, bodyRaisedBy?: unknown): EscrowContract {
     const c = this.get(id);
-    if (raisedBy !== c.client && raisedBy !== c.freelancer) {
-      throw new HttpError(403, 'unauthorized', 'Only the client or freelancer can open a dispute');
-    }
+    if (c.client !== caller && c.freelancer !== caller)
+      throw new HttpError(403, 'forbidden', 'Only the client or freelancer can open a dispute');
+    if (bodyRaisedBy !== undefined && bodyRaisedBy !== caller)
+      throw new HttpError(403, 'forbidden', 'raisedBy must match the authenticated address');
     this.requireActive(c);
     c.status = 'Disputed';
     c.dispute = {
-      raisedBy,
+      raisedBy: caller,
       reason: typeof reason === 'string' && reason ? reason : 'No reason given',
       openedAt: new Date().toISOString(),
     };
@@ -211,16 +221,20 @@ export class EscrowStore {
     return this.touch(c);
   }
 
-  cancel(id: number): EscrowContract {
+  /** @security caller must equal contract.client — mirrors cancel_contract's client.require_auth() */
+  cancel(id: number, caller: string): EscrowContract {
     const c = this.get(id);
+    if (c.client !== caller) throw new HttpError(403, 'forbidden', 'Only the contract client can cancel');
     this.requireActive(c);
     c.fundedAmount = c.releasedAmount;
     c.status = 'Cancelled';
     return this.touch(c);
   }
 
-  rate(id: number, ratingRaw: unknown): Reputation {
+  /** @security caller must equal contract.client — mirrors issue_reputation's client.require_auth() */
+  rate(id: number, ratingRaw: unknown, caller: string): Reputation {
     const c = this.get(id);
+    if (c.client !== caller) throw new HttpError(403, 'forbidden', 'Only the contract client can issue reputation');
     if (c.status !== 'Completed') {
       throw new HttpError(409, 'invalid_status', 'Only completed contracts can be rated');
     }
@@ -274,17 +288,17 @@ export class EscrowStore {
         { title: 'Implementation', amount: 750 },
       ],
     });
-    this.deposit(a.id, 1500);
-    this.release(a.id, 0);
+    this.deposit(a.id, 1500, a.client);
+    this.release(a.id, 0, a.client);
     const b = this.create({
       title: 'Smart contract audit',
       client: 'GCLIENTDEMOBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB',
       freelancer: 'GFREELANCERDEMOBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB',
       milestones: [{ title: 'Audit report', amount: 2000 }],
     });
-    this.deposit(b.id, 2000);
-    this.release(b.id, 0);
-    this.rate(b.id, 5);
+    this.deposit(b.id, 2000, b.client);
+    this.release(b.id, 0, b.client);
+    this.rate(b.id, 5, b.client);
     return this;
   }
 }

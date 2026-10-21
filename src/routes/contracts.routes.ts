@@ -32,6 +32,16 @@ import {
 } from "../middleware/validate.middleware";
 import type { MetricsServiceLike } from "../observability/metrics-service";
 import { createContractsObservabilityMiddleware } from "../observability/contracts-observability";
+import {
+  authenticateScopedApiKey,
+  requireScope,
+} from "../auth/scopedApiKeyMiddleware";
+import type { ParsedApiKeys } from "../config/apiKeysConfig";
+import {
+  resolveDisputeController,
+  resolveDisputeSchema,
+} from "../controllers/resolveDisputeController";
+import { SCOPES } from "../auth/scopes";
 
 // ─── Inline route-param validator ────────────────────────────────────────────
 
@@ -144,6 +154,7 @@ function validateContractQuery(
 function createContractsRouter(
   metricsService?: MetricsServiceLike,
   customDb?: any,
+  apiKeys?: ParsedApiKeys,
 ): Router {
   const router = Router();
 
@@ -369,6 +380,34 @@ function createContractsRouter(
     requirePermission("contracts", "delete", getContractOwnerId),
     controller.deleteContract,
   );
+
+  // POST /:id/resolve — resolve a dispute (scoped API key required)
+  // Protected by authenticateScopedApiKey + requireScope('disputes:resolve').
+  // The middleware is injected only when apiKeys are provided.
+  if (apiKeys && apiKeys.keys.length > 0) {
+    router.post(
+      "/:id/resolve",
+      validateContractId,
+      authenticateScopedApiKey(apiKeys),
+      requireScope(SCOPES.DISPUTES_RESOLVE),
+      validateSchema(resolveDisputeSchema),
+      resolveDisputeController,
+    );
+  } else {
+    // No keys configured → resolve is impossible (fail-closed).
+    router.post(
+      "/:id/resolve",
+      validateContractId,
+      (_req: Request, res: Response, _next: NextFunction) => {
+        res.status(401).json({
+          error: {
+            code: "unauthorized",
+            message: "Dispute resolution requires a scoped API key. No API keys are configured.",
+          },
+        });
+      },
+    );
+  }
 
   return router;
 }

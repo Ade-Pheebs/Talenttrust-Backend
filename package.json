@@ -19,6 +19,7 @@
     "test:watch": "jest --watch",
     "lint": "eslint src",
     "lint:fix": "eslint src --fix",
+    "apikey:new": "ts-node scripts/new-api-key.ts",
     "audit:ci": "npm audit --audit-level=high --omit=dev",
     "security:audit": "npm audit --audit-level=high --omit=dev",
     "security:audit:json": "npm audit --json --audit-level=high --omit=dev",

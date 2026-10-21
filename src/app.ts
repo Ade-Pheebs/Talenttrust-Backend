@@ -28,9 +28,13 @@ import { httpLoggerMiddleware } from './middleware/httpLogger';
 import { ReputationService } from './services/reputation.service';
 import { getDb } from './db/database';
 import { requestContextMiddleware } from './context';
+import { parseApiKeysConfig, type ParsedApiKeys } from './config/apiKeysConfig';
+import { createWhoamiRouter } from './routes/whoami.routes';
 
 interface AppFactoryOptions {
   includeTerminalHandlers?: boolean;
+  /** Inject parsed API keys (for tests). Falls back to API_KEYS env var. */
+  apiKeys?: ParsedApiKeys;
 }
 
 export function attachTerminalHandlers(app: express.Application): void {
@@ -42,6 +46,10 @@ export function createApp(options?: AppFactoryOptions): express.Application {
   const includeTerminalHandlers = options?.includeTerminalHandlers ?? true;
   const env = validateEnv();
   const app = express();
+
+  // Parse API keys: injected (tests) or from API_KEYS env var
+  const apiKeys: ParsedApiKeys =
+    options?.apiKeys ?? parseApiKeysConfig(process.env['API_KEYS']);
 
   applySecurityMiddleware(app, env.CORS_ALLOWED_ORIGINS);
 
@@ -76,8 +84,9 @@ export function createApp(options?: AppFactoryOptions): express.Application {
   app.use('/api/v1/auth', authRouter);
   app.use('/api/v1/api-keys', metricsService.trackApiKeysRequest.bind(metricsService));
   app.use('/api/v1', apiKeysRouter);
-  app.use('/api/v1/contracts', createContractsRouter(metricsService));
+  app.use('/api/v1/contracts', createContractsRouter(metricsService, undefined, apiKeys));
   app.use('/api/v1/disputes', createDisputesRouter({ metricsService }));
+  app.use('/api/v1/auth', createWhoamiRouter(apiKeys));
   app.use('/api/v1/reputation', reputationRouter);
   app.use('/api/v1/dependency-scan', dependencyScanRouter);
   app.use('/api/v1', apiKeysRouter);

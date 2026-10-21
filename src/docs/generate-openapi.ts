@@ -42,6 +42,113 @@ registry.registerPath({
 export function generateOpenApiSpec(): any {
   const generator = new OpenApiGeneratorV3(registry.definitions);
 
+  // Register the apiKey security scheme
+  registry.registerComponent('securitySchemes', 'apiKey', {
+    type: 'apiKey',
+    in: 'header',
+    name: 'X-API-Key',
+    description:
+      'Scoped API key for machine-to-machine authentication. ' +
+      'Provide via `X-API-Key` header or `Authorization: ApiKey <key>`.',
+  });
+
+  // Register POST /contracts/{id}/resolve
+  registry.registerPath({
+    method: 'post',
+    path: '/contracts/{id}/resolve',
+    summary: 'Resolve a dispute (scoped API key)',
+    tags: ['Contracts', 'Disputes'],
+    security: [{ apiKey: [] }],
+    parameters: [
+      {
+        name: 'id',
+        in: 'path',
+        required: true,
+        schema: { type: 'string' },
+        description: 'Contract ID',
+      },
+    ],
+    requestBody: {
+      required: true,
+      content: {
+        'application/json': {
+          schema: {
+            type: 'object',
+            required: ['freelancerBps'],
+            properties: {
+              freelancerBps: {
+                type: 'integer',
+                minimum: 0,
+                maximum: 10000,
+                description:
+                  'Basis-point split to the freelancer (10000 = 100% freelancer, 0 = 100% client).',
+              },
+            },
+          },
+        },
+      },
+    },
+    responses: {
+      200: {
+        description: 'Dispute resolved successfully',
+        content: {
+          'application/json': {
+            schema: {
+              type: 'object',
+              properties: {
+                status: { type: 'string', example: 'success' },
+                data: {
+                  type: 'object',
+                  properties: {
+                    disputeId: { type: 'string' },
+                    contractId: { type: 'string' },
+                    status: { type: 'string', example: 'resolved' },
+                    freelancerBps: { type: 'integer' },
+                    clientBps: { type: 'integer' },
+                    resolvedBy: { type: 'string' },
+                    resolution: { type: 'string' },
+                  },
+                },
+              },
+            },
+          },
+        },
+      },
+      401: { description: 'Missing or invalid API key' },
+      403: { description: 'Insufficient scope (requires disputes:resolve)' },
+      404: { description: 'No active dispute found for the contract' },
+    },
+  });
+
+  // Register GET /auth/whoami
+  registry.registerPath({
+    method: 'get',
+    path: '/auth/whoami',
+    summary: 'Return the authenticated API key id and scopes',
+    tags: ['Auth'],
+    security: [{ apiKey: [] }],
+    responses: {
+      200: {
+        description: 'API key identity and scopes',
+        content: {
+          'application/json': {
+            schema: {
+              type: 'object',
+              properties: {
+                keyId: { type: 'string' },
+                scopes: {
+                  type: 'array',
+                  items: { type: 'string' },
+                },
+              },
+            },
+          },
+        },
+      },
+      401: { description: 'Missing or invalid API key' },
+    },
+  });
+
   const spec = generator.generateDocument({
     openapi: '3.0.0',
     info: {

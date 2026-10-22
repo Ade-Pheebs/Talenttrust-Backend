@@ -4,6 +4,10 @@ const json = (schema: object) => ({ 'application/json': { schema } });
 const ok = (description: string, schema: object = { type: 'object' }) => ({
   200: { description, content: json(schema) },
 });
+const errorResponse = (description: string, schema: object = { $ref: '#/components/schemas/ErrorResponse' }) => ({
+  description,
+  content: json(schema),
+});
 const idParam = { name: 'id', in: 'path', required: true, schema: { type: 'integer' } };
 const contractRef = { $ref: '#/components/schemas/EscrowContract' };
 const reputationRef = { $ref: '#/components/schemas/Reputation' };
@@ -263,6 +267,49 @@ export const openapi = {
       },
     },
     schemas: {
+      DriftItem: {
+        type: 'object',
+        properties: {
+          field: { type: 'string', description: 'Field name that drifted' },
+          api: { description: 'Value in off-chain API record' },
+          chain: { description: 'Value in on-chain contract' },
+        },
+        required: ['field', 'api', 'chain'],
+      },
+      ChainInfo: {
+        type: 'object',
+        properties: {
+          escrowId: { type: 'string' },
+          linkedAt: { type: 'string', format: 'date-time' },
+          lastVerifiedAt: { type: 'string', format: 'date-time' },
+          status: { type: 'string', enum: ['in_sync', 'drift', 'unverified'] },
+          drift: {
+            type: 'array',
+            items: { $ref: '#/components/schemas/DriftItem' },
+          },
+        },
+        required: ['escrowId', 'linkedAt', 'lastVerifiedAt', 'status', 'drift'],
+      },
+      ErrorResponse: {
+        type: 'object',
+        properties: {
+          error: { type: 'string' },
+          message: { type: 'string' },
+        },
+        required: ['error', 'message'],
+      },
+      ChainMismatchError: {
+        type: 'object',
+        properties: {
+          error: { type: 'string' },
+          message: { type: 'string' },
+          mismatches: {
+            type: 'array',
+            items: { $ref: '#/components/schemas/DriftItem' },
+          },
+        },
+        required: ['error', 'message'],
+      },
       EscrowContract: {
         type: 'object',
         properties: {
@@ -286,71 +333,11 @@ export const openapi = {
           totalAmount: { type: 'number' },
           fundedAmount: { type: 'number' },
           releasedAmount: { type: 'number' },
-          status: {
-            type: 'string',
-            enum: ['Created', 'Funded', 'Completed', 'Disputed', 'Resolved', 'Cancelled'],
-          },
+          status: { type: 'string', enum: ['Created', 'Funded', 'Completed', 'Disputed', 'Resolved', 'Cancelled'] },
           reputationIssued: { type: 'boolean' },
-          dispute: {
-            type: 'object',
-            nullable: true,
-            properties: {
-              raisedBy: { type: 'string' },
-              reason: { type: 'string' },
-              openedAt: { type: 'string', format: 'date-time' },
-              freelancerBps: { type: 'integer' },
-              resolvedAt: { type: 'string', format: 'date-time', nullable: true },
-            },
-          },
+          chain: { $ref: '#/components/schemas/ChainInfo' },
           createdAt: { type: 'string', format: 'date-time' },
           updatedAt: { type: 'string', format: 'date-time' },
-        },
-      },
-      Reputation: {
-        type: 'object',
-        properties: {
-          address: { type: 'string' },
-          completedContracts: { type: 'integer' },
-          totalRating: { type: 'number' },
-          averageRating: { type: 'number' },
-        },
-      },
-      ChallengeResponse: {
-        type: 'object',
-        required: ['address', 'challenge', 'expiresAt'],
-        properties: {
-          address: { type: 'string' },
-          challenge: { type: 'string', description: 'The challenge string to sign with your Stellar private key.' },
-          expiresAt: { type: 'string', format: 'date-time' },
-        },
-      },
-      TokenRequest: {
-        type: 'object',
-        required: ['address', 'challenge', 'signature'],
-        properties: {
-          address: { type: 'string', description: 'Stellar G… public key.' },
-          challenge: { type: 'string', description: 'The exact challenge string returned by GET /challenge.' },
-          signature: {
-            type: 'string',
-            description: 'base64-encoded ed25519 signature over the UTF-8 bytes of the challenge string.',
-          },
-        },
-      },
-      TokenResponse: {
-        type: 'object',
-        required: ['token', 'tokenType', 'expiresAt'],
-        properties: {
-          token: { type: 'string', description: 'HS256 JWT to use as a bearer token (≤ 1 h).' },
-          tokenType: { type: 'string', enum: ['Bearer'] },
-          expiresAt: { type: 'string', format: 'date-time' },
-        },
-      },
-      ErrorResponse: {
-        type: 'object',
-        required: ['error', 'message'],
-        properties: {
-          error: { type: 'string', description: 'Machine-readable error code.' },
-          message: { type: 'string', description: 'Human-readable explanation.' },
         },
       },
     },

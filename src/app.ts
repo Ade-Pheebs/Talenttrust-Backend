@@ -14,10 +14,10 @@ const startedAt = Date.now();
 
 type LoggerLevel = 'debug' | 'info' | 'warn' | 'error';
 
-type Handler = (req: Request, res: Response) => unknown;
-const wrap = (fn: Handler) => (req: Request, res: Response, next: NextFunction) => {
+type Handler = (req: Request, res: Response) => unknown | Promise<unknown>;
+const wrap = (fn: Handler) => async (req: Request, res: Response, next: NextFunction) => {
   try {
-    const out = fn(req, res);
+    const out = await fn(req, res);
     if (out !== undefined && !res.headersSent) res.json(out);
   } catch (err) {
     next(err);
@@ -127,6 +127,8 @@ export function createApp(options: CreateAppOptions = {}): express.Application {
         'POST /api/v1/contracts/:id/resolve',
         'POST /api/v1/contracts/:id/cancel',
         'POST /api/v1/contracts/:id/reputation',
+        'POST /api/v1/contracts/:id/link',
+        'GET  /api/v1/contracts/:id/parity',
         'GET  /api/v1/reputation/:address',
         'GET  /api/v1/auth/challenge',
         'POST /api/v1/auth/token',
@@ -230,12 +232,18 @@ export function createApp(options: CreateAppOptions = {}): express.Application {
   v1.get('/stats', wrap(() => store.stats()));
   v1.get(
     '/contracts',
-    wrap((req) => ({
-      data: store.list({
-        status: typeof req.query.status === 'string' ? req.query.status : undefined,
-        party: typeof req.query.party === 'string' ? req.query.party : undefined,
-      }),
-    })),
+    wrap((req) => {
+      let linked: boolean | undefined = undefined;
+      if (req.query.linked === 'true') linked = true;
+      else if (req.query.linked === 'false') linked = false;
+      return {
+        data: store.list({
+          status: typeof req.query.status === 'string' ? req.query.status : undefined,
+          party: typeof req.query.party === 'string' ? req.query.party : undefined,
+          linked,
+        }),
+      };
+    }),
   );
 
   // POST /contracts — requires auth, caller must equal body.client
@@ -307,7 +315,7 @@ export function createApp(options: CreateAppOptions = {}): express.Application {
   app.use((err: unknown, req: Request, res: Response, _next: NextFunction) => {
     const requestId = req.id;
     if (err instanceof HttpError) {
-      res.status(err.status).json({ error: err.code, message: err.message, requestId });
+      res.status(err.status).json({ error: err.code, message: err.message, ...err.details, requestId });
       return;
     }
     if (err && typeof err === 'object' && (err as { type?: string }).type === 'entity.parse.failed') {
